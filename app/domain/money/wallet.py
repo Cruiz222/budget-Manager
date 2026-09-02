@@ -59,3 +59,8 @@ class Wallet:
             raise InsufficientFundsError
         
         self._available_balance = self._available_balance - amount
+
+
+    def lock_funds(self, amount: Money):
+        self._locked_balance = self._locked_balance + amount
+        self._available_balance = self._available_balance - amount
