@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from decimal import Decimal
-from currency import CurrencyCode
-from exception import (
+from .currency import Currency
+from .exception import (
     MoneyError,
     UnsupportedCurrencyError,
     CurrencyMismatchError,
@@ -14,11 +14,11 @@ from exception import (
 @dataclass(frozen=True)
 class Money:
     amount: Decimal
-    currency: CurrencyCode
+    currency: Currency
 
     def __post_init__(self):
         # 1. Currency validation
-        if not isinstance(self.currency, CurrencyCode):
+        if not isinstance(self.currency, Currency):
             raise UnsupportedCurrencyError("currency not supported")
 
         # 2. Precision check (works seamlessly for negative decimals like -50.25)
