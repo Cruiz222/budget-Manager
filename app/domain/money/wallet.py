@@ -10,7 +10,10 @@ from .exception import (
     ZeroAmountWithdrawalError,
     NegativeAmountWithdrawalError,
     CurrencyMismatchError,
-    InvalidAmountError
+    InvalidAmountError,
+    WalletAlreadyFrozenError,
+    WalletAlreadyClosedError,
+    WalletAlreadyActiveError
 
 )
 @dataclass
@@ -27,15 +30,14 @@ class Wallet:
         return self._available_balance
 
     def apply_deposit(self, amount: Money):
-       
-        if amount.amount <= 0:
-            raise ValueError("Amount must be greater than zero")
-
-        if amount.currency != self.currency:
-            raise ValueError("Unsuppported currency")    
-        
         if self.status == WalletStatus.CLOSED:
             raise ValueError("this account is Closed")
+        
+        if amount.currency != self.currency:
+            raise ValueError("Unsuppported currency")  
+       
+        if amount.amount <= 0:
+            raise ValueError("Amount must be greater than zero")  
 
         self._available_balance = self._available_balance + amount
 
@@ -66,14 +68,14 @@ class Wallet:
         if self.status == WalletStatus.CLOSED:
             raise WalletClosedError
         
-        if self._available_balance < amount:
-            raise InsufficientFundsError
-        
         if amount.amount <= 0:
             raise InvalidAmountError
-
+        
         if self.currency != amount.currency:
-            raise CurrencyMismatchError    
+            raise CurrencyMismatchError 
+        
+        if self._available_balance < amount:
+            raise InsufficientFundsError   
         
         self._locked_balance = self._locked_balance + amount
 
@@ -82,15 +84,40 @@ class Wallet:
 
 
     def release_funds(self, amount: Money):
+        if self.status == WalletStatus.CLOSED:
+            raise WalletClosedError
+
+        if amount.amount <= 0:
+            raise InvalidAmountError  
+
+        if self.currency != amount.currency:
+            raise CurrencyMismatchError  
+        
         if self._locked_balance < amount:
             raise InsufficientFundsError
         
-        if amount.amount <= 0:
-            raise InvalidAmountError
-        
-        if self.currency != amount.currency:
-            raise CurrencyMismatchError
-        
         self._locked_balance = self._locked_balance - amount
 
-        self._available_balance = self._available_balance + amount      
+        self._available_balance = self._available_balance + amount    
+
+
+    def freeze(self):
+        if self.status == WalletStatus.FROZEN:
+            raise WalletAlreadyFrozenError
+        
+        if self.status == WalletStatus.CLOSED:
+            raise WalletAlreadyClosedError
+        
+        self.status = WalletStatus.FROZEN
+
+
+
+    def unfreeze(self):
+        if self.status == WalletStatus.ACTIVE:
+            raise WalletAlreadyActiveError
+
+        if self.status == WalletStatus.CLOSED:
+            raise WalletClosedError    
+        
+        self.status = WalletStatus.ACTIVE    
+              

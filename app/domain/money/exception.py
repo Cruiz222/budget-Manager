@@ -24,3 +24,9 @@ class NegativeAmountWithdrawalError(MoneyError):
     pass
 class InvalidAmountError(MoneyError):
     pass
+class WalletAlreadyFrozenError(MoneyError):
+    pass
+class WalletAlreadyClosedError(MoneyError):
+    pass
+class WalletAlreadyActiveError(MoneyError):
+    pass
