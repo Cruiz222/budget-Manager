@@ -11,107 +11,109 @@ from app.domain.money.exception import (
     WalletClosedError
 )
 
-def test_lock_funds():
-    wallet = Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        currency=Currency.NGN,
-        status=WalletStatus.ACTIVE,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(6000, Currency.NGN)
-    )
-
-    wallet.lock_funds(Money(4000, Currency.NGN))
-
-    assert wallet._available_balance.amount == 6000
-
-    assert wallet._locked_balance.amount == 10000
-
-
-def test_lock_funds_insufficient_funds_error():
+def test_release_funds():
     wallet = Wallet(
         wallet_id=uuid4(),
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.ACTIVE,
         _available_balance=Money(4000, Currency.NGN),
-        _locked_balance=Money(6000, Currency.NGN)
-    )   
+        _locked_balance=Money(10000, Currency.NGN)
+    )
+
+    wallet.release_funds(Money(6000, Currency.NGN))
+
+    assert wallet._available_balance.amount == 10000
+
+    assert wallet._locked_balance.amount == 4000
+
+
+
+def test_release_insufficient_funds_error():
+    wallet = Wallet(
+        wallet_id=uuid4(),
+        user_id=uuid4(),
+        currency=Currency.NGN,
+        status=WalletStatus.ACTIVE,
+        _available_balance=Money(4000, Currency.NGN),
+        _locked_balance=Money(4000, Currency.NGN)
+    )
 
     with pytest.raises(InsufficientFundsError):
-        wallet.lock_funds(Money(6000, Currency.NGN))
+        wallet.release_funds(Money(5000, Currency.NGN))
 
 
-def test_lock_zero_amount_error():
+
+def test_release_zero_amount_error():
     wallet = Wallet(
         wallet_id=uuid4(),
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.ACTIVE,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(6000, Currency.NGN)
-    )   
+        _available_balance=Money(4000, Currency.NGN),
+        _locked_balance=Money(4000, Currency.NGN)
+    )
 
     with pytest.raises(InvalidAmountError):
-        wallet.lock_funds(Money(0, Currency.NGN))
+        wallet.release_funds(Money(0, Currency.NGN))
 
 
-def test_lock_negative_amount_error():
+def test_release_negative_amount_error():
     wallet = Wallet(
         wallet_id=uuid4(),
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.ACTIVE,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(6000, Currency.NGN)
-    )   
+        _available_balance=Money(4000, Currency.NGN),
+        _locked_balance=Money(4000, Currency.NGN)
+    )
 
     with pytest.raises(InvalidAmountError):
-        wallet.lock_funds(Money(-1000, Currency.NGN))
+        wallet.release_funds(Money(-2000, Currency.NGN))        
 
 
-
-def test_lock_currency_mismatch_error():
+def test_release_currency_mismatch_error():
     wallet = Wallet(
         wallet_id=uuid4(),
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.ACTIVE,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(6000, Currency.NGN)
-    )   
+        _available_balance=Money(4000, Currency.NGN),
+        _locked_balance=Money(4000, Currency.NGN)
+    )
 
     with pytest.raises(CurrencyMismatchError):
-        wallet.lock_funds(Money(1000, Currency.USD))
+        wallet.release_funds(Money(2000, Currency.USD))  
 
 
-def test_lock_frozen_wallet_funds():
-    wallet = Wallet (
+
+def test_release_frozen_wallet_error():
+    wallet = Wallet(
         wallet_id=uuid4(),
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.FROZEN,
-        _available_balance=Money(10000, Currency.NGN),
+        _available_balance=Money(4000, Currency.NGN),
         _locked_balance=Money(4000, Currency.NGN)
-
     )
 
-    wallet.lock_funds(Money(6000, Currency.NGN))
+    wallet.release_funds(Money(2000, Currency.NGN))  
 
-    assert wallet._available_balance.amount == 4000
+    assert wallet._available_balance.amount == 6000
 
-    assert wallet._locked_balance.amount == 10000
+    assert wallet._locked_balance.amount == 2000    
 
 
-def test_lock_funds_closed_wallet_error():
+
+def test_release_closed_wallet_error():
     wallet = Wallet(
         wallet_id=uuid4(),
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.CLOSED,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(6000, Currency.NGN)
-    )   
+        _available_balance=Money(4000, Currency.NGN),
+        _locked_balance=Money(4000, Currency.NGN)
+    )
 
     with pytest.raises(WalletClosedError):
-        wallet.lock_funds(Money(1000, Currency.USD))    
+        wallet.release_funds(Money(2000, Currency.NGN))                       

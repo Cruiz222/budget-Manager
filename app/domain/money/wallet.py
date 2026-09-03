@@ -9,7 +9,8 @@ from .exception import (
     WalletClosedError,
     ZeroAmountWithdrawalError,
     NegativeAmountWithdrawalError,
-    CurrencyMismatchError
+    CurrencyMismatchError,
+    InvalidAmountError
 
 )
 @dataclass
@@ -62,5 +63,34 @@ class Wallet:
 
 
     def lock_funds(self, amount: Money):
+        if self.status == WalletStatus.CLOSED:
+            raise WalletClosedError
+        
+        if self._available_balance < amount:
+            raise InsufficientFundsError
+        
+        if amount.amount <= 0:
+            raise InvalidAmountError
+
+        if self.currency != amount.currency:
+            raise CurrencyMismatchError    
+        
         self._locked_balance = self._locked_balance + amount
+
         self._available_balance = self._available_balance - amount
+
+
+
+    def release_funds(self, amount: Money):
+        if self._locked_balance < amount:
+            raise InsufficientFundsError
+        
+        if amount.amount <= 0:
+            raise InvalidAmountError
+        
+        if self.currency != amount.currency:
+            raise CurrencyMismatchError
+        
+        self._locked_balance = self._locked_balance - amount
+
+        self._available_balance = self._available_balance + amount      

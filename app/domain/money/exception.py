@@ -22,3 +22,5 @@ class ZeroAmountWithdrawalError(MoneyError):
     pass
 class NegativeAmountWithdrawalError(MoneyError):
     pass
+class InvalidAmountError(MoneyError):
+    pass
