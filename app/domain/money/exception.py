@@ -30,3 +30,7 @@ class WalletAlreadyClosedError(MoneyError):
     pass
 class WalletAlreadyActiveError(MoneyError):
     pass
+class NegativeAmountDepositError(MoneyError):
+    pass
+class InvalidWalletCurrencyError(MoneyError):
+    pass

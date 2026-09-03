@@ -13,7 +13,9 @@ from .exception import (
     InvalidAmountError,
     WalletAlreadyFrozenError,
     WalletAlreadyClosedError,
-    WalletAlreadyActiveError
+    WalletAlreadyActiveError,
+    InvalidWalletCurrencyError
+
 
 )
 @dataclass
@@ -28,16 +30,20 @@ class Wallet:
     @property
     def available_balance(self) -> Money:
         return self._available_balance
+    
+    @property
+    def locked_balance(self) -> Money:
+        return self._locked_balance
 
     def apply_deposit(self, amount: Money):
         if self.status == WalletStatus.CLOSED:
-            raise ValueError("this account is Closed")
+            raise WalletClosedError
         
         if amount.currency != self.currency:
-            raise ValueError("Unsuppported currency")  
+            raise CurrencyMismatchError  
        
         if amount.amount <= 0:
-            raise ValueError("Amount must be greater than zero")  
+            raise InvalidAmountError  
 
         self._available_balance = self._available_balance + amount
 
@@ -120,4 +126,11 @@ class Wallet:
             raise WalletClosedError    
         
         self.status = WalletStatus.ACTIVE    
+
+
+
+    def __post_init__(self):
+        if not isinstance(self.currency, Currency):
+           raise InvalidWalletCurrencyError("invalid wallet currency")
               
+    
