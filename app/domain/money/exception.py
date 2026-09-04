@@ -34,3 +34,9 @@ class NegativeAmountDepositError(MoneyError):
     pass
 class InvalidWalletCurrencyError(MoneyError):
     pass
+class InvalidWalletStatusError(MoneyError):
+    pass
+class InvalidWalletAvailableBalanceError(MoneyError):
+    pass
+class InvalidWalletLockedBalanceError(MoneyError):
+    pass

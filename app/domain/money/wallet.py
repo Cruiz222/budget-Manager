@@ -14,7 +14,10 @@ from .exception import (
     WalletAlreadyFrozenError,
     WalletAlreadyClosedError,
     WalletAlreadyActiveError,
-    InvalidWalletCurrencyError
+    InvalidWalletCurrencyError,
+    InvalidWalletStatusError,
+    InvalidWalletAvailableBalanceError,
+    InvalidWalletLockedBalanceError
 
 
 )
@@ -132,5 +135,20 @@ class Wallet:
     def __post_init__(self):
         if not isinstance(self.currency, Currency):
            raise InvalidWalletCurrencyError("invalid wallet currency")
+        
+        if not isinstance(self.status, WalletStatus):
+            raise InvalidWalletStatusError("invalid wallet status")
+        
+        if not isinstance(self._available_balance, Money):
+            raise InvalidWalletAvailableBalanceError("invalid wallet balance")
+        
+        if not isinstance(self._locked_balance, Money):
+            raise InvalidWalletLockedBalanceError("invalid locked balance")
+        
+        if self._available_balance.currency != self.currency:
+            raise CurrencyMismatchError("available balance currency must match wallet currency")
+        
+        if self._locked_balance.currency != self.currency:
+            raise CurrencyMismatchError("locked balance currency must match wallet currency")
               
     
