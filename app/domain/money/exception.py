@@ -40,3 +40,9 @@ class InvalidWalletAvailableBalanceError(MoneyError):
     pass
 class InvalidWalletLockedBalanceError(MoneyError):
     pass
+
+
+class TransactionError(Exception):
+    pass
+class TransactionAlreadySuccessfulError(TransactionError):
+    pass
