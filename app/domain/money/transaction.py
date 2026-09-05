@@ -6,7 +6,17 @@ from app.domain.money.transactionType import TransactionType
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.money import Money
 from app.domain.money.exception import (
-    TransactionAlreadySuccessfulError
+    TransactionAlreadySuccessfulError,
+    TransactionAlreadyFailedError,
+    TransactionAlreadyReversedError,
+    InvalidTransactionStateError,
+    InvalidTransactionWalletIDError,
+    InvalidTransactionTypeError,
+    InvalidTransactionAmountError,
+    InvalidInternalReference,
+    InvalidproviderReference,
+    InvalidTransactionNarration,
+    InvalidMetaData
 )
 
 @dataclass
@@ -30,5 +40,55 @@ class Transaction:
         if self.status == TransactionStatus.SUCCESSFUL:
             raise TransactionAlreadySuccessfulError("transaction is already successful")
         
+        if self.status != TransactionStatus.PENDING:
+            raise InvalidTransactionStateError("only pending transactions can be marked successful")
+        
         self.status = TransactionStatus.SUCCESSFUL
         self.completed_at = datetime.now()
+
+
+    def mark_failed(self):
+        if self.status == TransactionStatus.FAILED:
+            raise TransactionAlreadyFailedError 
+        
+        if self.status != TransactionStatus.PENDING:
+            raise InvalidTransactionStateError("only pending transactions can be marked failed")
+
+        self.status = TransactionStatus.FAILED
+        self.completed_at = datetime.now() 
+
+
+    def reverse(self):
+        if self.status == TransactionStatus.REVERSED:
+            raise TransactionAlreadyReversedError 
+
+        if self.status != TransactionStatus.SUCCESSFUL:
+            raise InvalidTransactionStateError 
+
+        self.status = TransactionStatus.REVERSED  
+
+
+    def __post_init__(self):
+        if not isinstance(self.wallet_id, uuid.UUID):
+            raise InvalidTransactionWalletIDError
+        
+        if not isinstance(self.type, TransactionType):
+            raise InvalidTransactionTypeError
+        
+        if not isinstance(self.amount, Money):
+            raise InvalidTransactionAmountError
+        
+        if self.amount.amount <= 0:
+            raise InvalidTransactionAmountError
+        
+        if self.internal_reference == "":
+            raise InvalidInternalReference
+        
+        if not isinstance(self.provider_reference, str):
+            raise InvalidproviderReference
+        
+        if not isinstance(self.narration, str):
+            raise InvalidTransactionNarration
+        
+        if not isinstance(self.metadata, dict):
+            raise InvalidMetaData

@@ -7,11 +7,11 @@ from app.domain.money.transaction import Transaction
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.money.exception import (
-    TransactionAlreadySuccessfulError,
+    TransactionAlreadyFailedError,
     InvalidTransactionStateError
 )
 
-def test_pending_transaction_become_successful_and_completed_at():
+def test_pending_transaction_failed_and_completed_at():
     transaction = Transaction (
         transaction_id=uuid4(),
         wallet_id=uuid4(),
@@ -26,34 +26,14 @@ def test_pending_transaction_become_successful_and_completed_at():
 
     )
 
-    transaction.mark_successful()
+    transaction.mark_failed()
 
-    assert transaction.status == TransactionStatus.SUCCESSFUL
+    assert transaction.status == TransactionStatus.FAILED
 
     assert transaction.completed_at is not None
 
 
-
-def test_already_successful_transaction_raises_error():
-    transaction = Transaction (
-        transaction_id=uuid4(),
-        wallet_id=uuid4(),
-        status=TransactionStatus.SUCCESSFUL,
-        type=TransactionType.DEPOSIT,
-        amount=Money(5000, Currency.NGN),
-        internal_reference="",
-        provider_reference="",
-        metadata=dict,
-        created_at=datetime.now(),
-        completed_at=datetime.now(),
-
-    )
-
-    with pytest.raises(TransactionAlreadySuccessfulError):
-        transaction.mark_successful()    
-
-
-def test_failed_transaction_cannot_be_marked_successful():
+def test_pending_transaction_already_failed_raises_error():
     transaction = Transaction (
         transaction_id=uuid4(),
         wallet_id=uuid4(),
@@ -62,17 +42,39 @@ def test_failed_transaction_cannot_be_marked_successful():
         amount=Money(5000, Currency.NGN),
         internal_reference="",
         provider_reference="",
-        metadata=dict,
+        metadata={},
+        created_at=datetime.now(),
+        completed_at=datetime.now(),
+
+    )
+
+    with pytest.raises(TransactionAlreadyFailedError):
+        transaction.mark_failed()
+
+
+
+
+def test_successful_transaction_cannot_be_marked_failed():
+    transaction = Transaction (
+        transaction_id=uuid4(),
+        wallet_id=uuid4(),
+        status=TransactionStatus.SUCCESSFUL,
+        type=TransactionType.DEPOSIT,
+        amount=Money(5000, Currency.NGN),
+        internal_reference="",
+        provider_reference="",
+        metadata={},
         created_at=datetime.now(),
         completed_at=datetime.now(),
 
     )
 
     with pytest.raises(InvalidTransactionStateError):
-        transaction.mark_successful() 
+        transaction.mark_failed()
 
 
-def test_reversed_transaction_cannot_be_marked_successful():
+
+def test_reversed_transaction_cannot_be_marked_failed():
     transaction = Transaction (
         transaction_id=uuid4(),
         wallet_id=uuid4(),
@@ -81,11 +83,14 @@ def test_reversed_transaction_cannot_be_marked_successful():
         amount=Money(5000, Currency.NGN),
         internal_reference="",
         provider_reference="",
-        metadata=dict,
+        metadata={},
         created_at=datetime.now(),
         completed_at=datetime.now(),
 
     )
 
     with pytest.raises(InvalidTransactionStateError):
-        transaction.mark_successful()                               
+        transaction.mark_failed()
+
+
+

@@ -40,9 +40,25 @@ class InvalidWalletAvailableBalanceError(MoneyError):
     pass
 class InvalidWalletLockedBalanceError(MoneyError):
     pass
-
-
-class TransactionError(Exception):
+class TransactionAlreadySuccessfulError(MoneyError):
     pass
-class TransactionAlreadySuccessfulError(TransactionError):
+class TransactionAlreadyFailedError(MoneyError):
+    pass
+class InvalidTransactionStateError(MoneyError):
+    pass 
+class TransactionAlreadyReversedError(MoneyError):
+    pass
+class InvalidTransactionWalletIDError(MoneyError):
+    pass
+class InvalidTransactionTypeError(MoneyError):
+    pass
+class InvalidTransactionAmountError(MoneyError):
+    pass
+class InvalidInternalReference(MoneyError):
+    pass
+class InvalidproviderReference(MoneyError):
+    pass
+class InvalidTransactionNarration(MoneyError):
+    pass
+class InvalidMetaData(MoneyError):
     pass
