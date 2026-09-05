@@ -121,3 +121,40 @@ Wallet
 ├── metadata                    → optional
 ├── created_at                  → generated automatically
 └── completed_at                → None initially
+
+
+
+| #  | Invariant                              | Test |
+| -- | -------------------------------------- | ---- |
+| 1  | wallet ID must be UUID                 | ✅    |
+| 2  | type must be TransactionType           | ✅    |
+| 3  | amount must be Money                   | ✅    |
+| 4  | amount cannot be zero                  | ✅    |
+| 5  | amount cannot be negative              | ✅    |
+| 6  | internal reference cannot be empty     | ✅    |
+| 7  | provider reference must be string/None | ✅    |
+| 8  | narration must be string/None          | ✅    |
+| 9  | metadata must be dict                  | ✅    |
+| 10 | PENDING → completed_at must be None    | ✅    |
+| 11 | SUCCESSFUL → completed_at required     | ✅    |
+| 12 | FAILED → completed_at required         | ✅    |
+| 13 | RVERSEED → completed_at required       | ✅    |
+
+
+
+
+Your Transaction cannot be created with these invalid states:
+
+❌ Invalid wallet ID
+❌ Invalid transaction type
+❌ Invalid amount object
+❌ Zero amount
+❌ Negative amount
+❌ Empty internal reference
+❌ Invalid provider reference
+❌ Invalid narration
+❌ Invalid metadata
+❌ PENDING + completed_at
+❌ SUCCESSFUL + no completed_at
+❌ FAILED + no completed_at
+❌ REVERSED + no completed_at

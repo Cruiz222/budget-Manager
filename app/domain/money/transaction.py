@@ -16,7 +16,8 @@ from app.domain.money.exception import (
     InvalidInternalReference,
     InvalidproviderReference,
     InvalidTransactionNarration,
-    InvalidMetaData
+    InvalidMetaData,
+    InvalidTransactionDateStamp
 )
 
 @dataclass
@@ -84,11 +85,23 @@ class Transaction:
         if self.internal_reference == "":
             raise InvalidInternalReference
         
-        if not isinstance(self.provider_reference, str):
+        if not isinstance(self.provider_reference, (str, type(None))):
             raise InvalidproviderReference
         
-        if not isinstance(self.narration, str):
+        if not isinstance(self.narration, (str, type(None))):
             raise InvalidTransactionNarration
         
         if not isinstance(self.metadata, dict):
             raise InvalidMetaData
+        
+        if self.status == TransactionStatus.PENDING and self.completed_at is not None:
+            raise InvalidTransactionDateStamp("pending transaction must not have completed at")
+        
+        if self.status == TransactionStatus.SUCCESSFUL and self.completed_at is None:
+            raise InvalidTransactionDateStamp("successful transaction must have valid date stamp")
+        
+        if self.status == TransactionStatus.FAILED and self.completed_at is None:
+            raise InvalidTransactionDateStamp("failed transaction must have valid date stamp")
+
+        if self.status == TransactionStatus.REVERSED and self.completed_at is None:
+            raise InvalidTransactionDateStamp("reversed transaction must have valid date stamp")    

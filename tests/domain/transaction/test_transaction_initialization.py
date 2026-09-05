@@ -13,7 +13,8 @@ from app.domain.money.exception import (
     InvalidInternalReference,
     InvalidproviderReference,
     InvalidTransactionNarration,
-    InvalidMetaData
+    InvalidMetaData,
+    InvalidTransactionDateStamp
    
 )
 
@@ -88,6 +89,20 @@ def test_creating_transaction_with_provider_reference_must_be_a_string():
         )        
 
 
+def test_creating_transaction_with_provider_reference_as_none_is_valid():
+    transaction = Transaction(
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            provider_reference=None,
+            internal_reference="internal-reference"
+        )     
+
+    transaction.internal_reference = None
+
+    assert transaction.internal_reference == None   
+
+
 def test_creating_transaction_with_narration_must_be_a_string():
     with pytest.raises(InvalidTransactionNarration):
         Transaction(
@@ -98,6 +113,31 @@ def test_creating_transaction_with_narration_must_be_a_string():
             internal_reference="internal-reference",
             narration=int
         )      
+def test_creating_transaction_with_narration_must_be_a_string():
+    with pytest.raises(InvalidTransactionNarration):
+        Transaction(
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal-reference",
+            narration=int
+        ) 
+
+def test_creating_transaction_with_narration_as_none_is_valid():
+    transaction = Transaction(
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal reference",
+            narration=None
+        )     
+
+    transaction.narration = None
+
+    assert transaction.narration == None   
+
 
 
 def test_creating_transaction_with_invalid_metadata_raises_error():
@@ -112,4 +152,59 @@ def test_creating_transaction_with_invalid_metadata_raises_error():
             metadata="metadata"
         )                
 
+
+def test_creating_pending_transaction_must_have_completed_at_as_none():
+    with pytest.raises(InvalidTransactionDateStamp):
+        Transaction (
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            status=TransactionStatus.PENDING,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal-reference",
+            narration="narration",
+            completed_at=datetime.now()
+        ) 
+
+
+def test_successful_transaction_must_not_have_completed_at_as_none():
+    with pytest.raises(InvalidTransactionDateStamp):
+        Transaction (
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            status=TransactionStatus.SUCCESSFUL,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal-reference",
+            narration="narration",
+            completed_at=None
+        )         
+
+
+def test_failed_transaction_must_not_have_completed_at_as_none():
+    with pytest.raises(InvalidTransactionDateStamp):
+        Transaction (
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            status=TransactionStatus.FAILED,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal-reference",
+            narration="narration",
+            completed_at=None
+        )         
+
+
+def test_reversed_transaction_must_not_have_completed_at_as_none():
+    with pytest.raises(InvalidTransactionDateStamp):
+        Transaction (
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            status=TransactionStatus.REVERSED,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal-reference",
+            narration="narration",
+            completed_at=None
+        )         
 

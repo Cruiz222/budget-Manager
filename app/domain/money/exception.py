@@ -62,3 +62,5 @@ class InvalidTransactionNarration(MoneyError):
     pass
 class InvalidMetaData(MoneyError):
     pass
+class InvalidTransactionDateStamp(MemoryError):
+    pass
