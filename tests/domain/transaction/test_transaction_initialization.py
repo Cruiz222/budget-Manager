@@ -158,7 +158,6 @@ def test_creating_pending_transaction_must_have_completed_at_as_none():
         Transaction (
             wallet_id=uuid4(),
             type=TransactionType.DEPOSIT,
-            status=TransactionStatus.PENDING,
             amount=Money(5000, Currency.NGN),
             provider_reference="provider-reference",
             internal_reference="internal-reference",
@@ -168,43 +167,53 @@ def test_creating_pending_transaction_must_have_completed_at_as_none():
 
 
 def test_successful_transaction_must_not_have_completed_at_as_none():
-    with pytest.raises(InvalidTransactionDateStamp):
-        Transaction (
+         transaction = Transaction (
             wallet_id=uuid4(),
             type=TransactionType.DEPOSIT,
-            status=TransactionStatus.SUCCESSFUL,
             amount=Money(5000, Currency.NGN),
             provider_reference="provider-reference",
             internal_reference="internal-reference",
             narration="narration",
-            completed_at=None
-        )         
+            
+        )      
+
+         transaction.mark_successful()
+
+         assert transaction.status == TransactionStatus.SUCCESSFUL
+         assert transaction.completed_at is not None   
 
 
 def test_failed_transaction_must_not_have_completed_at_as_none():
-    with pytest.raises(InvalidTransactionDateStamp):
-        Transaction (
+         transaction = Transaction (
             wallet_id=uuid4(),
             type=TransactionType.DEPOSIT,
-            status=TransactionStatus.FAILED,
             amount=Money(5000, Currency.NGN),
             provider_reference="provider-reference",
             internal_reference="internal-reference",
             narration="narration",
-            completed_at=None
-        )         
+        )   
+
+         transaction.mark_failed()
+
+         assert transaction.status == TransactionStatus.FAILED
+         assert transaction.completed_at is not None       
 
 
 def test_reversed_transaction_must_not_have_completed_at_as_none():
-    with pytest.raises(InvalidTransactionDateStamp):
-        Transaction (
+         transaction = Transaction (
             wallet_id=uuid4(),
             type=TransactionType.DEPOSIT,
-            status=TransactionStatus.REVERSED,
             amount=Money(5000, Currency.NGN),
             provider_reference="provider-reference",
             internal_reference="internal-reference",
             narration="narration",
-            completed_at=None
-        )         
+        )       
+
+         transaction.mark_successful() 
+         successful_completed_at = transaction.completed_at
+
+         transaction.reverse()
+
+         assert transaction.status == TransactionStatus.REVERSED
+         assert transaction.completed_at == successful_completed_at
 

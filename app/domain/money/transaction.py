@@ -32,9 +32,17 @@ class Transaction:
     metadata: dict[str, object] = field(default_factory=dict)
 
     transaction_id: uuid.UUID = field(default_factory=uuid.uuid4)
-    status: TransactionStatus = TransactionStatus.PENDING
+    _status: TransactionStatus = field(
+    default=TransactionStatus.PENDING,
+    init=False
+)
     created_at: datetime = field(default_factory=datetime.now)
     completed_at: datetime | None = None
+
+
+    @property
+    def status(self) -> TransactionStatus:
+        return self._status
 
 
     def mark_successful(self):
@@ -44,7 +52,7 @@ class Transaction:
         if self.status != TransactionStatus.PENDING:
             raise InvalidTransactionStateError("only pending transactions can be marked successful")
         
-        self.status = TransactionStatus.SUCCESSFUL
+        self._status = TransactionStatus.SUCCESSFUL
         self.completed_at = datetime.now()
 
 
@@ -55,7 +63,7 @@ class Transaction:
         if self.status != TransactionStatus.PENDING:
             raise InvalidTransactionStateError("only pending transactions can be marked failed")
 
-        self.status = TransactionStatus.FAILED
+        self._status = TransactionStatus.FAILED
         self.completed_at = datetime.now() 
 
 
@@ -66,7 +74,7 @@ class Transaction:
         if self.status != TransactionStatus.SUCCESSFUL:
             raise InvalidTransactionStateError 
 
-        self.status = TransactionStatus.REVERSED  
+        self._status = TransactionStatus.REVERSED  
 
 
     def __post_init__(self):
