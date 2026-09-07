@@ -158,3 +158,64 @@ Your Transaction cannot be created with these invalid states:
 ❌ SUCCESSFUL + no completed_at
 ❌ FAILED + no completed_at
 ❌ REVERSED + no completed_at
+
+
+### ACHITECTURE
+
+┌─────────────────────────────────────┐
+│           PRESENTATION              │
+│        HTTP / API / CLI             │
+└──────────────────┬──────────────────┘
+                   ↓
+┌─────────────────────────────────────┐
+│           APPLICATION               │
+│                                     │
+│  DepositMoney                       │
+│  WithdrawMoney                      │
+│  LockFunds                          │
+│  ReleaseFunds                       │
+│                                     │
+│  Orchestrates the workflow          │
+└──────────────────┬──────────────────┘
+                   ↓
+┌─────────────────────────────────────┐
+│             DOMAIN                  │
+│                                     │
+│  Money                              │
+│  Wallet                             │
+│  Transaction                        │
+│                                     │
+│  Enforces business rules            │
+└──────────────────┬──────────────────┘
+                   ↓
+┌─────────────────────────────────────┐
+│          INFRASTRUCTURE             │
+│                                     │
+│  PostgreSQL                         │
+│  Paystack                           │
+│  Redis                              │
+│  Email/SMS                          │
+└─────────────────────────────────────┘
+
+
+Caller
+  │
+  │ wallet_id + amount
+  ↓
+DepositMoney
+  │
+  ├── create Transaction(PENDING)
+  │
+  ├── process payment
+  │
+  ├── mark transaction SUCCESSFUL
+  │
+  └── update Wallet
+
+
+  | Component      | Responsibility                    |
+| -------------- | --------------------------------- |
+| `Money`        | Money arithmetic & currency rules |
+| `Wallet`       | Balance rules                     |
+| `Transaction`  | Financial event + lifecycle       |
+| `DepositMoney` | Coordinates the operation         |
