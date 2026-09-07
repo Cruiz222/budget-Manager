@@ -219,3 +219,32 @@ DepositMoney
 | `Wallet`       | Balance rules                     |
 | `Transaction`  | Financial event + lifecycle       |
 | `DepositMoney` | Coordinates the operation         |
+
+
+## testing business rules at domain level and aplpication level, but doman level owns the rules, application level endorses it.
+
+                    APPLICATION
+                         │
+              DepositMoney.execute()
+                         │
+          ┌──────────────┴──────────────┐
+          ▼                             ▼
+       Wallet                       Transaction
+          │                             │
+   business rules                 lifecycle rules
+          │                             │
+          └──────────────┬──────────────┘
+                         ▼
+                 TransactionRepository
+                         │
+                         ▼
+                      DATABASE
+
+
+
+                      TransactionRepository
+│
+├── save(transaction)
+├── get_by_id(transaction_id)
+├── get_by_provider_reference(provider_reference)
+└── get_by_wallet_id(wallet_id)
