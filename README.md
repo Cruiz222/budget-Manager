@@ -248,3 +248,18 @@ DepositMoney
 ├── get_by_id(transaction_id)
 ├── get_by_provider_reference(provider_reference)
 └── get_by_wallet_id(wallet_id)
+
+DOMAIN
+app/domain/repositories/
+└── transaction_repository.py
+        │
+        └── defines WHAT a repository must do
+
+        AND
+
+
+INFRASTRUCTURE
+app/infrastructure/repositories/
+└── in_memory_transaction_repository.py
+        │
+        └── defines HOW it actually stores transactions        
