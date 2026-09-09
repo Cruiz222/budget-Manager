@@ -1,2 +1,6 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Import each test file by its unique path instead of its bare module name.
+# Without this, two test files sharing a basename (e.g. test_lock_funds.py in
+# different directories) collide during collection.
+addopts = "--import-mode=importlib"
