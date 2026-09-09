@@ -1,0 +1,9 @@
+# Virtual environment (recreate from requirements.txt)
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Test & tooling caches
+.pytest_cache/
