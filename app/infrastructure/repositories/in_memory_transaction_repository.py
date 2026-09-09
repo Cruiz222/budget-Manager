@@ -16,4 +16,11 @@ class InMemoryTransactionRepository(TransactionRepository):
         if transaction_id not in self.transactions:
             raise TransactionNotFoundError
 
-        return self.transactions[transaction_id]    
+        return self.transactions[transaction_id]
+
+
+    def get_by_internal_reference(self, internal_reference):
+        for transaction in self.transactions.values():
+            if transaction.internal_reference == internal_reference:
+                return transaction
+        return None

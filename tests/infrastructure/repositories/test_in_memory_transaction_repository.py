@@ -65,3 +65,28 @@ def test_get_by_invalid_id_raises_error():
    with pytest.raises(TransactionNotFoundError):
     repository.get_by_id(transaction_id)
 
+
+def test_get_by_internal_reference_returns_saved_transaction():
+    transaction = Transaction(
+        wallet_id=uuid4(),
+        type=TransactionType.DEPOSIT,
+        amount=Money(5000, Currency.NGN),
+        internal_reference="payment-1",
+    )
+
+    repository = InMemoryTransactionRepository()
+
+    repository.save(transaction)
+
+    result = repository.get_by_internal_reference("payment-1")
+
+    assert result is transaction
+
+
+def test_get_by_internal_reference_returns_none_when_not_found():
+    repository = InMemoryTransactionRepository()
+
+    result = repository.get_by_internal_reference("unknown-reference")
+
+    assert result is None
+

@@ -56,6 +56,11 @@ class RecordingTransactionRepository(TransactionRepository):
     def get_by_id(self, transaction_id):
         raise NotImplementedError
 
+    def get_by_internal_reference(self, internal_reference):
+        # DepositMoney asks this before saving; ordering tests never replay a
+        # duplicate, so the answer is always None.
+        return None
+
 
 # --- Successful deposit ---
 
@@ -64,7 +69,8 @@ def test_successful_deposit_increases_balance_and_persists_successful_transactio
     repository = InMemoryTransactionRepository()
 
     transaction = DepositMoney(wallet, repository).execute(
-        Money(Decimal("5000"), NGN)
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
     )
 
     assert wallet.available_balance == Money(Decimal("15000"), NGN)
@@ -80,7 +86,10 @@ def test_deposit_is_persisted_as_pending_before_wallet_is_touched():
     wallet = build_wallet()
     repository = RecordingTransactionRepository()
 
-    DepositMoney(wallet, repository).execute(Money(Decimal("5000"), NGN))
+    DepositMoney(wallet, repository).execute(
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
+    )
 
     assert repository.saved_statuses == [
         TransactionStatus.PENDING,
@@ -95,7 +104,10 @@ def test_deposit_with_zero_amount_fails_and_persists_nothing():
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        DepositMoney(wallet, repository).execute(Money(Decimal("0"), NGN))
+        DepositMoney(wallet, repository).execute(
+            Money(Decimal("0"), NGN),
+            internal_reference=str(uuid4()),
+        )
 
     assert wallet.available_balance == Money(Decimal("10000"), NGN)
     assert not repository.transactions
@@ -106,7 +118,10 @@ def test_deposit_with_negative_amount_fails_and_persists_nothing():
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        DepositMoney(wallet, repository).execute(Money(Decimal("-5000"), NGN))
+        DepositMoney(wallet, repository).execute(
+            Money(Decimal("-5000"), NGN),
+            internal_reference=str(uuid4()),
+        )
 
     assert wallet.available_balance == Money(Decimal("10000"), NGN)
     assert not repository.transactions
@@ -117,7 +132,10 @@ def test_deposit_with_non_money_amount_fails_and_persists_nothing():
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        DepositMoney(wallet, repository).execute(5000)
+        DepositMoney(wallet, repository).execute(
+            5000,
+            internal_reference=str(uuid4()),
+        )
 
     assert wallet.available_balance == Money(Decimal("10000"), NGN)
     assert not repository.transactions
@@ -130,7 +148,10 @@ def test_deposit_with_wrong_currency_fails_and_persists_failed_transaction():
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(CurrencyMismatchError):
-        DepositMoney(wallet, repository).execute(Money(Decimal("5000"), USD))
+        DepositMoney(wallet, repository).execute(
+            Money(Decimal("5000"), USD),
+            internal_reference=str(uuid4()),
+        )
 
     assert wallet.available_balance == Money(Decimal("10000"), NGN)
 
@@ -144,7 +165,10 @@ def test_deposit_into_closed_wallet_fails_and_persists_failed_transaction():
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(WalletClosedError):
-        DepositMoney(wallet, repository).execute(Money(Decimal("5000"), NGN))
+        DepositMoney(wallet, repository).execute(
+            Money(Decimal("5000"), NGN),
+            internal_reference=str(uuid4()),
+        )
 
     assert wallet.available_balance == Money(Decimal("10000"), NGN)
 
@@ -158,9 +182,54 @@ def test_rejected_deposit_is_persisted_as_pending_then_failed():
     repository = RecordingTransactionRepository()
 
     with pytest.raises(WalletClosedError):
-        DepositMoney(wallet, repository).execute(Money(Decimal("5000"), NGN))
+        DepositMoney(wallet, repository).execute(
+            Money(Decimal("5000"), NGN),
+            internal_reference=str(uuid4()),
+        )
 
     assert repository.saved_statuses == [
         TransactionStatus.PENDING,
         TransactionStatus.FAILED,
     ]
+
+
+# --- Idempotency ---
+
+def test_replaying_the_same_internal_reference_credits_only_once():
+    wallet = build_wallet()
+    repository = InMemoryTransactionRepository()
+    service = DepositMoney(wallet, repository)
+    reference = str(uuid4())
+
+    first = service.execute(Money(Decimal("5000"), NGN), reference)
+    second = service.execute(Money(Decimal("5000"), NGN), reference)
+
+    # Same logical deposit returned - not a new one, and not double-credited.
+    assert second.transaction_id == first.transaction_id
+    assert wallet.available_balance == Money(Decimal("15000"), NGN)
+
+
+def test_different_internal_references_are_both_credited():
+    wallet = build_wallet()
+    repository = InMemoryTransactionRepository()
+    service = DepositMoney(wallet, repository)
+
+    service.execute(Money(Decimal("5000"), NGN), str(uuid4()))
+    service.execute(Money(Decimal("2000"), NGN), str(uuid4()))
+
+    assert wallet.available_balance == Money(Decimal("17000"), NGN)
+    assert len(repository.transactions) == 2
+
+
+def test_caller_supplied_internal_reference_is_persisted():
+    wallet = build_wallet()
+    repository = InMemoryTransactionRepository()
+    reference = "client-order-7f8a"
+
+    transaction = DepositMoney(wallet, repository).execute(
+        Money(Decimal("5000"), NGN),
+        internal_reference=reference,
+    )
+
+    stored = repository.get_by_id(transaction.transaction_id)
+    assert stored.internal_reference == reference
