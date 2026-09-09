@@ -1,4 +1,5 @@
-from uuid import UUID
+from decimal import Decimal
+from uuid import UUID, uuid4
 
 from app.application.deposit.deposit_money import DepositMoney
 from app.application.lock.lock_funds import LockFunds
@@ -6,9 +7,12 @@ from app.application.release.release_funds import ReleaseFunds
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.application.wallet_operation import WalletOperation
 from app.application.withdraw.withdraw_money import WithdrawMoney
+from app.domain.money.currency import Currency
 from app.domain.money.exception import MoneyError
 from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
+from app.domain.money.wallet import Wallet
+from app.domain.money.walletStatus import WalletStatus
 
 
 class WalletService:
@@ -38,6 +42,36 @@ class WalletService:
 
     def release(self, wallet_id, amount: Money, internal_reference: str) -> Transaction:
         return self._run(ReleaseFunds, wallet_id, amount, internal_reference)
+
+    def open_wallet(self, user_id: UUID, currency: Currency) -> Wallet:
+        """Open a new empty wallet for a user, in the given currency."""
+        uow = self._unit_of_work_factory.start()
+        try:
+            wallet = Wallet(
+                wallet_id=uuid4(),
+                user_id=user_id,
+                status=WalletStatus.ACTIVE,
+                _available_balance=Money(Decimal("0"), currency),
+                _locked_balance=Money(Decimal("0"), currency),
+                currency=currency,
+            )
+            uow.wallets.save(wallet)
+            uow.commit()
+            return wallet
+        except BaseException:
+            uow.rollback()
+            raise
+
+    def get_wallet(self, wallet_id: UUID) -> Wallet:
+        """Read a wallet's current state.
+
+        Pure read: nothing is committed. Absence raises WalletNotFoundError.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            return uow.wallets.get_by_id(wallet_id)
+        finally:
+            uow.rollback()
 
     def _run(
         self,

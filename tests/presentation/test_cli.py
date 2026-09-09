@@ -1,0 +1,79 @@
+import re
+from uuid import uuid4
+
+import pytest
+
+from app.presentation.cli import main
+
+
+def run(db_path, *argv):
+    """Invoke the CLI in-process against the given database file."""
+    return main(["--db", db_path, *argv])
+
+
+def opened_wallet_id(db_path, capsys):
+    assert run(db_path, "open", "--currency", "NGN") == 0
+    out = capsys.readouterr().out
+    match = re.search(r"opened wallet (\S+)", out)
+    assert match, out
+    return match.group(1)
+
+
+def test_open_then_balance_round_trip(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+
+    assert run(db, "balance", wallet_id) == 0
+    out = capsys.readouterr().out
+    assert "status: active" in out
+    assert "available: 0.00 NGN" in out
+    assert "locked: 0.00 NGN" in out
+
+
+def test_deposit_then_balance_shows_new_available(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+
+    assert run(db, "deposit", wallet_id, "2500.50") == 0
+    out = capsys.readouterr().out
+    assert "deposited 2500.50 NGN" in out
+
+    assert run(db, "balance", wallet_id) == 0
+    out = capsys.readouterr().out
+    assert "available: 2500.50 NGN" in out
+
+
+def test_withdraw_beyond_balance_fails_and_balance_is_unchanged(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "1000")
+    capsys.readouterr()
+
+    assert run(db, "withdraw", wallet_id, "5000") == 1
+    assert "error:" in capsys.readouterr().err
+
+    assert run(db, "balance", wallet_id) == 0
+    assert "available: 1000.00 NGN" in capsys.readouterr().out
+
+
+def test_operation_on_unknown_wallet_is_an_error(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+
+    assert run(db, "deposit", str(uuid4()), "500") == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_invalid_amount_is_a_usage_error(tmp_path):
+    db = str(tmp_path / "cli.db")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run(db, "deposit", str(uuid4()), "abc")
+    assert excinfo.value.code == 2
+
+
+def test_unknown_command_is_a_usage_error(tmp_path):
+    db = str(tmp_path / "cli.db")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run(db, "bogus")
+    assert excinfo.value.code == 2

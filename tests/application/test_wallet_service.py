@@ -165,3 +165,24 @@ def test_replaying_an_internal_reference_does_not_double_credit(tmp_path):
         get_wallet(factory, wallet.wallet_id).available_balance
         == Money(Decimal("15000"), NGN)
     )
+
+
+def test_open_wallet_persists_an_empty_active_wallet(tmp_path):
+    service, factory = build_service(tmp_path)
+    user_id = uuid4()
+
+    wallet = service.open_wallet(user_id, NGN)
+
+    stored = get_wallet(factory, wallet.wallet_id)
+    assert stored.user_id == user_id
+    assert stored.status is WalletStatus.ACTIVE
+    assert stored.currency is NGN
+    assert stored.available_balance == Money(Decimal("0"), NGN)
+    assert stored.locked_balance == Money(Decimal("0"), NGN)
+
+
+def test_get_wallet_of_unknown_id_raises(tmp_path):
+    service, _ = build_service(tmp_path)
+
+    with pytest.raises(WalletNotFoundError):
+        service.get_wallet(uuid4())
