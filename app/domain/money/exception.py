@@ -45,7 +45,9 @@ class TransactionAlreadySuccessfulError(MoneyError):
 class TransactionAlreadyFailedError(MoneyError):
     pass
 class InvalidTransactionStateError(MoneyError):
-    pass 
+    pass
+class InvalidTransactionStatusError(MoneyError):
+    pass
 class TransactionAlreadyReversedError(MoneyError):
     pass
 class InvalidTransactionWalletIDError(MoneyError):
@@ -62,7 +64,7 @@ class InvalidTransactionNarration(MoneyError):
     pass
 class InvalidMetaData(MoneyError):
     pass
-class InvalidTransactionDateStamp(MemoryError):
+class InvalidTransactionDateStamp(MoneyError):
     pass
 class TransactionNotFoundError(MoneyError):
     pass    

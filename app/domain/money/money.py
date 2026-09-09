@@ -21,7 +21,26 @@ class Money:
         if not isinstance(self.currency, Currency):
             raise UnsupportedCurrencyError("currency not supported")
 
-        # 2. Precision check (works seamlessly for negative decimals like -50.25)
+        # 2. Amount must be a type we can represent exactly.
+        #    bool is a subclass of int, so it must be rejected explicitly.
+        #    float is rejected on purpose: binary floats are not exact
+        #    (0.1 * 3 == 0.30000000000000004) and money must never rely on them.
+        if isinstance(self.amount, bool) or not isinstance(self.amount, (int, Decimal)):
+            raise InvalidMoneyOperationError(
+                "amount must be an int or Decimal, not "
+                f"{type(self.amount).__name__}"
+            )
+
+        # 3. Canonicalise to Decimal so every Money stores the same type.
+        #    Money(5000) and Money(Decimal("5000.00")) then compare equal.
+        object.__setattr__(self, "amount", Decimal(self.amount))
+
+        # 4. Reject non-finite values before the precision check below,
+        #    because round(NaN, 2) would raise a confusing built-in error.
+        if not self.amount.is_finite():
+            raise InvalidMoneyOperationError("amount must be a finite number")
+
+        # 5. Precision check (works seamlessly for negative decimals like -50.25)
         if round(self.amount, 2) != self.amount:
             raise UnsupportedDecimalPlaceError(
                 "amount can have only two decimal places"
@@ -63,25 +82,29 @@ class Money:
         """Supports unary negation: -money (e.g., turns +100 into -100)."""
         return Money(-self.amount, self.currency)
 
-    def __mul__(self, scalar: int | float | Decimal) -> "Money":
-        if not isinstance(scalar, (int, float, Decimal)):
+    def __mul__(self, scalar: int | Decimal) -> "Money":
+        if isinstance(scalar, bool) or not isinstance(scalar, (int, Decimal)):
             raise InvalidMoneyOperationError(
-                f"Cannot multiply Money by {type(scalar).__name__}."
+                f"Cannot multiply Money by {type(scalar).__name__}. "
+                "Use an int or Decimal scalar."
             )
-        return Money(self.amount * Decimal(str(scalar)), self.currency)
+        # amount is Decimal, so Decimal * (int|Decimal) is exact. If the product
+        # has more than two decimal places, the result's __post_init__ rejects it.
+        return Money(self.amount * scalar, self.currency)
 
-    def __rmul__(self, scalar: int | float | Decimal) -> "Money":
+    def __rmul__(self, scalar: int | Decimal) -> "Money":
         return self.__mul__(scalar)
 
-    def __truediv__(self, divisor: int | float | Decimal) -> "Money":
-        if not isinstance(divisor, (int, float, Decimal)):
+    def __truediv__(self, divisor: int | Decimal) -> "Money":
+        if isinstance(divisor, bool) or not isinstance(divisor, (int, Decimal)):
             raise InvalidMoneyOperationError(
-                f"Cannot divide Money by {type(divisor).__name__}."
+                f"Cannot divide Money by {type(divisor).__name__}. "
+                "Use an int or Decimal divisor."
             )
         if divisor == 0:
             raise ZeroDivisionError("Cannot divide Money by zero.")
 
-        return Money(self.amount / Decimal(str(divisor)), self.currency)
+        return Money(self.amount / divisor, self.currency)
 
     # --- Comparison Operators ---
 

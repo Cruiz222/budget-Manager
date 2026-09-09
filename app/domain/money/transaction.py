@@ -10,6 +10,7 @@ from app.domain.money.exception import (
     TransactionAlreadyFailedError,
     TransactionAlreadyReversedError,
     InvalidTransactionStateError,
+    InvalidTransactionStatusError,
     InvalidTransactionWalletIDError,
     InvalidTransactionTypeError,
     InvalidTransactionAmountError,
@@ -52,6 +53,7 @@ class Transaction:
     created_at: datetime | None = None,
     completed_at: datetime | None = None,
     reversed_at: datetime | None = None,
+    status: TransactionStatus = TransactionStatus.PENDING,
 ):
         self._wallet_id = wallet_id
         self._type = type
@@ -70,10 +72,14 @@ class Transaction:
 
         self._transaction_id = transaction_id or uuid.uuid4()
 
-        self._status = TransactionStatus.PENDING
+        # The default is PENDING (a brand-new transaction). The persistence
+        # layer passes an explicit status (SUCCESSFUL / FAILED / REVERSED) when
+        # re-hydrating a stored transaction. Restoring state via the constructor
+        # is NOT a live transition, so it bypasses the guards in mark_*().
+        self._status = status
 
         self._created_at = created_at or datetime.now()
-        self._completed_at = completed_at 
+        self._completed_at = completed_at
         self._reversed_at = reversed_at
 
         self.__post_init__()
@@ -173,7 +179,7 @@ class Transaction:
         if self._amount.amount <= 0:
             raise InvalidTransactionAmountError
 
-        if self.internal_reference == "":
+        if not isinstance(self.internal_reference, str) or self.internal_reference.strip() == "":
             raise InvalidInternalReference
 
         if not isinstance(self.provider_reference, (str, type(None))):
@@ -185,22 +191,40 @@ class Transaction:
         if not isinstance(self._metadata, dict):
             raise InvalidMetaData
 
+        if not isinstance(self.status, TransactionStatus):
+            raise InvalidTransactionStatusError("invalid transaction status")
+
+        # --- Lifecycle / date-stamp invariants ---
+        # PENDING: no completion yet.
+        # SUCCESSFUL / FAILED: left PENDING, so completed_at is required.
+        # REVERSED: was SUCCESSFUL, so completed_at is required and reversed_at
+        #           records when it was reversed.
         if self.status == TransactionStatus.PENDING and self.completed_at is not None:
             raise InvalidTransactionDateStamp(
-            "pending transaction must not have completed at"
-           )
+                "pending transaction must not have completed_at"
+            )
 
         if self.status == TransactionStatus.SUCCESSFUL and self.completed_at is None:
             raise InvalidTransactionDateStamp(
-                  "successful transaction must have valid date stamp"
-                )
+                "successful transaction must have completed_at"
+            )
 
         if self.status == TransactionStatus.FAILED and self.completed_at is None:
             raise InvalidTransactionDateStamp(
-                "failed transaction must have valid date stamp"
+                "failed transaction must have completed_at"
             )
 
         if self.status == TransactionStatus.REVERSED and self.completed_at is None:
             raise InvalidTransactionDateStamp(
-                "reversed transaction must have valid date stamp"
+                "reversed transaction must have completed_at"
+            )
+
+        if self.status == TransactionStatus.REVERSED and self.reversed_at is None:
+            raise InvalidTransactionDateStamp(
+                "reversed transaction must have reversed_at"
+            )
+
+        if self.status != TransactionStatus.REVERSED and self.reversed_at is not None:
+            raise InvalidTransactionDateStamp(
+                "only reversed transactions may have reversed_at"
             )

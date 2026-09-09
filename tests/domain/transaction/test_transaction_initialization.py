@@ -78,6 +78,26 @@ def test_creating_transaction_with_empty_internal_reference_raises_error():
         )
 
 
+def test_creating_transaction_with_none_internal_reference_raises_error():
+    with pytest.raises(InvalidInternalReference):
+        Transaction(
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            internal_reference=None,
+        )
+
+
+def test_creating_transaction_with_whitespace_internal_reference_raises_error():
+    with pytest.raises(InvalidInternalReference):
+        Transaction(
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            internal_reference="   ",
+        )
+
+
 def test_creating_transaction_with_provider_reference_must_be_a_string():
     with pytest.raises(InvalidproviderReference):
         Transaction(
