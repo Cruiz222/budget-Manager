@@ -55,6 +55,12 @@ class RecordingTransactionRepository(TransactionRepository):
     def get_by_internal_reference(self, internal_reference):
         return None
 
+    def get_by_wallet_id(self, wallet_id):
+        raise NotImplementedError
+
+    def get_by_provider_reference(self, provider_reference):
+        raise NotImplementedError
+
 
 # --- Successful lock ---
 

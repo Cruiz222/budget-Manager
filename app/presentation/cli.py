@@ -90,6 +90,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unfreeze_parser.add_argument("wallet_id", type=_uuid)
 
+    history_parser = subparsers.add_parser(
+        "history", help="show a wallet's transaction ledger, oldest first"
+    )
+    history_parser.add_argument("wallet_id", type=_uuid)
+
     for name, _ in OPERATIONS.items():
         op_parser = subparsers.add_parser(name, help=f"{name} money")
         op_parser.add_argument("wallet_id", type=_uuid)
@@ -151,6 +156,21 @@ def _unfreeze(service: WalletService, args) -> int:
     return 0
 
 
+def _history(service: WalletService, args) -> int:
+    transactions = service.transactions_for_wallet(args.wallet_id)
+    if not transactions:
+        print(f"no transactions for wallet {args.wallet_id}")
+        return 0
+    for transaction in transactions:
+        print(
+            f"{transaction.created_at.isoformat(timespec='seconds')}  "
+            f"{transaction.type.name.lower():<8} "
+            f"{transaction.amount}  "
+            f"{transaction.status.name.lower()}"
+        )
+    return 0
+
+
 def _describe(exc: MoneyError) -> str:
     return str(exc) if str(exc) else exc.__class__.__name__
 
@@ -170,6 +190,8 @@ def main(argv=None) -> int:
             return _freeze(service, args)
         if args.command == "unfreeze":
             return _unfreeze(service, args)
+        if args.command == "history":
+            return _history(service, args)
         return _operation(service, args)
     except MoneyError as exc:
         print(f"error: {_describe(exc)}", file=sys.stderr)

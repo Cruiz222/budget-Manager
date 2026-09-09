@@ -151,6 +151,55 @@ def test_get_by_internal_reference_returns_none_when_absent():
     assert repository.get_by_internal_reference(str(uuid4())) is None
 
 
+def test_get_by_wallet_id_returns_that_wallets_ledger_oldest_first():
+    wallet = build_wallet()
+    other_wallet = build_wallet()
+    repository = build_repository(wallet)
+    # Seed the second wallet so the foreign key resolves.
+    SqliteWalletRepository(repository._connection).save(other_wallet)
+
+    first = build_transaction(wallet, internal_reference=str(uuid4()))
+    second = build_transaction(wallet, internal_reference=str(uuid4()))
+    stranger = build_transaction(other_wallet, internal_reference=str(uuid4()))
+    for transaction in (first, second, stranger):
+        transaction.mark_successful()
+        repository.save(transaction)
+
+    ledger = repository.get_by_wallet_id(wallet.wallet_id)
+
+    assert [t.transaction_id for t in ledger] == [
+        first.transaction_id,
+        second.transaction_id,
+    ]
+
+
+def test_get_by_wallet_id_is_empty_for_a_wallet_without_transactions():
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+
+    assert repository.get_by_wallet_id(wallet.wallet_id) == []
+
+
+def test_get_by_provider_reference_finds_a_saved_transaction():
+    wallet = build_wallet()
+    transaction = build_transaction(wallet, provider_reference="prov-123")
+    transaction.mark_successful()
+    repository = build_repository(wallet)
+    repository.save(transaction)
+
+    stored = repository.get_by_provider_reference("prov-123")
+
+    assert stored is not None
+    assert stored.transaction_id == transaction.transaction_id
+
+
+def test_get_by_provider_reference_returns_none_when_absent():
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+
+    assert repository.get_by_provider_reference("prov-missing") is None
+
+
 def test_get_by_id_of_missing_transaction_raises():
     wallet = build_wallet()
     repository = build_repository(wallet)

@@ -24,3 +24,18 @@ class InMemoryTransactionRepository(TransactionRepository):
             if transaction.internal_reference == internal_reference:
                 return transaction
         return None
+
+    def get_by_wallet_id(self, wallet_id):
+        ledger = [
+            transaction
+            for transaction in self.transactions.values()
+            if transaction.wallet_id == wallet_id
+        ]
+        # Oldest first (by creation time), mirroring the SQL ORDER BY.
+        return sorted(ledger, key=lambda transaction: transaction.created_at)
+
+    def get_by_provider_reference(self, provider_reference):
+        for transaction in self.transactions.values():
+            if transaction.provider_reference == provider_reference:
+                return transaction
+        return None

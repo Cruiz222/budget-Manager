@@ -73,6 +73,21 @@ class WalletService:
         finally:
             uow.rollback()
 
+    def transactions_for_wallet(self, wallet_id: UUID) -> list[Transaction]:
+        """Read a wallet's full transaction ledger, oldest first.
+
+        Pure read like get_wallet. Absence of the wallet itself raises
+        WalletNotFoundError (an unknown wallet is different from an empty one).
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            # Validate the wallet exists so "unknown wallet" and "no activity
+            # yet" are distinguishable to the caller.
+            uow.wallets.get_by_id(wallet_id)
+            return uow.transactions.get_by_wallet_id(wallet_id)
+        finally:
+            uow.rollback()
+
     def freeze_wallet(self, wallet_id: UUID) -> Wallet:
         """Freeze a wallet, stopping withdrawals until it is unfrozen."""
         return self._change_status(wallet_id, Wallet.freeze)

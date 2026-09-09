@@ -103,6 +103,31 @@ class SqliteTransactionRepository(TransactionRepository):
             return None
         return self._row_to_transaction(row)
 
+    def get_by_wallet_id(self, wallet_id) -> list[Transaction]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_COLUMNS}
+            FROM transactions
+            WHERE wallet_id = ?
+            ORDER BY created_at
+            """,
+            (uuid_to_text(wallet_id),),
+        ).fetchall()
+        return [self._row_to_transaction(row) for row in rows]
+
+    def get_by_provider_reference(self, provider_reference: str) -> Transaction | None:
+        row = self._connection.execute(
+            f"""
+            SELECT {_COLUMNS}
+            FROM transactions
+            WHERE provider_reference = ?
+            """,
+            (provider_reference,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_transaction(row)
+
     def _row_to_transaction(self, row) -> Transaction:
         currency = text_to_enum(Currency, row["currency"])
         return Transaction(

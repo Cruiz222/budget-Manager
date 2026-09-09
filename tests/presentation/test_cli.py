@@ -112,6 +112,42 @@ def test_freeze_stops_withdrawals_but_not_deposits(tmp_path, capsys):
     assert "available: 1500.00 NGN" in capsys.readouterr().out
 
 
+def test_history_lists_the_wallets_transactions_oldest_first(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+
+    run(db, "deposit", wallet_id, "5000")
+    capsys.readouterr()
+    run(db, "deposit", wallet_id, "2000.50")
+    capsys.readouterr()
+
+    assert run(db, "history", wallet_id) == 0
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert "deposit" in lines[0]
+    assert "5000.00 NGN" in lines[0]
+    assert "successful" in lines[0]
+    assert "deposit" in lines[1]
+    assert "2000.50 NGN" in lines[1]
+
+
+def test_history_of_wallet_with_no_transactions_is_friendly(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+
+    assert run(db, "history", wallet_id) == 0
+    out = capsys.readouterr().out
+    assert "no transactions" in out
+
+
+def test_history_of_unknown_wallet_is_an_error(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+
+    assert run(db, "history", str(uuid4())) == 1
+    assert "error:" in capsys.readouterr().err
+
+
 def test_unknown_command_is_a_usage_error(tmp_path):
     db = str(tmp_path / "cli.db")
 

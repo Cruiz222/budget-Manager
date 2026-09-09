@@ -90,3 +90,62 @@ def test_get_by_internal_reference_returns_none_when_not_found():
 
     assert result is None
 
+
+def test_get_by_wallet_id_returns_that_wallets_ledger_oldest_first():
+    wallet_id = uuid4()
+    other_wallet_id = uuid4()
+
+    def build_transaction(owner, created_at):
+        return Transaction(
+            wallet_id=owner,
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            internal_reference=str(uuid4()),
+            created_at=created_at,
+        )
+
+    repository = InMemoryTransactionRepository()
+    first = build_transaction(wallet_id, datetime(2026, 1, 2))
+    second = build_transaction(wallet_id, datetime(2026, 1, 3))
+    stranger = build_transaction(other_wallet_id, datetime(2026, 1, 1))
+    # Save out of order: the ledger must come back oldest first regardless.
+    for transaction in (stranger, second, first):
+        repository.save(transaction)
+
+    ledger = repository.get_by_wallet_id(wallet_id)
+
+    assert [t.transaction_id for t in ledger] == [
+        first.transaction_id,
+        second.transaction_id,
+    ]
+
+
+def test_get_by_wallet_id_is_empty_for_a_wallet_without_transactions():
+    repository = InMemoryTransactionRepository()
+
+    assert repository.get_by_wallet_id(uuid4()) == []
+
+
+def test_get_by_provider_reference_finds_a_saved_transaction():
+    repository = InMemoryTransactionRepository()
+    transaction = Transaction(
+        wallet_id=uuid4(),
+        type=TransactionType.DEPOSIT,
+        amount=Money(5000, Currency.NGN),
+        internal_reference="payment-1",
+        provider_reference="prov-123",
+    )
+    repository.save(transaction)
+
+    result = repository.get_by_provider_reference("prov-123")
+
+    assert result is transaction
+
+
+def test_get_by_provider_reference_returns_none_when_not_found():
+    repository = InMemoryTransactionRepository()
+
+    result = repository.get_by_provider_reference("prov-missing")
+
+    assert result is None
+

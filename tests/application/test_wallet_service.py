@@ -13,6 +13,7 @@ from app.domain.money.exception import (
 )
 from app.domain.money.money import Money
 from app.domain.money.transactionStatus import TransactionStatus
+from app.domain.money.transactionType import TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
 from app.infrastructure.persistence.sqlite_unit_of_work import (
@@ -244,3 +245,62 @@ def test_status_change_on_unknown_wallet_raises(tmp_path):
 
     with pytest.raises(WalletNotFoundError):
         service.freeze_wallet(uuid4())
+
+
+def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path):
+    wallet = build_wallet()
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    service.deposit(
+        wallet.wallet_id,
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+    service.withdraw(
+        wallet.wallet_id,
+        Money(Decimal("2000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+
+    ledger = service.transactions_for_wallet(wallet.wallet_id)
+
+    assert [transaction.type for transaction in ledger] == [
+        TransactionType.DEPOSIT,
+        TransactionType.WITHDRAWAL,
+    ]
+    assert all(
+        transaction.status is TransactionStatus.SUCCESSFUL
+        for transaction in ledger
+    )
+
+
+def test_transactions_for_wallet_ignores_other_wallets(tmp_path):
+    wallet = build_wallet()
+    other_wallet = build_wallet()
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+    seed(factory, other_wallet)
+
+    service.deposit(
+        wallet.wallet_id,
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+    service.deposit(
+        other_wallet.wallet_id,
+        Money(Decimal("7000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+
+    ledger = service.transactions_for_wallet(wallet.wallet_id)
+
+    assert len(ledger) == 1
+    assert ledger[0].amount == Money(Decimal("5000"), NGN)
+
+
+def test_transactions_for_wallet_of_unknown_wallet_raises(tmp_path):
+    service, _ = build_service(tmp_path)
+
+    with pytest.raises(WalletNotFoundError):
+        service.transactions_for_wallet(uuid4())

@@ -61,6 +61,12 @@ class RecordingTransactionRepository(TransactionRepository):
         # duplicate, so the answer is always None.
         return None
 
+    def get_by_wallet_id(self, wallet_id):
+        raise NotImplementedError
+
+    def get_by_provider_reference(self, provider_reference):
+        raise NotImplementedError
+
 
 # --- Successful deposit ---
 
