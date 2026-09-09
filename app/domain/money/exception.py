@@ -6,7 +6,7 @@ class CurrencyMismatchError(MoneyError):
     pass
 class InvalidMoneyOperationError(MoneyError):
     pass
-class ZeroDivisionError(MoneyError):
+class MoneyDivisionByZeroError(MoneyError):
     pass
 class UnsupportedDecimalPlaceError(MoneyError):
     pass
@@ -41,6 +41,10 @@ class InvalidWalletStatusError(MoneyError):
 class InvalidWalletAvailableBalanceError(MoneyError):
     pass
 class InvalidWalletLockedBalanceError(MoneyError):
+    pass
+class InvalidWalletIDError(MoneyError):
+    pass
+class InvalidWalletUserIDError(MoneyError):
     pass
 class TransactionAlreadySuccessfulError(MoneyError):
     pass

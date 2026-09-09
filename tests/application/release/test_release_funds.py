@@ -25,22 +25,6 @@ NGN = Currency.NGN
 USD = Currency.USD
 
 
-def build_wallet(
-    status=WalletStatus.ACTIVE,
-    available="10000",
-    locked="5000",
-    currency=NGN,
-):
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=status,
-        _available_balance=Money(Decimal(available), currency),
-        _locked_balance=Money(Decimal(locked), currency),
-        currency=currency,
-    )
-
-
 class RecordingTransactionRepository(TransactionRepository):
     def __init__(self):
         self.saved_statuses = []
@@ -64,8 +48,8 @@ class RecordingTransactionRepository(TransactionRepository):
 
 # --- Successful release ---
 
-def test_successful_release_moves_locked_to_available_and_persists_successful_transaction():
-    wallet = build_wallet()
+def test_successful_release_moves_locked_to_available_and_persists_successful_transaction(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
 
     transaction = ReleaseFunds(wallet, repository).execute(
@@ -83,8 +67,8 @@ def test_successful_release_moves_locked_to_available_and_persists_successful_tr
     assert stored.completed_at is not None
 
 
-def test_release_is_persisted_as_pending_before_wallet_is_touched():
-    wallet = build_wallet()
+def test_release_is_persisted_as_pending_before_wallet_is_touched(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = RecordingTransactionRepository()
 
     ReleaseFunds(wallet, repository).execute(
@@ -100,8 +84,8 @@ def test_release_is_persisted_as_pending_before_wallet_is_touched():
 
 # --- Invalid amounts are rejected before any record exists ---
 
-def test_release_with_zero_amount_fails_and_persists_nothing():
-    wallet = build_wallet()
+def test_release_with_zero_amount_fails_and_persists_nothing(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
@@ -115,8 +99,8 @@ def test_release_with_zero_amount_fails_and_persists_nothing():
     assert not repository.transactions
 
 
-def test_release_with_negative_amount_fails_and_persists_nothing():
-    wallet = build_wallet()
+def test_release_with_negative_amount_fails_and_persists_nothing(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
@@ -129,8 +113,8 @@ def test_release_with_negative_amount_fails_and_persists_nothing():
     assert not repository.transactions
 
 
-def test_release_with_non_money_amount_fails_and_persists_nothing():
-    wallet = build_wallet()
+def test_release_with_non_money_amount_fails_and_persists_nothing(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
@@ -144,7 +128,7 @@ def test_release_with_non_money_amount_fails_and_persists_nothing():
 
 # --- Wallet rejections leave a FAILED audit record ---
 
-def test_release_more_than_locked_balance_fails_and_persists_failed_transaction():
+def test_release_more_than_locked_balance_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
 
@@ -161,8 +145,8 @@ def test_release_more_than_locked_balance_fails_and_persists_failed_transaction(
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_release_from_closed_wallet_fails_and_persists_failed_transaction():
-    wallet = build_wallet(status=WalletStatus.CLOSED)
+def test_release_from_closed_wallet_fails_and_persists_failed_transaction(build_wallet):
+    wallet = build_wallet(status=WalletStatus.CLOSED, locked="5000")
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(WalletClosedError):
@@ -177,8 +161,8 @@ def test_release_from_closed_wallet_fails_and_persists_failed_transaction():
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_release_with_wrong_currency_fails_and_persists_failed_transaction():
-    wallet = build_wallet()
+def test_release_with_wrong_currency_fails_and_persists_failed_transaction(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(CurrencyMismatchError):
@@ -194,7 +178,7 @@ def test_release_with_wrong_currency_fails_and_persists_failed_transaction():
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_rejected_release_is_persisted_as_pending_then_failed():
+def test_rejected_release_is_persisted_as_pending_then_failed(build_wallet):
     wallet = build_wallet(locked="5000")
     repository = RecordingTransactionRepository()
 
@@ -212,8 +196,8 @@ def test_rejected_release_is_persisted_as_pending_then_failed():
 
 # --- Idempotency ---
 
-def test_replaying_the_same_internal_reference_releases_only_once():
-    wallet = build_wallet()
+def test_replaying_the_same_internal_reference_releases_only_once(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
     service = ReleaseFunds(wallet, repository)
     reference = str(uuid4())
@@ -225,8 +209,8 @@ def test_replaying_the_same_internal_reference_releases_only_once():
     assert wallet.locked_balance == Money(Decimal("2000"), NGN)
 
 
-def test_caller_supplied_internal_reference_is_persisted():
-    wallet = build_wallet()
+def test_caller_supplied_internal_reference_is_persisted(build_wallet):
+    wallet = build_wallet(locked="5000")
     repository = InMemoryTransactionRepository()
     reference = "release-escrow-5b73"
 

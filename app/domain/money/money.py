@@ -6,7 +6,7 @@ from .exception import (
     UnsupportedCurrencyError,
     CurrencyMismatchError,
     InvalidMoneyOperationError,
-    ZeroDivisionError,
+    MoneyDivisionByZeroError,
     UnsupportedDecimalPlaceError,
 )
 
@@ -102,7 +102,7 @@ class Money:
                 "Use an int or Decimal divisor."
             )
         if divisor == 0:
-            raise ZeroDivisionError("Cannot divide Money by zero.")
+            raise MoneyDivisionByZeroError("Cannot divide Money by zero.")
 
         return Money(self.amount / divisor, self.currency)
 

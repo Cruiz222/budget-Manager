@@ -16,22 +16,11 @@ from app.infrastructure.repositories.sqlite_wallet_repository import (
 NGN = Currency.NGN
 
 
-def build_wallet(available="10000", locked="0"):
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=WalletStatus.ACTIVE,
-        _available_balance=Money(Decimal(available), NGN),
-        _locked_balance=Money(Decimal(locked), NGN),
-        currency=NGN,
-    )
-
-
 def build_repository():
     return SqliteWalletRepository(open_sqlite_connection(":memory:"))
 
 
-def test_save_and_get_by_id_round_trips_the_wallet():
+def test_save_and_get_by_id_round_trips_the_wallet(build_wallet):
     wallet = build_wallet()
     repository = build_repository()
 
@@ -46,7 +35,7 @@ def test_save_and_get_by_id_round_trips_the_wallet():
     assert stored.locked_balance == wallet.locked_balance
 
 
-def test_save_overwrites_an_existing_wallet():
+def test_save_overwrites_an_existing_wallet(build_wallet):
     wallet = build_wallet()
     repository = build_repository()
     repository.save(wallet)

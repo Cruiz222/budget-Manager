@@ -10,7 +10,7 @@ from app.domain.money.exception import (
     InvalidMoneyOperationError,
     UnsupportedCurrencyError,
     UnsupportedDecimalPlaceError,
-    ZeroDivisionError,
+    MoneyDivisionByZeroError,
 )
 
 NGN = Currency.NGN
@@ -187,7 +187,7 @@ def test_dividing_by_decimal_works():
 
 
 def test_dividing_by_zero_raises():
-    with pytest.raises(ZeroDivisionError):
+    with pytest.raises(MoneyDivisionByZeroError):
         Money(Decimal("100"), NGN) / 0
 
 

@@ -13,18 +13,7 @@ from app.infrastructure.repositories.in_memory_wallet_repository import (
 )
 
 
-def build_wallet():
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=WalletStatus.ACTIVE,
-        _available_balance=Money(Decimal("10000"), Currency.NGN),
-        _locked_balance=Money(Decimal("0"), Currency.NGN),
-        currency=Currency.NGN,
-    )
-
-
-def test_save_and_get_by_id_returns_same_wallet():
+def test_save_and_get_by_id_returns_same_wallet(build_wallet):
     wallet = build_wallet()
     repository = InMemoryWalletRepository()
 

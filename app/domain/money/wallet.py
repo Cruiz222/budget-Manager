@@ -17,7 +17,9 @@ from .exception import (
     InvalidWalletCurrencyError,
     InvalidWalletStatusError,
     InvalidWalletAvailableBalanceError,
-    InvalidWalletLockedBalanceError
+    InvalidWalletLockedBalanceError,
+    InvalidWalletIDError,
+    InvalidWalletUserIDError
 
 
 )
@@ -133,6 +135,12 @@ class Wallet:
 
 
     def __post_init__(self):
+        if not isinstance(self.wallet_id, uuid.UUID):
+            raise InvalidWalletIDError("invalid wallet id")
+
+        if not isinstance(self.user_id, uuid.UUID):
+            raise InvalidWalletUserIDError("invalid user id")
+
         if not isinstance(self.currency, Currency):
            raise InvalidWalletCurrencyError("invalid wallet currency")
         

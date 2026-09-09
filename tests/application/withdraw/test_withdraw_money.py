@@ -28,21 +28,6 @@ NGN = Currency.NGN
 USD = Currency.USD
 
 
-def build_wallet(
-    status=WalletStatus.ACTIVE,
-    available="10000",
-    currency=NGN,
-):
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=status,
-        _available_balance=Money(Decimal(available), currency),
-        _locked_balance=Money(Decimal("0"), currency),
-        currency=currency,
-    )
-
-
 class RecordingTransactionRepository(TransactionRepository):
     """Records the status on every save() so tests can assert the order of
     lifecycle steps rather than only the final state."""
@@ -70,7 +55,7 @@ class RecordingTransactionRepository(TransactionRepository):
 
 # --- Successful withdrawal ---
 
-def test_successful_withdrawal_decreases_balance_and_persists_successful_transaction():
+def test_successful_withdrawal_decreases_balance_and_persists_successful_transaction(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -88,7 +73,7 @@ def test_successful_withdrawal_decreases_balance_and_persists_successful_transac
     assert stored.completed_at is not None
 
 
-def test_withdrawal_is_persisted_as_pending_before_wallet_is_touched():
+def test_withdrawal_is_persisted_as_pending_before_wallet_is_touched(build_wallet):
     wallet = build_wallet()
     repository = RecordingTransactionRepository()
 
@@ -105,7 +90,7 @@ def test_withdrawal_is_persisted_as_pending_before_wallet_is_touched():
 
 # --- Invalid amounts are rejected before any record exists ---
 
-def test_withdrawal_with_zero_amount_fails_and_persists_nothing():
+def test_withdrawal_with_zero_amount_fails_and_persists_nothing(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -119,7 +104,7 @@ def test_withdrawal_with_zero_amount_fails_and_persists_nothing():
     assert not repository.transactions
 
 
-def test_withdrawal_with_negative_amount_fails_and_persists_nothing():
+def test_withdrawal_with_negative_amount_fails_and_persists_nothing(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -133,7 +118,7 @@ def test_withdrawal_with_negative_amount_fails_and_persists_nothing():
     assert not repository.transactions
 
 
-def test_withdrawal_with_non_money_amount_fails_and_persists_nothing():
+def test_withdrawal_with_non_money_amount_fails_and_persists_nothing(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -149,7 +134,7 @@ def test_withdrawal_with_non_money_amount_fails_and_persists_nothing():
 
 # --- Wallet rejections leave a FAILED audit record ---
 
-def test_withdrawal_from_frozen_wallet_fails_and_persists_failed_transaction():
+def test_withdrawal_from_frozen_wallet_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet(status=WalletStatus.FROZEN)
     repository = InMemoryTransactionRepository()
 
@@ -165,7 +150,7 @@ def test_withdrawal_from_frozen_wallet_fails_and_persists_failed_transaction():
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_withdrawal_from_closed_wallet_fails_and_persists_failed_transaction():
+def test_withdrawal_from_closed_wallet_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet(status=WalletStatus.CLOSED)
     repository = InMemoryTransactionRepository()
 
@@ -181,7 +166,7 @@ def test_withdrawal_from_closed_wallet_fails_and_persists_failed_transaction():
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_withdrawal_beyond_available_balance_fails_and_persists_failed_transaction():
+def test_withdrawal_beyond_available_balance_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet(available="10000")
     repository = InMemoryTransactionRepository()
 
@@ -197,7 +182,7 @@ def test_withdrawal_beyond_available_balance_fails_and_persists_failed_transacti
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_withdrawal_with_wrong_currency_fails_and_persists_failed_transaction():
+def test_withdrawal_with_wrong_currency_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -213,7 +198,7 @@ def test_withdrawal_with_wrong_currency_fails_and_persists_failed_transaction():
     assert stored.status is TransactionStatus.FAILED
 
 
-def test_rejected_withdrawal_is_persisted_as_pending_then_failed():
+def test_rejected_withdrawal_is_persisted_as_pending_then_failed(build_wallet):
     wallet = build_wallet(available="10000")
     repository = RecordingTransactionRepository()
 
@@ -231,7 +216,7 @@ def test_rejected_withdrawal_is_persisted_as_pending_then_failed():
 
 # --- Idempotency ---
 
-def test_replaying_the_same_internal_reference_withdraws_only_once():
+def test_replaying_the_same_internal_reference_withdraws_only_once(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
     service = WithdrawMoney(wallet, repository)
@@ -244,7 +229,7 @@ def test_replaying_the_same_internal_reference_withdraws_only_once():
     assert wallet.available_balance == Money(Decimal("5000"), NGN)
 
 
-def test_caller_supplied_internal_reference_is_persisted():
+def test_caller_supplied_internal_reference_is_persisted(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
     reference = "client-payout-3a9f"

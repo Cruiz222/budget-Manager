@@ -22,17 +22,6 @@ from app.infrastructure.repositories.sqlite_wallet_repository import (
 NGN = Currency.NGN
 
 
-def build_wallet():
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=WalletStatus.ACTIVE,
-        _available_balance=Money(Decimal("10000"), NGN),
-        _locked_balance=Money(Decimal("0"), NGN),
-        currency=NGN,
-    )
-
-
 def build_transaction(wallet, **overrides):
     kwargs = dict(
         wallet_id=wallet.wallet_id,
@@ -51,7 +40,7 @@ def build_repository(wallet):
     return SqliteTransactionRepository(connection)
 
 
-def test_round_trips_a_successful_transaction():
+def test_round_trips_a_successful_transaction(build_wallet):
     wallet = build_wallet()
     transaction = build_transaction(
         wallet,
@@ -78,7 +67,7 @@ def test_round_trips_a_successful_transaction():
     assert stored.completed_at == transaction.completed_at
 
 
-def test_save_updates_the_same_row_across_the_lifecycle():
+def test_save_updates_the_same_row_across_the_lifecycle(build_wallet):
     """A PENDING write followed by a SUCCESSFUL write must update one row."""
     wallet = build_wallet()
     transaction = build_transaction(wallet)
@@ -103,7 +92,7 @@ def test_save_updates_the_same_row_across_the_lifecycle():
         ("mark_failed", TransactionStatus.FAILED),
     ],
 )
-def test_round_trips_terminal_status(transition, expected_status):
+def test_round_trips_terminal_status(transition, expected_status, build_wallet):
     wallet = build_wallet()
     transaction = build_transaction(wallet)
     getattr(transaction, transition)()
@@ -116,7 +105,7 @@ def test_round_trips_terminal_status(transition, expected_status):
     assert stored.completed_at == transaction.completed_at
 
 
-def test_round_trips_a_reversed_transaction():
+def test_round_trips_a_reversed_transaction(build_wallet):
     wallet = build_wallet()
     transaction = build_transaction(wallet)
     transaction.mark_successful()
@@ -131,7 +120,7 @@ def test_round_trips_a_reversed_transaction():
     assert stored.reversed_at == transaction.reversed_at
 
 
-def test_get_by_internal_reference_finds_a_saved_transaction():
+def test_get_by_internal_reference_finds_a_saved_transaction(build_wallet):
     wallet = build_wallet()
     transaction = build_transaction(wallet)
     transaction.mark_successful()
@@ -144,14 +133,14 @@ def test_get_by_internal_reference_finds_a_saved_transaction():
     assert stored.transaction_id == transaction.transaction_id
 
 
-def test_get_by_internal_reference_returns_none_when_absent():
+def test_get_by_internal_reference_returns_none_when_absent(build_wallet):
     wallet = build_wallet()
     repository = build_repository(wallet)
 
     assert repository.get_by_internal_reference(str(uuid4())) is None
 
 
-def test_get_by_wallet_id_returns_that_wallets_ledger_oldest_first():
+def test_get_by_wallet_id_returns_that_wallets_ledger_oldest_first(build_wallet):
     wallet = build_wallet()
     other_wallet = build_wallet()
     repository = build_repository(wallet)
@@ -173,14 +162,14 @@ def test_get_by_wallet_id_returns_that_wallets_ledger_oldest_first():
     ]
 
 
-def test_get_by_wallet_id_is_empty_for_a_wallet_without_transactions():
+def test_get_by_wallet_id_is_empty_for_a_wallet_without_transactions(build_wallet):
     wallet = build_wallet()
     repository = build_repository(wallet)
 
     assert repository.get_by_wallet_id(wallet.wallet_id) == []
 
 
-def test_get_by_provider_reference_finds_a_saved_transaction():
+def test_get_by_provider_reference_finds_a_saved_transaction(build_wallet):
     wallet = build_wallet()
     transaction = build_transaction(wallet, provider_reference="prov-123")
     transaction.mark_successful()
@@ -193,14 +182,14 @@ def test_get_by_provider_reference_finds_a_saved_transaction():
     assert stored.transaction_id == transaction.transaction_id
 
 
-def test_get_by_provider_reference_returns_none_when_absent():
+def test_get_by_provider_reference_returns_none_when_absent(build_wallet):
     wallet = build_wallet()
     repository = build_repository(wallet)
 
     assert repository.get_by_provider_reference("prov-missing") is None
 
 
-def test_get_by_id_of_missing_transaction_raises():
+def test_get_by_id_of_missing_transaction_raises(build_wallet):
     wallet = build_wallet()
     repository = build_repository(wallet)
 

@@ -13,18 +13,7 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 NGN = Currency.NGN
 
 
-def build_wallet():
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=WalletStatus.ACTIVE,
-        _available_balance=Money(Decimal("10000"), NGN),
-        _locked_balance=Money(Decimal("0"), NGN),
-        currency=NGN,
-    )
-
-
-def test_two_service_instances_share_state_over_one_database(tmp_path):
+def test_two_service_instances_share_state_over_one_database(tmp_path, build_wallet):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
 
     # Seed a wallet through a unit of work, exactly like the service would.

@@ -18,17 +18,6 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 NGN = Currency.NGN
 
 
-def build_wallet():
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=WalletStatus.ACTIVE,
-        _available_balance=Money(Decimal("10000"), NGN),
-        _locked_balance=Money(Decimal("0"), NGN),
-        currency=NGN,
-    )
-
-
 def build_successful_deposit(wallet, internal_reference):
     transaction = Transaction(
         wallet_id=wallet.wallet_id,
@@ -40,7 +29,7 @@ def build_successful_deposit(wallet, internal_reference):
     return transaction
 
 
-def test_rollback_discards_a_wallet_and_its_transaction(tmp_path):
+def test_rollback_discards_a_wallet_and_its_transaction(tmp_path, build_wallet):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / "atomic.db"))
     wallet = build_wallet()
     internal_reference = str(uuid4())
@@ -58,7 +47,7 @@ def test_rollback_discards_a_wallet_and_its_transaction(tmp_path):
     fresh.rollback()
 
 
-def test_commit_persists_wallet_and_transaction_together(tmp_path):
+def test_commit_persists_wallet_and_transaction_together(tmp_path, build_wallet):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / "atomic.db"))
     wallet = build_wallet()
     wallet.apply_deposit(Money(Decimal("5000"), NGN))  # new balance: 15000
@@ -80,7 +69,7 @@ def test_commit_persists_wallet_and_transaction_together(tmp_path):
     fresh.rollback()
 
 
-def test_rollback_keeps_the_prior_committed_balance(tmp_path):
+def test_rollback_keeps_the_prior_committed_balance(tmp_path, build_wallet):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / "atomic.db"))
     wallet = build_wallet()
 

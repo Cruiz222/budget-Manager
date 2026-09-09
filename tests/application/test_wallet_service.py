@@ -23,17 +23,6 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 NGN = Currency.NGN
 
 
-def build_wallet(available="10000", locked="0", status=WalletStatus.ACTIVE):
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=status,
-        _available_balance=Money(Decimal(available), NGN),
-        _locked_balance=Money(Decimal(locked), NGN),
-        currency=NGN,
-    )
-
-
 def build_service(tmp_path):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / "wallet_service.db"))
     return WalletService(factory), factory
@@ -61,7 +50,7 @@ def get_transaction(factory, internal_reference):
         uow.rollback()
 
 
-def test_deposit_loads_wallet_and_persists_new_balance(tmp_path):
+def test_deposit_loads_wallet_and_persists_new_balance(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -82,7 +71,7 @@ def test_deposit_loads_wallet_and_persists_new_balance(tmp_path):
     assert stored_transaction.status is TransactionStatus.SUCCESSFUL
 
 
-def test_withdrawal_persists_new_balance(tmp_path):
+def test_withdrawal_persists_new_balance(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -99,7 +88,7 @@ def test_withdrawal_persists_new_balance(tmp_path):
     )
 
 
-def test_lock_moves_both_balances(tmp_path):
+def test_lock_moves_both_balances(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -126,7 +115,7 @@ def test_operation_on_unknown_wallet_raises(tmp_path):
         )
 
 
-def test_rejected_operation_persists_a_failed_audit_row_and_no_balance_change(tmp_path):
+def test_rejected_operation_persists_a_failed_audit_row_and_no_balance_change(tmp_path, build_wallet):
     wallet = build_wallet(status=WalletStatus.CLOSED)
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -148,7 +137,7 @@ def test_rejected_operation_persists_a_failed_audit_row_and_no_balance_change(tm
     assert stored_transaction.status is TransactionStatus.FAILED
 
 
-def test_replaying_an_internal_reference_does_not_double_credit(tmp_path):
+def test_replaying_an_internal_reference_does_not_double_credit(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -194,7 +183,7 @@ def test_get_wallet_of_unknown_id_raises(tmp_path):
         service.get_wallet(uuid4())
 
 
-def test_freeze_persists_frozen_then_unfreeze_restores_active(tmp_path):
+def test_freeze_persists_frozen_then_unfreeze_restores_active(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -214,7 +203,7 @@ def test_freeze_persists_frozen_then_unfreeze_restores_active(tmp_path):
     )
 
 
-def test_freezing_an_already_frozen_wallet_rejects(tmp_path):
+def test_freezing_an_already_frozen_wallet_rejects(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -231,7 +220,7 @@ def test_freezing_an_already_frozen_wallet_rejects(tmp_path):
     )
 
 
-def test_unfreezing_an_already_active_wallet_rejects(tmp_path):
+def test_unfreezing_an_already_active_wallet_rejects(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -247,7 +236,7 @@ def test_status_change_on_unknown_wallet_raises(tmp_path):
         service.freeze_wallet(uuid4())
 
 
-def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path):
+def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
@@ -275,7 +264,7 @@ def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path):
     )
 
 
-def test_transactions_for_wallet_ignores_other_wallets(tmp_path):
+def test_transactions_for_wallet_ignores_other_wallets(tmp_path, build_wallet):
     wallet = build_wallet()
     other_wallet = build_wallet()
     service, factory = build_service(tmp_path)

@@ -9,8 +9,34 @@ from app.domain.money.exception import (
    InvalidWalletStatusError,
    InvalidWalletAvailableBalanceError,
    InvalidWalletLockedBalanceError,
+   InvalidWalletIDError,
+   InvalidWalletUserIDError,
    CurrencyMismatchError
 )
+
+
+def test_wallet_with_invalid_id_raises_error():
+    with pytest.raises(InvalidWalletIDError):
+        Wallet(
+            wallet_id="not-a-uuid",
+            user_id=uuid4(),
+            currency=Currency.NGN,
+            status=WalletStatus.ACTIVE,
+            _available_balance=Money(5000, Currency.NGN),
+            _locked_balance=Money(6000, Currency.NGN),
+        )
+
+
+def test_wallet_with_invalid_user_id_raises_error():
+    with pytest.raises(InvalidWalletUserIDError):
+        Wallet(
+            wallet_id=uuid4(),
+            user_id="not-a-uuid",
+            currency=Currency.NGN,
+            status=WalletStatus.ACTIVE,
+            _available_balance=Money(5000, Currency.NGN),
+            _locked_balance=Money(6000, Currency.NGN),
+        )
 
 
 def test_wallet_with_invalid_currency_raises_error():

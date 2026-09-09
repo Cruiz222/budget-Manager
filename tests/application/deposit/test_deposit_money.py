@@ -24,21 +24,6 @@ NGN = Currency.NGN
 USD = Currency.USD
 
 
-def build_wallet(
-    status=WalletStatus.ACTIVE,
-    available="10000",
-    currency=NGN,
-):
-    return Wallet(
-        wallet_id=uuid4(),
-        user_id=uuid4(),
-        status=status,
-        _available_balance=Money(Decimal(available), currency),
-        _locked_balance=Money(Decimal("0"), currency),
-        currency=currency,
-    )
-
-
 class RecordingTransactionRepository(TransactionRepository):
     """Test double that records the status each time save() is called.
 
@@ -70,7 +55,7 @@ class RecordingTransactionRepository(TransactionRepository):
 
 # --- Successful deposit ---
 
-def test_successful_deposit_increases_balance_and_persists_successful_transaction():
+def test_successful_deposit_increases_balance_and_persists_successful_transaction(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -88,7 +73,7 @@ def test_successful_deposit_increases_balance_and_persists_successful_transactio
     assert stored.completed_at is not None
 
 
-def test_deposit_is_persisted_as_pending_before_wallet_is_touched():
+def test_deposit_is_persisted_as_pending_before_wallet_is_touched(build_wallet):
     wallet = build_wallet()
     repository = RecordingTransactionRepository()
 
@@ -105,7 +90,7 @@ def test_deposit_is_persisted_as_pending_before_wallet_is_touched():
 
 # --- Invalid amounts are rejected before any record exists ---
 
-def test_deposit_with_zero_amount_fails_and_persists_nothing():
+def test_deposit_with_zero_amount_fails_and_persists_nothing(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -119,7 +104,7 @@ def test_deposit_with_zero_amount_fails_and_persists_nothing():
     assert not repository.transactions
 
 
-def test_deposit_with_negative_amount_fails_and_persists_nothing():
+def test_deposit_with_negative_amount_fails_and_persists_nothing(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -133,7 +118,7 @@ def test_deposit_with_negative_amount_fails_and_persists_nothing():
     assert not repository.transactions
 
 
-def test_deposit_with_non_money_amount_fails_and_persists_nothing():
+def test_deposit_with_non_money_amount_fails_and_persists_nothing(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -149,7 +134,7 @@ def test_deposit_with_non_money_amount_fails_and_persists_nothing():
 
 # --- Wallet rejections leave a FAILED audit record ---
 
-def test_deposit_with_wrong_currency_fails_and_persists_failed_transaction():
+def test_deposit_with_wrong_currency_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -166,7 +151,7 @@ def test_deposit_with_wrong_currency_fails_and_persists_failed_transaction():
     assert stored.completed_at is not None
 
 
-def test_deposit_into_closed_wallet_fails_and_persists_failed_transaction():
+def test_deposit_into_closed_wallet_fails_and_persists_failed_transaction(build_wallet):
     wallet = build_wallet(status=WalletStatus.CLOSED)
     repository = InMemoryTransactionRepository()
 
@@ -183,7 +168,7 @@ def test_deposit_into_closed_wallet_fails_and_persists_failed_transaction():
     assert stored.completed_at is not None
 
 
-def test_rejected_deposit_is_persisted_as_pending_then_failed():
+def test_rejected_deposit_is_persisted_as_pending_then_failed(build_wallet):
     wallet = build_wallet(status=WalletStatus.CLOSED)
     repository = RecordingTransactionRepository()
 
@@ -201,7 +186,7 @@ def test_rejected_deposit_is_persisted_as_pending_then_failed():
 
 # --- Idempotency ---
 
-def test_replaying_the_same_internal_reference_credits_only_once():
+def test_replaying_the_same_internal_reference_credits_only_once(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
     service = DepositMoney(wallet, repository)
@@ -215,7 +200,7 @@ def test_replaying_the_same_internal_reference_credits_only_once():
     assert wallet.available_balance == Money(Decimal("15000"), NGN)
 
 
-def test_different_internal_references_are_both_credited():
+def test_different_internal_references_are_both_credited(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
     service = DepositMoney(wallet, repository)
@@ -227,7 +212,7 @@ def test_different_internal_references_are_both_credited():
     assert len(repository.transactions) == 2
 
 
-def test_caller_supplied_internal_reference_is_persisted():
+def test_caller_supplied_internal_reference_is_persisted(build_wallet):
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
     reference = "client-order-7f8a"
