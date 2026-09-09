@@ -5,7 +5,12 @@ import pytest
 
 from app.application.wallet_service import WalletService
 from app.domain.money.currency import Currency
-from app.domain.money.exception import WalletClosedError, WalletNotFoundError
+from app.domain.money.exception import (
+    WalletAlreadyActiveError,
+    WalletAlreadyFrozenError,
+    WalletClosedError,
+    WalletNotFoundError,
+)
 from app.domain.money.money import Money
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.wallet import Wallet
@@ -186,3 +191,56 @@ def test_get_wallet_of_unknown_id_raises(tmp_path):
 
     with pytest.raises(WalletNotFoundError):
         service.get_wallet(uuid4())
+
+
+def test_freeze_persists_frozen_then_unfreeze_restores_active(tmp_path):
+    wallet = build_wallet()
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    frozen = service.freeze_wallet(wallet.wallet_id)
+    assert frozen.status is WalletStatus.FROZEN
+    assert (
+        get_wallet(factory, wallet.wallet_id).status
+        is WalletStatus.FROZEN
+    )
+
+    active = service.unfreeze_wallet(wallet.wallet_id)
+    assert active.status is WalletStatus.ACTIVE
+    assert (
+        get_wallet(factory, wallet.wallet_id).status
+        is WalletStatus.ACTIVE
+    )
+
+
+def test_freezing_an_already_frozen_wallet_rejects(tmp_path):
+    wallet = build_wallet()
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    service.freeze_wallet(wallet.wallet_id)
+
+    with pytest.raises(WalletAlreadyFrozenError):
+        service.freeze_wallet(wallet.wallet_id)
+
+    # Unfreezing a frozen wallet is the intended path - it succeeds.
+    assert (
+        service.unfreeze_wallet(wallet.wallet_id).status
+        is WalletStatus.ACTIVE
+    )
+
+
+def test_unfreezing_an_already_active_wallet_rejects(tmp_path):
+    wallet = build_wallet()
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    with pytest.raises(WalletAlreadyActiveError):
+        service.unfreeze_wallet(wallet.wallet_id)
+
+
+def test_status_change_on_unknown_wallet_raises(tmp_path):
+    service, _ = build_service(tmp_path)
+
+    with pytest.raises(WalletNotFoundError):
+        service.freeze_wallet(uuid4())

@@ -80,6 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     balance_parser.add_argument("wallet_id", type=_uuid)
 
+    freeze_parser = subparsers.add_parser(
+        "freeze", help="freeze a wallet (stops withdrawals)"
+    )
+    freeze_parser.add_argument("wallet_id", type=_uuid)
+
+    unfreeze_parser = subparsers.add_parser(
+        "unfreeze", help="return a frozen wallet to active"
+    )
+    unfreeze_parser.add_argument("wallet_id", type=_uuid)
+
     for name, _ in OPERATIONS.items():
         op_parser = subparsers.add_parser(name, help=f"{name} money")
         op_parser.add_argument("wallet_id", type=_uuid)
@@ -129,6 +139,18 @@ def _operation(service: WalletService, args) -> int:
     return 0
 
 
+def _freeze(service: WalletService, args) -> int:
+    wallet = service.freeze_wallet(args.wallet_id)
+    print(f"wallet {wallet.wallet_id} is now {wallet.status.name.lower()}")
+    return 0
+
+
+def _unfreeze(service: WalletService, args) -> int:
+    wallet = service.unfreeze_wallet(args.wallet_id)
+    print(f"wallet {wallet.wallet_id} is now {wallet.status.name.lower()}")
+    return 0
+
+
 def _describe(exc: MoneyError) -> str:
     return str(exc) if str(exc) else exc.__class__.__name__
 
@@ -144,6 +166,10 @@ def main(argv=None) -> int:
             return _open(service, args)
         if args.command == "balance":
             return _balance(service, args)
+        if args.command == "freeze":
+            return _freeze(service, args)
+        if args.command == "unfreeze":
+            return _unfreeze(service, args)
         return _operation(service, args)
     except MoneyError as exc:
         print(f"error: {_describe(exc)}", file=sys.stderr)

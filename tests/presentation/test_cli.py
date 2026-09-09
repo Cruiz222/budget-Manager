@@ -71,6 +71,47 @@ def test_invalid_amount_is_a_usage_error(tmp_path):
     assert excinfo.value.code == 2
 
 
+def test_freeze_then_unfreeze_round_trip(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+
+    assert run(db, "freeze", wallet_id) == 0
+    assert "is now frozen" in capsys.readouterr().out
+
+    assert run(db, "balance", wallet_id) == 0
+    out = capsys.readouterr().out
+    assert "status: frozen" in out
+    assert "available: 0.00 NGN" in out
+
+    assert run(db, "unfreeze", wallet_id) == 0
+    assert "is now active" in capsys.readouterr().out
+
+    assert run(db, "balance", wallet_id) == 0
+    assert "status: active" in capsys.readouterr().out
+
+
+def test_freeze_stops_withdrawals_but_not_deposits(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "1000")
+    capsys.readouterr()
+    run(db, "freeze", wallet_id)
+    capsys.readouterr()
+
+    # A frozen wallet rejects the withdrawal ...
+    assert run(db, "withdraw", wallet_id, "300") == 1
+    assert "error:" in capsys.readouterr().err
+
+    # ... but the freeze was a status change only - no money moved.
+    assert run(db, "balance", wallet_id) == 0
+    assert "available: 1000.00 NGN" in capsys.readouterr().out
+
+    # Top-ups are still allowed while frozen.
+    assert run(db, "deposit", wallet_id, "500") == 0
+    assert run(db, "balance", wallet_id) == 0
+    assert "available: 1500.00 NGN" in capsys.readouterr().out
+
+
 def test_unknown_command_is_a_usage_error(tmp_path):
     db = str(tmp_path / "cli.db")
 

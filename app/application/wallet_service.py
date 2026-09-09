@@ -73,6 +73,31 @@ class WalletService:
         finally:
             uow.rollback()
 
+    def freeze_wallet(self, wallet_id: UUID) -> Wallet:
+        """Freeze a wallet, stopping withdrawals until it is unfrozen."""
+        return self._change_status(wallet_id, Wallet.freeze)
+
+    def unfreeze_wallet(self, wallet_id: UUID) -> Wallet:
+        """Return a frozen wallet to its active state."""
+        return self._change_status(wallet_id, Wallet.unfreeze)
+
+    def _change_status(self, wallet_id: UUID, transition) -> Wallet:
+        """Load a wallet, apply a status transition, persist it atomically.
+
+        Unlike a money operation there is no ledger row - the wallet either
+        moves to the new state or (on rejection) stays as it was.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            wallet = uow.wallets.get_by_id(wallet_id)
+            transition(wallet)
+            uow.wallets.save(wallet)
+            uow.commit()
+            return wallet
+        except BaseException:
+            uow.rollback()
+            raise
+
     def _run(
         self,
         operation_cls,
