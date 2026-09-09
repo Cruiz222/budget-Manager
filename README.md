@@ -262,4 +262,44 @@ INFRASTRUCTURE
 app/infrastructure/repositories/
 └── in_memory_transaction_repository.py
         │
-        └── defines HOW it actually stores transactions        
+        └── defines HOW it actually stores transactions 
+
+
+        Our rule
+
+Think of the transaction as having two categories:
+
+Immutable facts — set once at creation:
+
+transaction_id
+wallet_id
+type
+amount
+internal_reference
+provider_reference
+narration
+created_at
+
+Lifecycle state — changes only through domain methods:
+
+status
+completed_at
+reversed_at       
+
+
+Transaction
+│
+├── Facts — cannot be changed
+│   ├── transaction_id
+│   ├── wallet_id
+│   ├── type
+│   ├── amount
+│   ├── internal_reference
+│   ├── provider_reference
+│   ├── narration
+│   └── created_at
+│
+└── Lifecycle — controlled changes
+    ├── status
+    ├── completed_at
+    └── reversed_at

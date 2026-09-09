@@ -98,10 +98,7 @@ def test_creating_transaction_with_provider_reference_as_none_is_valid():
             internal_reference="internal-reference"
         )     
 
-    transaction.provider_reference = None
-
-    assert transaction.provider_reference == None   
-
+    assert transaction.provider_reference is None
 
    
 def test_creating_transaction_with_narration_must_be_a_string():
@@ -125,9 +122,7 @@ def test_creating_transaction_with_narration_as_none_is_valid():
             narration=None
         )     
 
-    transaction.narration = None
-
-    assert transaction.narration == None   
+    assert transaction.narration is None  
 
 
 
