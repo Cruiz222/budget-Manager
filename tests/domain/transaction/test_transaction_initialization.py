@@ -98,21 +98,12 @@ def test_creating_transaction_with_provider_reference_as_none_is_valid():
             internal_reference="internal-reference"
         )     
 
-    transaction.internal_reference = None
+    transaction.provider_reference = None
 
-    assert transaction.internal_reference == None   
+    assert transaction.provider_reference == None   
 
 
-def test_creating_transaction_with_narration_must_be_a_string():
-    with pytest.raises(InvalidTransactionNarration):
-        Transaction(
-            wallet_id=uuid4(),
-            type=TransactionType.DEPOSIT,
-            amount=Money(5000, Currency.NGN),
-            provider_reference="provider-reference",
-            internal_reference="internal-reference",
-            narration=int
-        )      
+   
 def test_creating_transaction_with_narration_must_be_a_string():
     with pytest.raises(InvalidTransactionNarration):
         Transaction(
@@ -216,4 +207,27 @@ def test_reversed_transaction_must_not_have_completed_at_as_none():
 
          assert transaction.status == TransactionStatus.REVERSED
          assert transaction.completed_at == successful_completed_at
+
+
+
+def test_reversed_transaction_must_not_have_reversed_at_as_none():
+         transaction = Transaction (
+            wallet_id=uuid4(),
+            type=TransactionType.DEPOSIT,
+            amount=Money(5000, Currency.NGN),
+            provider_reference="provider-reference",
+            internal_reference="internal-reference",
+            narration="narration",
+            reversed_at=None
+        )       
+
+         transaction.mark_successful() 
+         successful_completed_at = transaction.completed_at
+
+         transaction.reverse()
+
+         assert transaction.status == TransactionStatus.REVERSED
+         assert transaction.completed_at == successful_completed_at
+         assert transaction.reversed_at is not None
+         assert transaction.reversed_at >= successful_completed_at
 

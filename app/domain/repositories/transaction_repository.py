@@ -6,5 +6,8 @@ class TransactionRepository(ABC):
     @abstractmethod
     def save(self, transaction: Transaction) -> Transaction :
         pass
-        
+    @abstractmethod    
+    def get_by_id(self, transaction_id) -> Transaction:
+        pass
+    
 

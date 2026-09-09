@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from dataclasses import field
 import uuid
 from datetime import datetime
+from types import MappingProxyType
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.money import Money
@@ -24,13 +25,12 @@ from app.domain.money.exception import (
 class Transaction:
     wallet_id: uuid.UUID
     type: TransactionType
-    amount: Money
+    amount: initVar[Money]
+    _amount: Money = field(init=False)
     internal_reference: str
-
     provider_reference: str | None = None
     narration: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
-
     transaction_id: uuid.UUID = field(default_factory=uuid.uuid4)
     _status: TransactionStatus = field(
     default=TransactionStatus.PENDING,
@@ -38,11 +38,20 @@ class Transaction:
 )
     created_at: datetime = field(default_factory=datetime.now)
     completed_at: datetime | None = None
+    reversed_at: datetime | None = None
 
 
     @property
     def status(self) -> TransactionStatus:
         return self._status
+
+    @property
+    def metadata(self):
+        return MappingProxyType(self._metadata) 
+
+    @property
+    def amount(self) -> Money:
+        return self._amount        
 
 
     def mark_successful(self):
@@ -74,7 +83,8 @@ class Transaction:
         if self.status != TransactionStatus.SUCCESSFUL:
             raise InvalidTransactionStateError 
 
-        self._status = TransactionStatus.REVERSED  
+        self.reversed_at = datetime.now()
+        self._status = TransactionStatus.REVERSED   
 
 
     def __post_init__(self):
@@ -84,11 +94,13 @@ class Transaction:
         if not isinstance(self.type, TransactionType):
             raise InvalidTransactionTypeError
         
-        if not isinstance(self.amount, Money):
+        if not isinstance(self._amount, Money):
             raise InvalidTransactionAmountError
         
         if self.amount.amount <= 0:
             raise InvalidTransactionAmountError
+
+        self._amount = amount    
         
         if self.internal_reference == "":
             raise InvalidInternalReference
@@ -101,6 +113,8 @@ class Transaction:
         
         if not isinstance(self.metadata, dict):
             raise InvalidMetaData
+
+        self.metadata = MappingProxyType(self.metadata)   
         
         if self.status == TransactionStatus.PENDING and self.completed_at is not None:
             raise InvalidTransactionDateStamp("pending transaction must not have completed at")

@@ -41,3 +41,20 @@ def test_newly_created_transaction_must_start_with_status_pending():
     )        
 
     assert transaction.status == TransactionStatus.PENDING
+
+
+def test_transaction_amount_can_not_be_changed_directly():
+    transaction = Transaction (
+        transaction_id=uuid4(),
+        wallet_id=uuid4(),
+        type=TransactionType.DEPOSIT,
+        amount=Money(5000, Currency.NGN),
+        internal_reference="internal_reference",
+        provider_reference="provider_reference",
+        metadata={},
+        created_at=datetime.now(),
+        completed_at=None,
+    )
+
+    with pytest.raises(AttributeError):
+        transaction.amount = Money(100, Currency.NGN)
