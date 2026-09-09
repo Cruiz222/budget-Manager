@@ -7,3 +7,6 @@ __pycache__/
 
 # Test & tooling caches
 .pytest_cache/
+
+# Local database files (created by the SQLite composition root)
+*.db
