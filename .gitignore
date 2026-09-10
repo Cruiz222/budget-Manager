@@ -10,3 +10,6 @@ __pycache__/
 
 # Local database files (created by the SQLite composition root)
 *.db
+
+# Project archive snapshots
+project.zip

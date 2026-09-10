@@ -5,6 +5,7 @@ from types import MappingProxyType
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.money import Money
+from app.domain.money.destination import Destination
 from app.domain.money.exception import (
     TransactionAlreadySuccessfulError,
     TransactionAlreadyFailedError,
@@ -14,6 +15,9 @@ from app.domain.money.exception import (
     InvalidTransactionWalletIDError,
     InvalidTransactionTypeError,
     InvalidTransactionAmountError,
+    InvalidTransactionDestinationError,
+    MissingDestinationError,
+    UnexpectedDestinationError,
     InvalidInternalReference,
     InvalidproviderReference,
     InvalidTransactionNarration,
@@ -31,6 +35,7 @@ class Transaction:
     provider_reference: str | None
     narration: str | None
     _metadata: dict[str, object]
+    _destination: Destination | None
 
     _transaction_id: uuid.UUID
     _status: TransactionStatus
@@ -54,6 +59,7 @@ class Transaction:
     completed_at: datetime | None = None,
     reversed_at: datetime | None = None,
     status: TransactionStatus = TransactionStatus.PENDING,
+    destination: Destination | None = None,
 ):
         self._wallet_id = wallet_id
         self._type = type
@@ -69,6 +75,8 @@ class Transaction:
             raise InvalidMetaData
 
         self._metadata = dict(metadata)
+
+        self._destination = destination
 
         self._transaction_id = transaction_id or uuid.uuid4()
 
@@ -130,7 +138,11 @@ class Transaction:
 
     @property
     def reversed_at(self):
-        return self._reversed_at                                   
+        return self._reversed_at
+
+    @property
+    def destination(self) -> Destination | None:
+        return self._destination                                   
 
 
     def mark_successful(self):
@@ -227,4 +239,27 @@ class Transaction:
         if self.status != TransactionStatus.REVERSED and self.reversed_at is not None:
             raise InvalidTransactionDateStamp(
                 "only reversed transactions may have reversed_at"
+            )
+
+        # --- Destination invariant ---
+        # A payout sends money to an external account, so it must record where
+        # it went - a payout with no destination is a payment to nowhere. No
+        # other type has a counterparty (a deposit's far end is not the wallet's
+        # business; lock/unlock never leave), so carrying one would be a bug.
+        # Both directions are enforced, exactly as the date-stamp rules above
+        # are: an impossible record cannot be constructed in the first place.
+        if self.destination is not None and not isinstance(self.destination, Destination):
+            raise InvalidTransactionDestinationError(
+                f"destination must be a Destination, not "
+                f"{type(self.destination).__name__}"
+            )
+
+        if self.type is TransactionType.PAYOUT and self.destination is None:
+            raise MissingDestinationError(
+                "a payout transaction must record a destination"
+            )
+
+        if self.type is not TransactionType.PAYOUT and self.destination is not None:
+            raise UnexpectedDestinationError(
+                f"a {self.type.value} transaction must not carry a destination"
             )

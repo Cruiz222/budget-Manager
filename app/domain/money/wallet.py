@@ -112,6 +112,35 @@ class Wallet:
         self._available_balance = self._available_balance + amount    
 
 
+    def payout_from_locked(self, amount: Money):
+        """Send money out of the wallet, spending the locked balance.
+
+        This is the counterpart of withdraw() for reserved funds. The
+        distinction that matters: lock_funds and release_funds only *move*
+        money between the two balances, so the wallet still holds it all.
+        payout_from_locked reduces what the wallet holds - value actually
+        leaves - which is why it refuses a frozen wallet exactly as withdraw()
+        does. Freezing stops value from leaving; it does not stop internal
+        reshuffling between available and locked.
+        """
+        if self.status == WalletStatus.CLOSED:
+            raise WalletClosedError("this wallet is closed")
+
+        if self.status == WalletStatus.FROZEN:
+            raise WalletFrozenError("this wallet is frozen")
+
+        if amount.amount <= 0:
+            raise InvalidAmountError("amount must be greater than zero")
+
+        if self.currency != amount.currency:
+            raise CurrencyMismatchError("currency must be the same")
+
+        if self._locked_balance < amount:
+            raise InsufficientFundsError("insufficient locked balance")
+
+        self._locked_balance = self._locked_balance - amount
+
+
     def freeze(self):
         if self.status == WalletStatus.FROZEN:
             raise WalletAlreadyFrozenError

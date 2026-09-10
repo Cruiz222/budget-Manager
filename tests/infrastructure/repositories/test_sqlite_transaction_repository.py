@@ -4,6 +4,8 @@ from uuid import uuid4
 import pytest
 
 from app.domain.money.currency import Currency
+from app.domain.money.destination import Destination
+from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.exception import TransactionNotFoundError
 from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
@@ -20,6 +22,13 @@ from app.infrastructure.repositories.sqlite_wallet_repository import (
 )
 
 NGN = Currency.NGN
+
+DESTINATION = Destination(
+    kind=DestinationKind.BANK_ACCOUNT,
+    identifier="0123456789",
+    name="Chinedu Okafor",
+    details={"bank_code": "058"},
+)
 
 
 def build_transaction(wallet, **overrides):
@@ -195,3 +204,33 @@ def test_get_by_id_of_missing_transaction_raises(build_wallet):
 
     with pytest.raises(TransactionNotFoundError):
         repository.get_by_id(uuid4())
+
+
+def test_round_trips_a_payout_with_its_destination(build_wallet):
+    """The snapshot survives storage, including the rail-specific details."""
+    wallet = build_wallet()
+    transaction = build_transaction(
+        wallet,
+        type=TransactionType.PAYOUT,
+        destination=DESTINATION,
+    )
+    transaction.mark_successful()
+    repository = build_repository(wallet)
+
+    repository.save(transaction)
+
+    stored = repository.get_by_id(transaction.transaction_id)
+    assert stored.destination == DESTINATION
+    assert stored.destination.kind is DestinationKind.BANK_ACCOUNT
+    assert stored.destination.detail("bank_code") == "058"
+
+
+def test_a_transaction_without_a_destination_round_trips_as_none(build_wallet):
+    wallet = build_wallet()
+    transaction = build_transaction(wallet)
+    transaction.mark_successful()
+    repository = build_repository(wallet)
+
+    repository.save(transaction)
+
+    assert repository.get_by_id(transaction.transaction_id).destination is None

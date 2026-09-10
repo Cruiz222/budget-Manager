@@ -73,4 +73,21 @@ class InvalidMetaData(MoneyError):
 class InvalidTransactionDateStamp(MoneyError):
     pass
 class TransactionNotFoundError(MoneyError):
-    pass    
+    pass
+
+class InvalidDestinationKindError(MoneyError):
+    pass
+class InvalidDestinationIdentifierError(MoneyError):
+    pass
+class InvalidDestinationNameError(MoneyError):
+    pass
+class InvalidDestinationDetailsError(MoneyError):
+    pass
+class MissingDestinationDetailError(MoneyError):
+    pass
+class InvalidTransactionDestinationError(MoneyError):
+    pass
+class MissingDestinationError(MoneyError):
+    pass
+class UnexpectedDestinationError(MoneyError):
+    pass

@@ -8,10 +8,12 @@ from app.domain.money.transactionType import TransactionType
 from app.domain.repositories.transaction_repository import TransactionRepository
 from app.infrastructure.persistence.serialization import (
     datetime_to_text,
+    destination_to_text,
     enum_to_text,
     metadata_to_text,
     money_to_text,
     text_to_datetime,
+    text_to_destination,
     text_to_enum,
     text_to_metadata,
     text_to_money,
@@ -21,8 +23,8 @@ from app.infrastructure.persistence.serialization import (
 
 _COLUMNS = (
     "transaction_id, wallet_id, type, amount, currency, internal_reference, "
-    "provider_reference, narration, metadata, status, created_at, completed_at, "
-    "reversed_at"
+    "provider_reference, narration, metadata, destination, status, created_at, "
+    "completed_at, reversed_at"
 )
 
 
@@ -44,7 +46,7 @@ class SqliteTransactionRepository(TransactionRepository):
         self._connection.execute(
             f"""
             INSERT INTO transactions ({_COLUMNS})
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(transaction_id) DO UPDATE SET
                 wallet_id          = excluded.wallet_id,
                 type               = excluded.type,
@@ -54,6 +56,7 @@ class SqliteTransactionRepository(TransactionRepository):
                 provider_reference = excluded.provider_reference,
                 narration          = excluded.narration,
                 metadata           = excluded.metadata,
+                destination        = excluded.destination,
                 status             = excluded.status,
                 created_at         = excluded.created_at,
                 completed_at       = excluded.completed_at,
@@ -69,6 +72,7 @@ class SqliteTransactionRepository(TransactionRepository):
                 transaction.provider_reference,
                 transaction.narration,
                 metadata_to_text(transaction.metadata),
+                destination_to_text(transaction.destination),
                 enum_to_text(transaction.status),
                 datetime_to_text(transaction.created_at),
                 datetime_to_text(transaction.completed_at),
@@ -138,6 +142,7 @@ class SqliteTransactionRepository(TransactionRepository):
             provider_reference=row["provider_reference"],
             narration=row["narration"],
             metadata=text_to_metadata(row["metadata"]),
+            destination=text_to_destination(row["destination"]),
             transaction_id=text_to_uuid(row["transaction_id"]),
             status=text_to_enum(TransactionStatus, row["status"]),
             created_at=text_to_datetime(row["created_at"]),

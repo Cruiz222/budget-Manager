@@ -3,11 +3,13 @@ from uuid import UUID, uuid4
 
 from app.application.deposit.deposit_money import DepositMoney
 from app.application.lock.lock_funds import LockFunds
+from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.release.release_funds import ReleaseFunds
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.application.wallet_operation import WalletOperation
 from app.application.withdraw.withdraw_money import WithdrawMoney
 from app.domain.money.currency import Currency
+from app.domain.money.destination import Destination
 from app.domain.money.exception import MoneyError
 from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
@@ -42,6 +44,22 @@ class WalletService:
 
     def release(self, wallet_id, amount: Money, internal_reference: str) -> Transaction:
         return self._run(ReleaseFunds, wallet_id, amount, internal_reference)
+
+    def payout_from_locked(
+        self,
+        wallet_id,
+        amount: Money,
+        internal_reference: str,
+        destination: Destination,
+    ) -> Transaction:
+        """Spend the locked balance, sending value out to an external account."""
+        return self._run(
+            PayoutFromLocked,
+            wallet_id,
+            amount,
+            internal_reference,
+            destination=destination,
+        )
 
     def open_wallet(self, user_id: UUID, currency: Currency) -> Wallet:
         """Open a new empty wallet for a user, in the given currency."""
@@ -119,6 +137,7 @@ class WalletService:
         wallet_id: UUID,
         amount: Money,
         internal_reference: str,
+        destination: Destination | None = None,
     ) -> Transaction:
         uow = self._unit_of_work_factory.start()
         try:
@@ -126,7 +145,7 @@ class WalletService:
             operation: WalletOperation = operation_cls(
                 wallet, uow.transactions
             )
-            transaction = operation.execute(amount, internal_reference)
+            transaction = operation.execute(amount, internal_reference, destination)
             # The wallet changed (or would have) - persist the aggregate's new
             # state in the same transaction as the ledger row above.
             uow.wallets.save(wallet)

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+from app.domain.money.destination import Destination
 from app.domain.money.exception import InvalidAmountError, MoneyError
 from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
@@ -11,8 +12,8 @@ from app.domain.repositories.transaction_repository import TransactionRepository
 class WalletOperation(ABC):
     """Shared skeleton for a single-wallet money operation.
 
-    Deposit, withdrawal, lock and release all run the same guarded flow, so the
-    flow lives here once instead of being copy-pasted:
+    Deposit, withdrawal, lock, release and payout all run the same guarded flow,
+    so the flow lives here once instead of being copy-pasted:
 
         validate amount
         -> deduplicate by internal_reference
@@ -20,12 +21,16 @@ class WalletOperation(ABC):
         -> apply through the wallet (it decides)
         -> record SUCCESSFUL, or FAILED on rejection and re-raise
 
-    Concrete use cases supply only the two things that differ:
+    Concrete use cases supply only the things that differ:
       - transaction_type:  the TransactionType recorded on the ledger
       - _apply():          the wallet method that performs the operation
 
     This is the Template Method pattern: the base class owns the algorithm and
     lets subclasses fill in the variable steps.
+
+    ``destination`` is passed straight through to the Transaction, which is
+    where the rule about it lives: a payout must carry one, every other type
+    must not. The base does not police it - it only delivers it.
     """
 
     #: Transaction type recorded for this operation (set by each subclass).
@@ -35,7 +40,12 @@ class WalletOperation(ABC):
         self.wallet = wallet
         self.transaction_repository = transaction_repository
 
-    def execute(self, amount: Money, internal_reference: str) -> Transaction:
+    def execute(
+        self,
+        amount: Money,
+        internal_reference: str,
+        destination: Destination | None = None,
+    ) -> Transaction:
         # 1. Command validation happens before any record exists.
         self._validate_amount(amount)
 
@@ -46,12 +56,15 @@ class WalletOperation(ABC):
         if existing is not None:
             return existing
 
-        # 3. Record intent BEFORE touching the wallet.
+        # 3. Record intent BEFORE touching the wallet. A payout reaches here
+        #    with a destination; every other type reaches here without one. The
+        #    Transaction rejects the wrong combination before anything is saved.
         transaction = Transaction(
             wallet_id=self.wallet.wallet_id,
             type=self.transaction_type,
             amount=amount,
             internal_reference=internal_reference,
+            destination=destination,
         )
         self.transaction_repository.save(transaction)
 

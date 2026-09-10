@@ -19,6 +19,8 @@ from decimal import Decimal, InvalidOperation
 from app.application.wallet_service import WalletService
 from app.composition_root import build_wallet_service
 from app.domain.money.currency import Currency
+from app.domain.money.destination import Destination
+from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.exception import MoneyError
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
@@ -95,6 +97,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     history_parser.add_argument("wallet_id", type=_uuid)
 
+    # Not in OPERATIONS below: a payout takes a destination as well as an
+    # amount, and OPERATIONS drives the plain amount+--ref operations.
+    payout_parser = subparsers.add_parser(
+        "payout",
+        help="send money from the locked balance to a bank account",
+    )
+    payout_parser.add_argument("wallet_id", type=_uuid)
+    payout_parser.add_argument("amount", type=_decimal)
+    payout_parser.add_argument(
+        "--account", required=True, help="destination account number"
+    )
+    payout_parser.add_argument(
+        "--bank-code", required=True, help="destination bank code, e.g. 058"
+    )
+    payout_parser.add_argument(
+        "--name", required=True, help="destination account name"
+    )
+    payout_parser.add_argument(
+        "--ref",
+        help="idempotency key (auto-generated if omitted)",
+    )
+
     for name, _ in OPERATIONS.items():
         op_parser = subparsers.add_parser(name, help=f"{name} money")
         op_parser.add_argument("wallet_id", type=_uuid)
@@ -138,6 +162,32 @@ def _operation(service: WalletService, args) -> int:
     verb = OPERATIONS[args.command]
     print(
         f"{verb} {amount} | "
+        f"available {current.available_balance} | "
+        f"locked {current.locked_balance}"
+    )
+    return 0
+
+
+def _payout(service: WalletService, args) -> int:
+    # Like every other amount on this CLI, the number carries no currency of its
+    # own - it is read in the wallet's currency.
+    wallet = service.get_wallet(args.wallet_id)
+    amount = Money(args.amount, wallet.currency)
+    destination = Destination(
+        kind=DestinationKind.BANK_ACCOUNT,
+        identifier=args.account,
+        name=args.name,
+        details={"bank_code": args.bank_code},
+    )
+    internal_reference = args.ref if args.ref is not None else str(uuid.uuid4())
+
+    service.payout_from_locked(
+        args.wallet_id, amount, internal_reference, destination
+    )
+
+    current = service.get_wallet(args.wallet_id)
+    print(
+        f"paid {amount} to {destination} | "
         f"available {current.available_balance} | "
         f"locked {current.locked_balance}"
     )
@@ -192,6 +242,8 @@ def main(argv=None) -> int:
             return _unfreeze(service, args)
         if args.command == "history":
             return _history(service, args)
+        if args.command == "payout":
+            return _payout(service, args)
         return _operation(service, args)
     except MoneyError as exc:
         print(f"error: {_describe(exc)}", file=sys.stderr)

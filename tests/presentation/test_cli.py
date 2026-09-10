@@ -148,6 +148,92 @@ def test_history_of_unknown_wallet_is_an_error(tmp_path, capsys):
     assert "error:" in capsys.readouterr().err
 
 
+def test_payout_sends_locked_funds_to_a_bank_account(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+    run(db, "lock", wallet_id, "6000")
+    capsys.readouterr()
+
+    assert run(
+        db,
+        "payout",
+        wallet_id,
+        "2000",
+        "--account",
+        "0123456789",
+        "--bank-code",
+        "058",
+        "--name",
+        "Chinedu Okafor",
+    ) == 0
+    out = capsys.readouterr().out
+    assert "paid 2000.00 NGN to Chinedu Okafor (bank_account:0123456789)" in out
+    assert "available 4000.00 NGN" in out
+    assert "locked 4000.00 NGN" in out
+
+
+def test_payout_beyond_the_locked_balance_is_an_error(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+
+    # Nothing is locked, so available balance cannot fund a payout.
+    assert run(
+        db,
+        "payout",
+        wallet_id,
+        "2000",
+        "--account",
+        "0123456789",
+        "--bank-code",
+        "058",
+        "--name",
+        "Chinedu Okafor",
+    ) == 1
+    assert "error:" in capsys.readouterr().err
+
+    assert run(db, "balance", wallet_id) == 0
+    assert "available: 10000.00 NGN" in capsys.readouterr().out
+
+
+def test_payout_appears_in_history(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+    run(db, "lock", wallet_id, "6000")
+    capsys.readouterr()
+    run(
+        db,
+        "payout",
+        wallet_id,
+        "2000",
+        "--account",
+        "0123456789",
+        "--bank-code",
+        "058",
+        "--name",
+        "Chinedu Okafor",
+    )
+    capsys.readouterr()
+
+    assert run(db, "history", wallet_id) == 0
+    out = capsys.readouterr().out
+    assert "payout" in out
+    assert "2000.00 NGN" in out
+
+
+def test_payout_without_a_destination_is_a_usage_error(tmp_path):
+    db = str(tmp_path / "cli.db")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run(db, "payout", str(uuid4()), "2000", "--account", "0123456789")
+    assert excinfo.value.code == 2
+
+
 def test_unknown_command_is_a_usage_error(tmp_path):
     db = str(tmp_path / "cli.db")
 

@@ -5,7 +5,10 @@ import pytest
 
 from app.application.wallet_service import WalletService
 from app.domain.money.currency import Currency
+from app.domain.money.destination import Destination
+from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.exception import (
+    InsufficientFundsError,
     WalletAlreadyActiveError,
     WalletAlreadyFrozenError,
     WalletClosedError,
@@ -21,6 +24,13 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 )
 
 NGN = Currency.NGN
+
+DESTINATION = Destination(
+    kind=DestinationKind.BANK_ACCOUNT,
+    identifier="0123456789",
+    name="Chinedu Okafor",
+    details={"bank_code": "058"},
+)
 
 
 def build_service(tmp_path):
@@ -102,6 +112,66 @@ def test_lock_moves_both_balances(tmp_path, build_wallet):
     stored = get_wallet(factory, wallet.wallet_id)
     assert stored.available_balance == Money(Decimal("7000"), NGN)
     assert stored.locked_balance == Money(Decimal("3000"), NGN)
+
+
+def test_payout_from_locked_spends_the_locked_balance(tmp_path, build_wallet):
+    """Round-trips PAYOUT through SQLite, so the enum name persists and hydrates."""
+    wallet = build_wallet(available="1000", locked="5000")
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    transaction = service.payout_from_locked(
+        wallet.wallet_id,
+        Money(Decimal("3000"), NGN),
+        str(uuid4()),
+        DESTINATION,
+    )
+
+    assert transaction.type is TransactionType.PAYOUT
+    stored = get_wallet(factory, wallet.wallet_id)
+    assert stored.locked_balance == Money(Decimal("2000"), NGN)
+    assert stored.available_balance == Money(Decimal("1000"), NGN)
+
+
+def test_payout_destination_survives_the_database(tmp_path, build_wallet):
+    """The whole point of snapshotting: where the money went is recoverable."""
+    wallet = build_wallet(locked="5000")
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    transaction = service.payout_from_locked(
+        wallet.wallet_id,
+        Money(Decimal("3000"), NGN),
+        str(uuid4()),
+        DESTINATION,
+    )
+
+    stored_transaction = get_transaction(factory, transaction.internal_reference)
+    assert stored_transaction.destination == DESTINATION
+    assert stored_transaction.destination.detail("bank_code") == "058"
+
+
+def test_rejected_payout_persists_a_failed_audit_row_and_no_balance_change(tmp_path, build_wallet):
+    wallet = build_wallet(locked="5000")
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+    internal_reference = str(uuid4())
+
+    with pytest.raises(InsufficientFundsError):
+        service.payout_from_locked(
+            wallet.wallet_id,
+            Money(Decimal("15000"), NGN),
+            internal_reference,
+            DESTINATION,
+        )
+
+    assert (
+        get_wallet(factory, wallet.wallet_id).locked_balance
+        == Money(Decimal("5000"), NGN)
+    )
+    stored_transaction = get_transaction(factory, internal_reference)
+    assert stored_transaction is not None
+    assert stored_transaction.status is TransactionStatus.FAILED
 
 
 def test_operation_on_unknown_wallet_raises(tmp_path):
