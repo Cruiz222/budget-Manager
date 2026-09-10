@@ -1,36 +1,23 @@
-import calendar
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 from .cadence import Cadence
+from .calendarMath import MONTHS_PER_YEAR, add_months
 from .exception import (
     InvalidOccurrenceIndexError,
     InvalidScheduleAnchorError,
     InvalidScheduleCadenceError,
 )
 
-_MONTHS_PER_YEAR = 12
-
-
-def _add_months(start: date, months: int) -> date:
-    """``start`` moved forward by whole months, clamped to the target month's end.
-
-    The clamp is what makes February survivable: a plan anchored on the 31st
-    lands on the 28th in a short month. Note that the day is always read from
-    ``start`` - the anchor - and never from the previous occurrence. That is the
-    whole trick. Advancing month-by-month from the *last run* would take
-    31 Jan -> 28 Feb -> 28 Mar and never find its way back to the 31st.
-    """
-    index = start.month - 1 + months
-    year = start.year + index // _MONTHS_PER_YEAR
-    month = index % _MONTHS_PER_YEAR + 1
-    last_day_of_month = calendar.monthrange(year, month)[1]
-    return date(year, month, min(start.day, last_day_of_month))
-
 
 @dataclass(frozen=True)
 class Schedule:
-    """When a plan repeats: a cadence plus the date the pattern is anchored to.
+    """When a plan repeats: a cadence plus the moment the pattern is anchored to.
+
+    A *moment*, not a day. A plan that pays salaries at noon is a different
+    promise from one that pays them at midnight, and while the anchor was a
+    ``date`` the difference could not be expressed at all - which is what made
+    "notify me 30 minutes before it fires" unrepresentable.
 
     Frozen, and pure: nothing here reads the clock. A ``Schedule`` cannot tell
     you "the next run is Tuesday" - you have to hand it the moment you mean.
@@ -39,29 +26,33 @@ class Schedule:
     """
 
     cadence: Cadence
-    anchor: date
+    anchor: datetime
 
     def __post_init__(self):
         if not isinstance(self.cadence, Cadence):
             raise InvalidScheduleCadenceError(
                 f"cadence must be a Cadence, got {type(self.cadence).__name__}"
             )
-        # A datetime passes isinstance(x, date) - datetime subclasses date - so
-        # without the second clause one would slip through and then poison the
-        # date arithmetic with time-of-day components. Reject it explicitly.
-        if not isinstance(self.anchor, date) or isinstance(self.anchor, datetime):
+        # The old check here had the opposite shape, and the reason is worth
+        # keeping. It had to *exclude* datetimes, because a datetime passes
+        # isinstance(x, date) - the subclass trap - and one would otherwise have
+        # slipped in and been truncated. Now the datetime is what we want, so no
+        # second clause is needed: a plain date is not a datetime, and it is
+        # rejected for that reason rather than by a special case.
+        if not isinstance(self.anchor, datetime):
             raise InvalidScheduleAnchorError(
-                f"anchor must be a date, got {type(self.anchor).__name__}"
+                f"anchor must be a datetime, got {type(self.anchor).__name__}"
             )
 
-    def occurrence(self, index: int) -> date:
-        """The date of the ``index``-th run, counting the anchor as run 0.
+    def occurrence(self, index: int) -> datetime:
+        """The moment of the ``index``-th run, counting the anchor as run 0.
 
         Every occurrence is derived from the anchor rather than from its
         predecessor. That single choice is what makes month-end drift
         unrepresentable instead of merely unlikely: there is no code path that
         can accumulate a rounding error, because nothing is ever computed from
-        the previous answer.
+        the previous answer. It is now also what carries the time of day - every
+        occurrence is the anchor, moved - so a noon plan pays at noon forever.
         """
         if index < 0:
             raise InvalidOccurrenceIndexError(
@@ -72,8 +63,10 @@ class Schedule:
         if self.cadence is Cadence.WEEKLY:
             return self.anchor + timedelta(weeks=index)
         if self.cadence is Cadence.MONTHLY:
-            return _add_months(self.anchor, index)
-        return _add_months(self.anchor, index * _MONTHS_PER_YEAR)
+            return add_months(self.anchor, index)
+        return add_months(self.anchor, index * MONTHS_PER_YEAR)
 
     def __str__(self) -> str:
-        return f"{self.cadence.value} from {self.anchor.isoformat()}"
+        # To the minute: seconds are never something a user set, so printing
+        # "12:00:00" would be reporting precision this value does not have.
+        return f"{self.cadence.value} from {self.anchor.isoformat(timespec='minutes')}"

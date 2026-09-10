@@ -21,7 +21,7 @@ from app.domain.planning.runStatus import RunStatus
 def build_run(**overrides):
     kwargs = dict(
         plan_id=uuid4(),
-        due_at=date(2026, 4, 1),
+        due_at=datetime(2026, 4, 1),
         status=RunStatus.SUCCEEDED,
     )
     kwargs.update(overrides)
@@ -68,14 +68,27 @@ def test_an_invalid_plan_id_is_rejected():
         build_run(plan_id=str(uuid4()))
 
 
-def test_a_datetime_due_at_is_rejected_despite_being_a_date():
-    assert isinstance(datetime(2026, 4, 1, 9, 0), date)  # the trap, stated
+def test_a_bare_date_due_at_is_rejected():
+    """The trap, in the new direction.
+
+    A ``datetime`` passes ``isinstance(x, date)``, so the old check had to
+    exclude datetimes by name. Now a datetime is what a run's occurrence *is*,
+    which makes the reverse mistake just as easy to write: handing in a plain
+    date, which names a day but no moment for the run to have happened at.
+    """
+    assert isinstance(datetime(2026, 4, 1, 9, 0), date)  # the trap, still true
 
     with pytest.raises(InvalidPlanRunDueAtError):
-        build_run(due_at=datetime(2026, 4, 1, 9, 0))
+        build_run(due_at=date(2026, 4, 1))
 
 
-def test_a_non_date_due_at_is_rejected():
+def test_a_datetime_due_at_is_accepted():
+    run = build_run(due_at=datetime(2026, 4, 1, 9, 0))
+
+    assert run.due_at == datetime(2026, 4, 1, 9, 0)
+
+
+def test_a_non_datetime_due_at_is_rejected():
     with pytest.raises(InvalidPlanRunDueAtError):
         build_run(due_at="2026-04-01")
 
@@ -104,15 +117,15 @@ def test_a_run_cannot_be_mutated():
 
 def test_the_natural_key_is_plan_and_occurrence():
     plan_id = uuid4()
-    run = build_run(plan_id=plan_id, due_at=date(2026, 4, 1))
+    run = build_run(plan_id=plan_id, due_at=datetime(2026, 4, 1))
 
-    assert run.key == (plan_id, date(2026, 4, 1))
+    assert run.key == (plan_id, datetime(2026, 4, 1))
 
 
 def test_runs_sharing_a_key_but_differing_in_outcome_are_not_equal():
     """They are not 'the same run' - they are a bug worth catching."""
     plan_id = uuid4()
-    due_at = date(2026, 4, 1)
+    due_at = datetime(2026, 4, 1)
 
     blocked = build_run(plan_id=plan_id, due_at=due_at, status=RunStatus.BLOCKED, reason=RunBlockReason.WALLET_FROZEN)
     succeeded = build_run(plan_id=plan_id, due_at=due_at, status=RunStatus.SUCCEEDED)
@@ -122,19 +135,19 @@ def test_runs_sharing_a_key_but_differing_in_outcome_are_not_equal():
 
 
 def test_str_of_a_successful_run():
-    run = build_run(plan_id=UUID(int=0), due_at=date(2026, 4, 1))
+    run = build_run(plan_id=UUID(int=0), due_at=datetime(2026, 4, 1))
 
-    assert str(run) == f"run of {UUID(int=0)} due 2026-04-01: succeeded"
+    assert str(run) == f"run of {UUID(int=0)} due 2026-04-01T00:00: succeeded"
 
 
 def test_str_of_a_blocked_run_names_the_reason():
     run = build_run(
         plan_id=UUID(int=0),
-        due_at=date(2026, 4, 1),
+        due_at=datetime(2026, 4, 1),
         status=RunStatus.BLOCKED,
         reason=RunBlockReason.INSUFFICIENT_BALANCE,
     )
 
     assert str(run) == (
-        f"run of {UUID(int=0)} due 2026-04-01: blocked (insufficient_balance)"
+        f"run of {UUID(int=0)} due 2026-04-01T00:00: blocked (insufficient_balance)"
     )

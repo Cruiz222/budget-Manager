@@ -21,7 +21,7 @@ from app.infrastructure.persistence.serialization import (
 )
 
 _COLUMNS = (
-    "plan_id, wallet_id, source, schedule, instructions, "
+    "plan_id, wallet_id, name, source, schedule, instructions, "
     "status, completed_runs, ends_on, created_at"
 )
 
@@ -47,11 +47,12 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
         self._connection.execute(
             """
             INSERT INTO savings_plans
-                (plan_id, wallet_id, source, schedule, instructions,
+                (plan_id, wallet_id, name, source, schedule, instructions,
                  status, completed_runs, ends_on, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(plan_id) DO UPDATE SET
                 wallet_id      = excluded.wallet_id,
+                name           = excluded.name,
                 source         = excluded.source,
                 schedule       = excluded.schedule,
                 instructions   = excluded.instructions,
@@ -63,6 +64,7 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
             (
                 uuid_to_text(plan.plan_id),
                 uuid_to_text(plan.wallet_id),
+                plan.name,
                 enum_to_text(plan.source),
                 schedule_to_text(plan.schedule),
                 instructions_to_text(plan.instructions),
@@ -111,6 +113,7 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
         return SavingsPlan(
             plan_id=text_to_uuid(row["plan_id"]),
             wallet_id=text_to_uuid(row["wallet_id"]),
+            name=row["name"],
             source=text_to_enum(PlanSource, row["source"]),
             schedule=text_to_schedule(row["schedule"]),
             _instructions=text_to_instructions(row["instructions"]),

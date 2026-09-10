@@ -12,8 +12,19 @@ class RunBlockReason(Enum):
 
     The set below is **incomplete by design**. These are the refusals the wallet
     can already make, so they are certain; the run use case is what will prove
-    whether anything else is needed. Adding a member later is a data migration,
-    not a refactor - the persisted contract is the member's *name*.
+    whether anything else is needed.
+
+    Adding a member is free, and this line said the opposite until it was
+    corrected. The persisted contract is the member's *name*, so:
+
+    - **renaming** a member is a data migration - existing rows still hold the
+      old name and will fail to read back;
+    - **adding** one is free - no row can hold a name that did not exist;
+    - **widening** what a member *means* is free too, so long as every row
+      already written stays true under the new meaning. If it does not, the old
+      rows silently start lying, and no migration tool can catch that.
+
+    The third case is the dangerous one precisely because it is the quiet one.
     """
 
     INSUFFICIENT_BALANCE = "insufficient_balance"

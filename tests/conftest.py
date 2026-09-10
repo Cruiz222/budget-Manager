@@ -13,7 +13,7 @@ currency - with explicit defaults:
     build_wallet(available="500", locked="2500")
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
@@ -25,6 +25,7 @@ from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.notifications.notificationChannel import NotificationChannel
 from app.domain.planning.cadence import Cadence
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.plannedAction import PlannedAction
@@ -40,6 +41,56 @@ BANK_DESTINATION = Destination(
     name="Chinedu Okafor",
     details={"bank_code": "058"},
 )
+
+#: Every variable ``email_settings`` reads. Cleared for every test in the suite.
+#:
+#: ``os.environ`` is a global that exactly one module reads, and leaving it
+#: alone would make the tests depend on whoever is running them: a developer
+#: with SMTP configured would have ``plan tick`` tests that queue nothing and
+#: then reach out over the network, and the same suite would pass on a clean
+#: machine and fail on a working one. Clearing them here is what makes "no test
+#: opens a socket" a property of the suite rather than a property of the shell
+#: it happens to run in. A test that wants a configured install sets the
+#: variables it needs with ``monkeypatch.setenv``.
+NOTIFICATION_VARIABLES = (
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASSWORD",
+    "SMTP_STARTTLS",
+    "BUDGET_NOTIFY_TO",
+    "BUDGET_NOTIFY_FROM",
+)
+
+
+@pytest.fixture(autouse=True)
+def no_notification_environment(monkeypatch):
+    for name in NOTIFICATION_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+
+
+class FakeChannel(NotificationChannel):
+    """A delivery channel that records instead of sending.
+
+    This is the seam that means no test in this suite opens a socket. It is not
+    a mock: it implements the real port, so anything that passes with this passes
+    with the SMTP adapter as far as the calling code is concerned.
+
+    ``failures`` is a queue of exceptions to raise, consumed one per attempt.
+    Once it is empty, sends succeed - which is what makes "the second tick gets
+    through" expressible without any further arrangement.
+    """
+
+    def __init__(self, failures=()):
+        self.attempts: list = []
+        self.sent: list = []
+        self._failures = list(failures)
+
+    def send(self, message) -> None:
+        self.attempts.append(message)
+        if self._failures:
+            raise self._failures.pop(0)
+        self.sent.append(message)
 
 
 @pytest.fixture
@@ -70,17 +121,27 @@ def build_plan():
 
     Defaults describe the product's headline case: a locked-source monthly plan
     paying 2000 NGN to one named bank account, starting 1 January 2026.
+
+    The anchor default is **midnight**, and that is a deliberate choice about
+    what the suite can see. ``date(...) != datetime(...)``, so a midnight anchor
+    still catches a value that came back as a plain date - the type regression.
+    It does *not* catch a moment that lost its time of day on the way through,
+    because midnight is the one answer that losing the time cannot change; the
+    noon-based tests in ``test_schedule.py`` and ``test_savings_plan.py`` are
+    what cover that. Keeping midnight here buys readable expectations everywhere
+    else in exchange for those few tests carrying the weight.
     """
 
     def _build(
         source: PlanSource = PlanSource.LOCKED,
         cadence: Cadence = Cadence.MONTHLY,
-        anchor: date = date(2026, 1, 1),
+        anchor: datetime = datetime(2026, 1, 1),
         instructions: tuple[Instruction, ...] | None = None,
         status: PlanStatus = PlanStatus.ACTIVE,
         completed_runs: int = 0,
         ends_on: date | None = None,
         wallet_id: UUID | None = None,
+        name: str = "salary",
     ) -> SavingsPlan:
         if instructions is None:
             instructions = (
@@ -93,6 +154,7 @@ def build_plan():
             )
         return SavingsPlan(
             wallet_id=wallet_id if wallet_id is not None else uuid4(),
+            name=name,
             source=source,
             schedule=Schedule(cadence=cadence, anchor=anchor),
             _instructions=instructions,
@@ -100,5 +162,20 @@ def build_plan():
             completed_runs=completed_runs,
             ends_on=ends_on,
         )
+
+    return _build
+
+
+@pytest.fixture
+def build_channel():
+    """Return a fresh FakeChannel, optionally told to fail the first N sends.
+
+        build_channel()                                  # every send succeeds
+        build_channel(failures=[OSError("refused")])      # the first send raises
+        build_channel(failures=[OSError("a"), OSError("b")])   # the first two
+    """
+
+    def _build(failures=()) -> FakeChannel:
+        return FakeChannel(failures=failures)
 
     return _build

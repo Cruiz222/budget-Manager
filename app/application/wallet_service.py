@@ -3,6 +3,7 @@ from uuid import UUID, uuid4
 
 from app.application.deposit.deposit_money import DepositMoney
 from app.application.lock.lock_funds import LockFunds
+from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.release.release_funds import ReleaseFunds
 from app.application.unit_of_work import UnitOfWorkFactory
@@ -55,6 +56,27 @@ class WalletService:
         """Spend the locked balance, sending value out to an external account."""
         return self._run(
             PayoutFromLocked,
+            wallet_id,
+            amount,
+            internal_reference,
+            destination=destination,
+        )
+
+    def payout_from_available(
+        self,
+        wallet_id,
+        amount: Money,
+        internal_reference: str,
+        destination: Destination,
+    ) -> Transaction:
+        """Spend the available balance, sending value out to an external account.
+
+        The unlocked counterpart of payout_from_locked, and the operation a
+        scheduled payout performs when the user never reserved the money. Both
+        record PAYOUT; the difference is which balance funds it.
+        """
+        return self._run(
+            PayoutFromAvailable,
             wallet_id,
             amount,
             internal_reference,

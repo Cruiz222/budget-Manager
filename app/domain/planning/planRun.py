@@ -1,6 +1,6 @@
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 
 from .exception import (
     InvalidPlanRunDueAtError,
@@ -33,16 +33,23 @@ class PlanRun:
     appending a second, contradictory one. The key lives in the database as the
     primary key; Python equality stays whole-object, because two runs that share
     a key and disagree about the outcome are not "the same run" - they are a bug.
+
+    Because ``due_at`` is a moment, the *text* the key is stored as changed from
+    "2026-01-01" to "2026-01-01T00:00:00" when this became a datetime - and two
+    different strings do not collide, so a retried run would have appended the
+    second row this docstring promises cannot exist. That is why the store
+    carries a migration. A primary key is a persisted contract, and changing the
+    representation of a keyed column is a data change, not a refactor.
     """
 
     plan_id: uuid.UUID
-    due_at: date
+    due_at: datetime
     status: RunStatus
     recorded_at: datetime = field(default_factory=datetime.now)
     reason: RunBlockReason | None = None
 
     @property
-    def key(self) -> tuple[uuid.UUID, date]:
+    def key(self) -> tuple[uuid.UUID, datetime]:
         """The natural key: one run per plan per occurrence."""
         return (self.plan_id, self.due_at)
 
@@ -50,12 +57,13 @@ class PlanRun:
         if not isinstance(self.plan_id, uuid.UUID):
             raise InvalidPlanRunPlanIDError("invalid plan id")
 
-        # datetime subclasses date, so the second clause is doing real work -
-        # without it a timestamp would pass and then compare oddly against pure
-        # dates read back from storage.
-        if not isinstance(self.due_at, date) or isinstance(self.due_at, datetime):
+        # The moment of the occurrence, so it matches what the schedule derives.
+        # The check here used to have to exclude datetimes - they pass
+        # isinstance(x, date) - and now it requires one; a plain date is simply
+        # not a datetime, so no second clause is needed to say so.
+        if not isinstance(self.due_at, datetime):
             raise InvalidPlanRunDueAtError(
-                f"due_at must be a date, got {type(self.due_at).__name__}"
+                f"due_at must be a datetime, got {type(self.due_at).__name__}"
             )
 
         if not isinstance(self.status, RunStatus):
@@ -87,6 +95,11 @@ class PlanRun:
             )
 
     def __str__(self) -> str:
+        # To the minute, so this reads like the schedule line and the CLI's
+        # moment display. Bare interpolation would give "2026-04-01 00:00:00" -
+        # a space instead of a T, and seconds nobody set - which is a third
+        # format for the same idea.
+        moment = self.due_at.isoformat(timespec="minutes")
         if self.reason is not None:
-            return f"run of {self.plan_id} due {self.due_at}: {self.status.value} ({self.reason.value})"
-        return f"run of {self.plan_id} due {self.due_at}: {self.status.value}"
+            return f"run of {self.plan_id} due {moment}: {self.status.value} ({self.reason.value})"
+        return f"run of {self.plan_id} due {moment}: {self.status.value}"

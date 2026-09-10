@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -64,7 +64,7 @@ def test_round_trips_a_plan(build_wallet, build_plan):
     wallet = build_wallet()
     plan = build_plan(
         wallet_id=wallet.wallet_id,
-        anchor=date(2026, 1, 1),
+        anchor=datetime(2026, 1, 1),
         ends_on=date(2026, 12, 31),
     )
     repository = build_repository(wallet)
@@ -79,6 +79,29 @@ def test_round_trips_a_plan(build_wallet, build_plan):
     assert stored.completed_runs == 0
     assert stored.ends_on == date(2026, 12, 31)
     assert stored.created_at == plan.created_at
+
+
+def test_the_name_survives(build_wallet, build_plan):
+    """The whole reason the column exists: five plans on a wallet, told apart by name."""
+    wallet = build_wallet()
+    plan = build_plan(wallet_id=wallet.wallet_id, name="Rent 2026")
+    repository = build_repository(wallet)
+
+    repository.save(plan)
+
+    assert repository.get_by_id(plan.plan_id).name == "Rent 2026"
+
+
+def test_renaming_a_plan_persists(build_wallet, build_plan):
+    wallet = build_wallet()
+    plan = build_plan(wallet_id=wallet.wallet_id, name="Rent")
+    repository = build_repository(wallet)
+    repository.save(plan)
+
+    plan.name = "Rent 2027"
+    repository.save(plan)
+
+    assert repository.get_by_id(plan.plan_id).name == "Rent 2027"
 
 
 def test_instructions_survive_with_their_destinations(build_wallet, build_plan):
@@ -100,7 +123,11 @@ def test_instructions_survive_with_their_destinations(build_wallet, build_plan):
 
 def test_a_release_instruction_survives_without_a_destination(build_wallet, build_plan):
     wallet = build_wallet()
-    plan = build_plan(wallet_id=wallet.wallet_id, instructions=(release("1500"),))
+    plan = build_plan(
+        wallet_id=wallet.wallet_id,
+        instructions=(release("1500"),),
+        ends_on=date(2026, 6, 1),
+    )
     repository = build_repository(wallet)
 
     repository.save(plan)
@@ -138,7 +165,7 @@ def test_the_schedule_round_trips(build_wallet, build_plan):
     plan = build_plan(
         wallet_id=wallet.wallet_id,
         cadence=Cadence.WEEKLY,
-        anchor=date(2026, 5, 7),
+        anchor=datetime(2026, 5, 7),
     )
     repository = build_repository(wallet)
 
@@ -146,13 +173,35 @@ def test_the_schedule_round_trips(build_wallet, build_plan):
 
     stored = repository.get_by_id(plan.plan_id)
     assert stored.schedule.cadence is Cadence.WEEKLY
-    assert stored.schedule.anchor == date(2026, 5, 7)
+    assert stored.schedule.anchor == datetime(2026, 5, 7)
+
+
+def test_the_time_of_day_of_the_anchor_survives(build_wallet, build_plan):
+    """The schedule is stored as an anchor *moment*, not as a next-due day.
+
+    If the anchor came back as midnight, every occurrence a reloaded plan
+    derives would move to midnight - and the plan would pay twelve hours early
+    for the rest of its life, having been stored correctly the whole time.
+    """
+    wallet = build_wallet()
+    plan = build_plan(
+        wallet_id=wallet.wallet_id,
+        cadence=Cadence.MONTHLY,
+        anchor=datetime(2026, 3, 2, 12, 0),
+    )
+    repository = build_repository(wallet)
+
+    repository.save(plan)
+
+    stored = repository.get_by_id(plan.plan_id)
+    assert stored.schedule.anchor == datetime(2026, 3, 2, 12, 0)
+    assert stored.next_due_at == datetime(2026, 3, 2, 12, 0)
 
 
 def test_the_anchor_survives_so_drift_protection_survives(build_wallet, build_plan):
     """A reloaded plan must recover the 31st exactly as the in-memory one does."""
     wallet = build_wallet()
-    plan = build_plan(wallet_id=wallet.wallet_id, anchor=date(2026, 1, 31))
+    plan = build_plan(wallet_id=wallet.wallet_id, anchor=datetime(2026, 1, 31))
     repository = build_repository(wallet)
     repository.save(plan)
 
@@ -163,10 +212,10 @@ def test_the_anchor_survives_so_drift_protection_survives(build_wallet, build_pl
         seen.append(stored.next_due_at)
 
     assert seen == [
-        date(2026, 1, 31),
-        date(2026, 2, 28),
-        date(2026, 3, 31),
-        date(2026, 4, 30),
+        datetime(2026, 1, 31),
+        datetime(2026, 2, 28),
+        datetime(2026, 3, 31),
+        datetime(2026, 4, 30),
     ]
 
 
@@ -184,14 +233,14 @@ def test_the_run_count_survives_so_a_reloaded_plan_is_due_where_it_left_off(
     build_wallet, build_plan
 ):
     wallet = build_wallet()
-    plan = build_plan(wallet_id=wallet.wallet_id, anchor=date(2026, 1, 1), completed_runs=3)
+    plan = build_plan(wallet_id=wallet.wallet_id, anchor=datetime(2026, 1, 1), completed_runs=3)
     repository = build_repository(wallet)
 
     repository.save(plan)
 
     stored = repository.get_by_id(plan.plan_id)
     assert stored.completed_runs == 3
-    assert stored.next_due_at == date(2026, 4, 1)
+    assert stored.next_due_at == datetime(2026, 4, 1)
 
 
 def test_get_by_id_of_a_missing_plan_raises(build_wallet):

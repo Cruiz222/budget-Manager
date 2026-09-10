@@ -151,11 +151,11 @@ def text_to_destination(value: str | None) -> Destination | None:
 
 
 def schedule_to_text(schedule: Schedule) -> str:
-    """Store a schedule as JSON: its cadence name and its anchor date.
+    """Store a schedule as JSON: its cadence name and its anchor moment.
 
-    The anchor is stored, not a "next due" date. That is the drift guard made
+    The anchor is stored, not a "next due" value. That is the drift guard made
     durable - a plan reloaded from disk recomputes every occurrence from this
-    one date, exactly as it did in memory.
+    one moment, exactly as it did in memory, time of day included.
     """
     return json.dumps(
         {
@@ -166,10 +166,17 @@ def schedule_to_text(schedule: Schedule) -> str:
 
 
 def text_to_schedule(value: str) -> Schedule:
+    """Rebuild a schedule from its JSON form.
+
+    ``datetime.fromisoformat`` reads a bare "2026-01-01" as midnight, so anchors
+    written back when the anchor was a plain date load as midnight plans with no
+    migration - and a midnight plan is exactly what such a row always meant, since
+    every occurrence was derived from it and had no time to carry.
+    """
     payload = json.loads(value)
     return Schedule(
         cadence=text_to_enum(Cadence, payload["cadence"]),
-        anchor=date.fromisoformat(payload["anchor"]),
+        anchor=datetime.fromisoformat(payload["anchor"]),
     )
 
 

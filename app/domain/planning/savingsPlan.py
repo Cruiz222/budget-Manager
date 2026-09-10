@@ -10,14 +10,17 @@ from .exception import (
     InvalidPlanEndDateError,
     InvalidPlanIDError,
     InvalidPlanInstructionsError,
+    InvalidPlanNameError,
     InvalidPlanScheduleError,
     InvalidPlanSourceError,
     InvalidPlanStatusError,
     InvalidPlanWalletIDError,
+    IrreversibleReleasePlanError,
     MixedInstructionCurrenciesError,
     PlanAlreadyFinishedError,
     PlanNotActiveError,
     PlanNotPausedError,
+    ReleasePlanRequiresEndDateError,
     ReleaseRequiresLockedSourceError,
 )
 from .instruction import Instruction
@@ -45,20 +48,32 @@ class SavingsPlan:
     Invariants inside one aggregate belong to that aggregate; invariants that
     span two belong to the application layer.
 
-    ``completed_runs`` is the drift guard. Every due date is derived as
+    ``completed_runs`` is the drift guard. Every due moment is derived as
     ``schedule.occurrence(completed_runs)`` rather than by adding a step to the
-    last run's date, so a plan can never slowly slide off its anchor. It also
+    last run's moment, so a plan can never slowly slide off its anchor. It also
     gives pause/resume the right behaviour for free: a paused plan does not
     advance the counter, so its next run is still the one that was missed.
+
+    Two kinds of plan exist, and they have different rights. A plan that
+    **releases** locked money is a promise the user made to themselves; it is
+    irreversible, so neither ``cancel`` nor ``edit_instructions`` will touch it,
+    and it must name the date the promise comes due. A plan that only **pays
+    out** is an instruction, not a vow - editable and stoppable, whether it
+    spends the locked balance or the available one.
     """
 
     wallet_id: uuid.UUID
+    name: str
     source: PlanSource
     schedule: Schedule
     _instructions: tuple[Instruction, ...]
     plan_id: uuid.UUID = field(default_factory=uuid.uuid4)
     status: PlanStatus = PlanStatus.ACTIVE
     completed_runs: int = 0
+    # A *day*, not a moment, and deliberately so. The plan fires at an instant
+    # and ends on a date: "until 2 July" means through 2 July. The two places
+    # that compare it reduce the moment to its day - see ``record_run`` and
+    # ``__post_init__`` - and ``Duration.end_from`` is where the day comes from.
     ends_on: date | None = None
     created_at: datetime = field(default_factory=datetime.now)
 
@@ -69,11 +84,30 @@ class SavingsPlan:
         Exposed as a tuple rather than the list it was built from so that
         ``plan.instructions.append(...)`` is not merely discouraged but
         impossible - it would slip a line past every ``__post_init__`` check.
+        Changing them is ``edit_instructions``, which runs the checks.
         """
         return self._instructions
 
     @property
-    def next_due_at(self) -> date:
+    def is_irreversible(self) -> bool:
+        """Whether this plan releases locked funds, and so cannot be undone.
+
+        The rule the product rests on: locking is a commitment device, and a
+        commitment you can revoke with one command is not one. So a plan holding
+        a release is refused by ``cancel`` and by ``edit_instructions`` - the
+        money leaves the locked balance when its set date arrives, and not
+        before.
+
+        Deferring a run is recoverable
+        - the run stays queued and resume picks it back up - while cancelling
+        discards it for good. Pausing forever is possible, and visible; the plan
+        sits PAUSED still holding its place. That is a different act from
+        cancelling, and it reads differently to anyone looking at the account.
+        """
+        return self._holds_a_release(self._instructions)
+
+    @property
+    def next_due_at(self) -> datetime:
         """When this plan next fires. Derived from the anchor, never accumulated."""
         return self.schedule.occurrence(self.completed_runs)
 
@@ -91,7 +125,7 @@ class SavingsPlan:
             total = total + instruction.amount
         return total
 
-    def is_due_at(self, moment: date) -> bool:
+    def is_due_at(self, moment: datetime) -> bool:
         """Whether a run is owed as of ``moment``. Only an ACTIVE plan is ever due."""
         return self.status is PlanStatus.ACTIVE and self.next_due_at <= moment
 
@@ -109,7 +143,15 @@ class SavingsPlan:
 
         self.completed_runs += 1
 
-        if self.ends_on is not None and self.next_due_at > self.ends_on:
+        # The plan's end is a *day*, so the test is against the day the next run
+        # falls on - not the moment. A plan anchored at noon on 2 March and told
+        # to end on 2 March has run exactly once: after recording, the next
+        # occurrence is 2 April, whose day is past the end, so the plan retires.
+        # Comparing the moments instead would ask whether noon on 2 April is
+        # after midnight on 2 March, which is the same answer here but the wrong
+        # question - and it would give the wrong answer for a plan ending on its
+        # own last run's day.
+        if self.ends_on is not None and self.next_due_at.date() > self.ends_on:
             self.status = PlanStatus.COMPLETED
 
     def pause(self):
@@ -125,12 +167,51 @@ class SavingsPlan:
         self.status = PlanStatus.ACTIVE
 
     def cancel(self):
-        """End the plan for good. Terminal - unlike pause, there is no way back."""
+        """End the plan for good. Terminal - unlike pause, there is no way back.
+
+        Refused outright for a plan that releases locked funds. That is not an
+        extra rule bolted on: it is the whole point of locking. If the plan that
+        unlocks the money could be cancelled, the lock would be a decoration.
+        """
+        if self.is_irreversible:
+            raise IrreversibleReleasePlanError(
+                "a plan that releases locked funds cannot be cancelled; "
+                "its set date is the condition"
+            )
         if self.status in (PlanStatus.CANCELLED, PlanStatus.COMPLETED):
             raise PlanAlreadyFinishedError(
                 f"a {self.status.value} plan cannot be cancelled"
             )
         self.status = PlanStatus.CANCELLED
+
+    def edit_instructions(self, instructions: tuple[Instruction, ...]):
+        """Replace the plan's lines, for runs that have not happened yet.
+
+        Editing is deliberately routed through the *same* validation the
+        constructor uses rather than a second copy of it. Two code paths
+        enforcing one invariant is a bug factory: the day the currency rule
+        changes, one of them is forgotten, and the aggregate starts accepting
+        plans it would never have been built with. Here there is one rule and
+        one implementation, called from both doors.
+
+        Already-recorded runs are untouched. They describe money that has
+        already moved; rewriting them to match a later edit would make the
+        ledger agree with the plan and disagree with reality.
+
+        Refused for a plan that releases locked funds, and refused once the plan
+        has finished - a cancelled or completed plan is history.
+        """
+        if self.status is not PlanStatus.ACTIVE:
+            raise PlanNotActiveError(
+                f"a {self.status.value} plan cannot be edited"
+            )
+        if self.is_irreversible:
+            raise IrreversibleReleasePlanError(
+                "a plan that releases locked funds cannot be edited; "
+                "its set date is the condition"
+            )
+        self._validate_instructions(instructions)
+        self._instructions = instructions
 
     def __post_init__(self):
         if not isinstance(self.plan_id, uuid.UUID):
@@ -138,6 +219,15 @@ class SavingsPlan:
 
         if not isinstance(self.wallet_id, uuid.UUID):
             raise InvalidPlanWalletIDError("invalid wallet id")
+
+        # A name is not decoration. Without one, a wallet holding five plans can
+        # only be read as five UUIDs, and "cancel the rent plan" stops being
+        # something the user can say. It is validated like a label rather than
+        # like an identifier: a blank name is a name the user did not give.
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise InvalidPlanNameError(
+                f"name must be a non-empty string, got {self.name!r}"
+            )
 
         if not isinstance(self.source, PlanSource):
             raise InvalidPlanSourceError(
@@ -166,20 +256,54 @@ class SavingsPlan:
                     f"ends_on must be a date or None, "
                     f"got {type(self.ends_on).__name__}"
                 )
-            if self.ends_on < self.schedule.anchor:
+            # Reduced to a day on purpose: a term ends on a day, so the end is
+            # compared against the day of the first run. This is one of only two
+            # places a moment and a deadline ever meet, and both do the same
+            # thing. Without the .date() the comparison raises TypeError - a
+            # datetime and a date do not order against each other - which is the
+            # prompt to apply the rule rather than a reason to relax it.
+            if self.ends_on < self.schedule.anchor.date():
                 raise InvalidPlanEndDateError(
                     "ends_on cannot fall before the plan's first run"
                 )
 
-        if not isinstance(self._instructions, tuple):
+        self._validate_instructions(self._instructions)
+
+    def _validate_instructions(self, instructions: tuple[Instruction, ...]):
+        """Everything that has to be true of a plan's instruction list.
+
+        One implementation, called by the constructor and by
+        ``edit_instructions``. It takes the list as an argument rather than
+        reading ``self._instructions`` so that it can check a *candidate* list
+        before the aggregate commits to it - validate, then assign.
+
+        The first draft of this method checked only the rules that mention the
+        instruction list and left the rest in the constructor. Two things then
+        slipped through the edit door: a list could be assigned in place of a
+        tuple, and an open-ended release plan could be created by editing. Both
+        checks had been *written*, and both were unreachable from the second
+        door.
+
+        The lesson is about where the cut is made. Splitting by "which checks
+        mention this field" produced a seam that looked principled and was
+        arbitrary; splitting by "which checks must hold together" does not. A
+        plan's instructions are only valid *relative to the plan's own source
+        and end date*, so those checks belong here even though they read
+        ``self``. The rule: a validation method owns every rule that can be
+        broken by the thing it validates.
+        """
+        # First, because everything below iterates: a list here would mean the
+        # aggregate holds a mutable sequence, which is the exact thing the
+        # tuple requirement exists to prevent.
+        if not isinstance(instructions, tuple):
             raise InvalidPlanInstructionsError(
-                f"instructions must be a tuple, got {type(self._instructions).__name__}"
+                f"instructions must be a tuple, got {type(instructions).__name__}"
             )
 
-        if not self._instructions:
+        if not instructions:
             raise EmptyPlanInstructionsError("a plan must have at least one instruction")
 
-        for instruction in self._instructions:
+        for instruction in instructions:
             if not isinstance(instruction, Instruction):
                 raise InvalidPlanInstructionsError(
                     f"every instruction must be an Instruction, "
@@ -189,7 +313,7 @@ class SavingsPlan:
         # A plan moves one currency. Mixing them inside a single run would make
         # total_to_move - the number the scheduler checks a balance against -
         # meaningless, since there would be no such thing as "the" total.
-        currencies = {instruction.amount.currency for instruction in self._instructions}
+        currencies = {instruction.amount.currency for instruction in instructions}
         if len(currencies) > 1:
             names = sorted(currency.name for currency in currencies)
             raise MixedInstructionCurrenciesError(
@@ -200,14 +324,43 @@ class SavingsPlan:
         # was locked. On an AVAILABLE-source plan it is a no-op with paperwork.
         if self.source is not PlanSource.LOCKED and any(
             instruction.action is PlannedAction.RELEASE
-            for instruction in self._instructions
+            for instruction in instructions
         ):
             raise ReleaseRequiresLockedSourceError(
                 "a plan can only release funds it draws from the locked balance"
             )
 
+        # A plan that releases locked funds is irreversible, so it must say when
+        # the promise comes due. Without an end date it would be both
+        # uncancellable and endless - locked money with no way out at all, which
+        # is strictly worse than the temptation locking exists to prevent. The
+        # rule is derived, not chosen: "irreversible until the set date" only
+        # means something if there is a set date.
+        #
+        # Checked against the *candidate* list, not self._instructions, so that
+        # editing a payout plan into a release plan is refused unless the plan
+        # already has an end date to anchor the promise to.
+        if self._holds_a_release(instructions) and self.ends_on is None:
+            raise ReleasePlanRequiresEndDateError(
+                "a plan that releases locked funds must set the date it ends"
+            )
+
+    @staticmethod
+    def _holds_a_release(instructions) -> bool:
+        """Whether a list of instructions contains a release.
+
+        Static, and takes the list, because it is asked about candidates as well
+        as about the plan's own instructions - ``is_irreversible`` is one caller,
+        validation is the other.
+        """
+        return any(
+            instruction.action is PlannedAction.RELEASE
+            for instruction in instructions
+        )
+
     def __str__(self) -> str:
         return (
-            f"plan {self.plan_id} ({self.status.value}, {self.schedule}, "
-            f"{len(self._instructions)} instruction(s) from {self.source.value})"
+            f"plan {self.name!r} {self.plan_id} ({self.status.value}, "
+            f"{self.schedule}, {len(self._instructions)} instruction(s) "
+            f"from {self.source.value})"
         )

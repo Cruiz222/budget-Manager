@@ -15,14 +15,17 @@ from app.domain.planning.exception import (
     InvalidPlanEndDateError,
     InvalidPlanIDError,
     InvalidPlanInstructionsError,
+    InvalidPlanNameError,
     InvalidPlanScheduleError,
     InvalidPlanSourceError,
     InvalidPlanStatusError,
     InvalidPlanWalletIDError,
+    IrreversibleReleasePlanError,
     MixedInstructionCurrenciesError,
     PlanAlreadyFinishedError,
     PlanNotActiveError,
     PlanNotPausedError,
+    ReleasePlanRequiresEndDateError,
     ReleaseRequiresLockedSourceError,
 )
 from app.domain.planning.instruction import Instruction
@@ -108,21 +111,23 @@ class TestConstruction:
 
 
 class TestConstructionValidation:
-    def test_an_invalid_wallet_id_is_rejected(self, build_plan):
+    def test_an_invalid_wallet_id_is_rejected(self):
         with pytest.raises(InvalidPlanWalletIDError):
             SavingsPlan(
                 wallet_id="not-a-uuid",
+                name="salary",
                 source=PlanSource.LOCKED,
-                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=date(2026, 1, 1)),
+                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
                 _instructions=(payout("500"),),
             )
 
-    def test_an_invalid_plan_id_is_rejected(self, build_plan):
+    def test_an_invalid_plan_id_is_rejected(self):
         with pytest.raises(InvalidPlanIDError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                name="salary",
                 source=PlanSource.LOCKED,
-                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=date(2026, 1, 1)),
+                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
                 _instructions=(payout("500"),),
                 plan_id="not-a-uuid",
             )
@@ -131,8 +136,9 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanSourceError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                name="salary",
                 source="locked",
-                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=date(2026, 1, 1)),
+                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
                 _instructions=(payout("500"),),
             )
 
@@ -140,6 +146,7 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanScheduleError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                name="salary",
                 source=PlanSource.LOCKED,
                 schedule="monthly",
                 _instructions=(payout("500"),),
@@ -149,8 +156,9 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanStatusError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                name="salary",
                 source=PlanSource.LOCKED,
-                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=date(2026, 1, 1)),
+                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
                 _instructions=(payout("500"),),
                 status="running",
             )
@@ -159,25 +167,59 @@ class TestConstructionValidation:
         with pytest.raises(InvalidCompletedRunsError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                name="salary",
                 source=PlanSource.LOCKED,
-                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=date(2026, 1, 1)),
+                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
                 _instructions=(payout("500"),),
                 completed_runs=-1,
             )
 
     def test_an_end_date_before_the_first_run_is_rejected(self, build_plan):
+        """Compared by *day*: 31 May is before 1 June even though the run is at noon."""
         with pytest.raises(InvalidPlanEndDateError):
-            build_plan(anchor=date(2026, 6, 1), ends_on=date(2026, 5, 31))
+            build_plan(anchor=datetime(2026, 6, 1, 12, 0), ends_on=date(2026, 5, 31))
 
     def test_an_end_date_of_today_is_allowed(self, build_plan):
-        """A one-run plan: the anchor itself is the only occurrence."""
-        plan = build_plan(anchor=date(2026, 6, 1), ends_on=date(2026, 6, 1))
+        """A one-run plan: the anchor's own day is the only occurrence.
+
+        Anchored at noon and ended the same day. Allowed, because the end is a
+        *day* - if it were a moment it would be midnight on 1 June, which falls
+        before the plan's only run, and this would be an error instead.
+        """
+        plan = build_plan(anchor=datetime(2026, 6, 1, 12, 0), ends_on=date(2026, 6, 1))
 
         assert plan.ends_on == date(2026, 6, 1)
 
     def test_a_datetime_end_date_is_rejected(self, build_plan):
         with pytest.raises(InvalidPlanEndDateError):
             build_plan(ends_on=datetime(2026, 12, 31, 23, 59))
+
+
+class TestNaming:
+    """A plan has a name because a wallet with five plans is otherwise five UUIDs."""
+
+    def test_a_plan_carries_the_name_it_was_given(self, build_plan):
+        plan = build_plan(name="Rent 2026")
+
+        assert plan.name == "Rent 2026"
+
+    def test_a_blank_name_is_rejected(self, build_plan):
+        with pytest.raises(InvalidPlanNameError):
+            build_plan(name="   ")
+
+    def test_an_empty_name_is_rejected(self, build_plan):
+        with pytest.raises(InvalidPlanNameError):
+            build_plan(name="")
+
+    def test_a_non_string_name_is_rejected(self, build_plan):
+        with pytest.raises(InvalidPlanNameError):
+            build_plan(name=42)
+
+    def test_two_plans_on_one_wallet_are_told_apart_by_name(self, build_plan):
+        rent = build_plan(name="Rent")
+        salary = build_plan(name="Salary")
+
+        assert rent.name != salary.name
 
 
 class TestCurrencyHomogeneity:
@@ -217,7 +259,9 @@ class TestSourceAgainstAction:
 
     def test_releasing_from_a_locked_source_is_allowed(self, build_plan):
         plan = build_plan(
-            source=PlanSource.LOCKED, instructions=(release("1000"),)
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 6, 1),
         )
 
         assert plan.source is PlanSource.LOCKED
@@ -244,20 +288,288 @@ class TestSourceAgainstAction:
         assert len(plan.instructions) == 2
 
 
-class TestDueDates:
+class TestIrreversibility:
+    """Locking is the commitment device, so releasing is the one act you cannot take back."""
+
+    def test_a_payout_plan_is_reversible(self, build_plan):
+        assert not build_plan(instructions=(payout("2000"),)).is_irreversible
+
+    def test_a_release_plan_is_irreversible(self, build_plan):
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        assert plan.is_irreversible
+
+    def test_a_plan_mixing_a_payout_with_a_release_is_irreversible(self, build_plan):
+        """One release is enough - the plan as a whole is now a promise."""
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("2000"), release("500")),
+            ends_on=date(2026, 6, 1),
+        )
+
+        assert plan.is_irreversible
+
+    def test_a_release_plan_without_a_set_date_is_rejected(self, build_plan):
+        """Open-ended and uncancellable together would mean locked money with no exit."""
+        with pytest.raises(ReleasePlanRequiresEndDateError):
+            build_plan(source=PlanSource.LOCKED, instructions=(release("1000"),))
+
+    def test_a_release_plan_with_a_set_date_is_accepted(self, build_plan):
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 3, 1),
+        )
+
+        assert plan.ends_on == date(2026, 3, 1)
+
+    def test_cancelling_a_release_plan_is_refused(self, build_plan):
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        with pytest.raises(IrreversibleReleasePlanError):
+            plan.cancel()
+
+    def test_a_refused_cancellation_leaves_the_plan_active(self, build_plan):
+        """The refusal has to be total - a half-applied status change is worse than none."""
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        with pytest.raises(IrreversibleReleasePlanError):
+            plan.cancel()
+
+        assert plan.status is PlanStatus.ACTIVE
+
+    def test_a_payout_plan_drawing_on_locked_money_can_still_be_cancelled(self, build_plan):
+        """The rule is about releasing, not about which balance the money sits in."""
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("20000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        plan.cancel()
+
+        assert plan.status is PlanStatus.CANCELLED
+
+    def test_a_release_plan_can_still_be_paused(self, build_plan):
+        """Deferral is recoverable, termination is not - so pause survives."""
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        plan.pause()
+
+        assert plan.status is PlanStatus.PAUSED
+
+
+class TestEditing:
+    """Payouts are instructions, not vows - they can be rewritten until they run."""
+
+    def test_an_active_payout_plan_can_be_edited(self, build_plan):
+        plan = build_plan(instructions=(payout("2000"),))
+
+        plan.edit_instructions((payout("3000", "salary"), payout("500", "data")))
+
+        assert len(plan.instructions) == 2
+        assert plan.total_to_move == Money(Decimal("3500"), NGN)
+
+    def test_editing_does_not_disturb_the_plan_position(self, build_plan):
+        """Editing changes the lines, not the run count - the next due moment is untouched."""
+        plan = build_plan(anchor=datetime(2026, 1, 1), completed_runs=3)
+
+        plan.edit_instructions((payout("9999"),))
+
+        assert plan.completed_runs == 3
+        assert plan.next_due_at == datetime(2026, 4, 1)
+
+    def test_editing_to_an_empty_list_is_rejected(self, build_plan):
+        plan = build_plan()
+
+        with pytest.raises(EmptyPlanInstructionsError):
+            plan.edit_instructions(())
+
+    def test_editing_to_a_list_is_rejected(self, build_plan):
+        """The same tuple rule as construction - it is the same validation."""
+        plan = build_plan()
+
+        with pytest.raises(InvalidPlanInstructionsError):
+            plan.edit_instructions([payout("500")])
+
+    def test_editing_may_not_mix_currencies(self, build_plan):
+        plan = build_plan()
+        usd = Instruction(
+            action=PlannedAction.PAYOUT,
+            amount=Money(Decimal("100"), Currency.USD),
+            label="subscription",
+            destination=BANK_DESTINATION,
+        )
+
+        with pytest.raises(MixedInstructionCurrenciesError):
+            plan.edit_instructions((payout("2000"), usd))
+
+    def test_editing_may_not_introduce_a_release_on_an_available_plan(self, build_plan):
+        """The edit door enforces the source rule too - that is why it is one door."""
+        plan = build_plan(source=PlanSource.AVAILABLE, instructions=(payout("2000"),))
+
+        with pytest.raises(ReleaseRequiresLockedSourceError):
+            plan.edit_instructions((release("500"),))
+
+    def test_a_rejected_edit_leaves_the_original_instructions_in_place(self, build_plan):
+        """Validate, then assign. A rejected candidate must not be half-applied."""
+        plan = build_plan(instructions=(payout("2000"),))
+        usd = Instruction(
+            action=PlannedAction.PAYOUT,
+            amount=Money(Decimal("100"), Currency.USD),
+            label="subscription",
+            destination=BANK_DESTINATION,
+        )
+
+        with pytest.raises(MixedInstructionCurrenciesError):
+            plan.edit_instructions((payout("3000"), usd))
+
+        assert plan.instructions == (payout("2000"),)
+        assert plan.total_to_move == Money(Decimal("2000"), NGN)
+
+    def test_a_release_plan_cannot_be_edited(self, build_plan):
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(release("1000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        with pytest.raises(IrreversibleReleasePlanError):
+            plan.edit_instructions((release("2000"),))
+
+    def test_a_paused_plan_cannot_be_edited(self, build_plan):
+        plan = build_plan()
+        plan.pause()
+
+        with pytest.raises(PlanNotActiveError):
+            plan.edit_instructions((payout("500"),))
+
+    def test_a_cancelled_plan_cannot_be_edited(self, build_plan):
+        plan = build_plan()
+        plan.cancel()
+
+        with pytest.raises(PlanNotActiveError):
+            plan.edit_instructions((payout("500"),))
+
+    def test_introducing_a_release_without_a_set_date_is_refused(self, build_plan):
+        """Convert a payout plan into a release plan only if it already says when it ends."""
+        plan = build_plan(source=PlanSource.LOCKED, instructions=(payout("2000"),))
+
+        with pytest.raises(ReleasePlanRequiresEndDateError):
+            plan.edit_instructions((release("2000"),))
+
+    def test_introducing_a_release_with_a_set_date_is_accepted(self, build_plan):
+        """With a date, the conversion is coherent - and the plan becomes irreversible."""
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("2000"),),
+            ends_on=date(2026, 6, 1),
+        )
+
+        plan.edit_instructions((release("2000"),))
+
+        assert plan.is_irreversible
+        with pytest.raises(IrreversibleReleasePlanError):
+            plan.cancel()
+
+
+def usd_payout(amount: str = "100") -> Instruction:
+    return Instruction(
+        action=PlannedAction.PAYOUT,
+        amount=Money(Decimal(amount), Currency.USD),
+        label="subscription",
+        destination=BANK_DESTINATION,
+    )
+
+
+#: Instruction lists that must be refused, with the reason each is refused.
+#: Every one of these is reachable through both doors, and the whole point of
+#: the class below is that neither door is the one that gets forgotten.
+REJECTED_INSTRUCTION_LISTS = [
+    ("empty", PlanSource.LOCKED, None, (), EmptyPlanInstructionsError),
+    ("a list, not a tuple", PlanSource.LOCKED, None, [payout("500")], InvalidPlanInstructionsError),
+    ("a non-instruction", PlanSource.LOCKED, None, (payout("500"), "pay the rent"), InvalidPlanInstructionsError),
+    ("mixed currencies", PlanSource.LOCKED, None, (payout("2000"), usd_payout()), MixedInstructionCurrenciesError),
+    ("a release on an available source", PlanSource.AVAILABLE, None, (release("500"),), ReleaseRequiresLockedSourceError),
+    ("an open-ended release", PlanSource.LOCKED, None, (release("500"),), ReleasePlanRequiresEndDateError),
+]
+
+
+class TestTheTwoDoorsAgree:
+    """Construction and editing enforce one rule, because they call one method.
+
+    Written after both doors were found disagreeing: the edit path accepted a
+    list where the constructor demanded a tuple, and would happily build an
+    open-ended release plan. Two hand-written tests could have caught those
+    individually, and did not - the list and the end-date rule were each checked
+    on the way in and nowhere else.
+
+    This class is the general statement of the rule, so the *next* check that
+    gets added to one door has somewhere to fail loudly if it is not added to
+    the other. It is a property, not an example: for every way a candidate can
+    be illegal, the same candidate must be rejected identically whichever way it
+    arrives.
+    """
+
+    @pytest.mark.parametrize(
+        "description, source, ends_on, candidate, expected",
+        REJECTED_INSTRUCTION_LISTS,
+        ids=[case[0] for case in REJECTED_INSTRUCTION_LISTS],
+    )
+    def test_the_constructor_refuses_the_candidate(
+        self, description, source, ends_on, candidate, expected, build_plan
+    ):
+        with pytest.raises(expected):
+            build_plan(source=source, ends_on=ends_on, instructions=candidate)
+
+    @pytest.mark.parametrize(
+        "description, source, ends_on, candidate, expected",
+        REJECTED_INSTRUCTION_LISTS,
+        ids=[case[0] for case in REJECTED_INSTRUCTION_LISTS],
+    )
+    def test_editing_refuses_the_same_candidate(
+        self, description, source, ends_on, candidate, expected, build_plan
+    ):
+        # Built with a known-good payout list, so the only illegal thing in play
+        # is the candidate - otherwise this would pass for the wrong reason.
+        plan = build_plan(source=source, ends_on=ends_on, instructions=(payout("2000"),))
+
+        with pytest.raises(expected):
+            plan.edit_instructions(candidate)
+
+
+class TestDueMoments:
+    """A plan fires at an instant and is checked against the instant it is asked about."""
+
     def test_a_new_plan_is_due_on_its_anchor(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1))
 
-        assert plan.next_due_at == date(2026, 1, 1)
+        assert plan.next_due_at == datetime(2026, 1, 1)
 
-    def test_the_next_due_date_advances_with_the_run_count(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1), completed_runs=3)
+    def test_the_next_due_moment_advances_with_the_run_count(self, build_plan):
+        plan = build_plan(anchor=datetime(2026, 1, 1), completed_runs=3)
 
-        assert plan.next_due_at == date(2026, 4, 1)
+        assert plan.next_due_at == datetime(2026, 4, 1)
 
     def test_a_plan_anchored_on_the_31st_stays_on_the_31st(self, build_plan):
         """The aggregate inherits the schedule's drift protection, not a copy of it."""
-        plan = build_plan(anchor=date(2026, 1, 31))
+        plan = build_plan(anchor=datetime(2026, 1, 31))
 
         seen = [plan.next_due_at]
         for _ in range(3):
@@ -265,35 +577,42 @@ class TestDueDates:
             seen.append(plan.next_due_at)
 
         assert seen == [
-            date(2026, 1, 31),
-            date(2026, 2, 28),
-            date(2026, 3, 31),
-            date(2026, 4, 30),
+            datetime(2026, 1, 31),
+            datetime(2026, 2, 28),
+            datetime(2026, 3, 31),
+            datetime(2026, 4, 30),
         ]
 
-    def test_a_plan_is_due_once_its_due_date_arrives(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1))
+    def test_a_plan_is_due_once_its_due_moment_arrives(self, build_plan):
+        plan = build_plan(anchor=datetime(2026, 1, 1))
 
-        assert plan.is_due_at(date(2026, 1, 1))
-        assert plan.is_due_at(date(2026, 5, 20))
+        assert plan.is_due_at(datetime(2026, 1, 1))
+        assert plan.is_due_at(datetime(2026, 5, 20))
 
-    def test_a_plan_is_not_due_before_its_due_date(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1))
+    def test_a_plan_is_not_due_before_its_due_moment(self, build_plan):
+        plan = build_plan(anchor=datetime(2026, 1, 1))
 
-        assert not plan.is_due_at(date(2025, 12, 31))
+        assert not plan.is_due_at(datetime(2025, 12, 31))
+
+    def test_a_plan_is_not_due_an_hour_before_its_due_moment(self, build_plan):
+        """The hour is real, not cosmetic - the claim the date-based model could not make."""
+        plan = build_plan(anchor=datetime(2026, 3, 2, 12, 0))
+
+        assert not plan.is_due_at(datetime(2026, 3, 2, 11, 59))
+        assert plan.is_due_at(datetime(2026, 3, 2, 12, 0))
 
     def test_a_paused_plan_is_never_due(self, build_plan):
         """Paused means 'waiting for a human', not 'overdue'."""
-        plan = build_plan(anchor=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1))
         plan.pause()
 
-        assert not plan.is_due_at(date(2026, 6, 1))
+        assert not plan.is_due_at(datetime(2026, 6, 1))
 
     def test_a_cancelled_plan_is_never_due(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1))
         plan.cancel()
 
-        assert not plan.is_due_at(date(2026, 6, 1))
+        assert not plan.is_due_at(datetime(2026, 6, 1))
 
 
 class TestRunCost:
@@ -313,19 +632,22 @@ class TestRunCost:
         assert plan.total_to_move == Money(Decimal("100000"), NGN)
 
     def test_a_run_mixing_payouts_and_releases_totals_both(self, build_plan):
-        plan = build_plan(instructions=(payout("2000"), release("500")))
+        plan = build_plan(
+            instructions=(payout("2000"), release("500")),
+            ends_on=date(2026, 6, 1),
+        )
 
         assert plan.total_to_move == Money(Decimal("2500"), NGN)
 
 
 class TestRunRecording:
     def test_recording_a_run_advances_the_occurrence(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1))
 
         plan.record_run()
 
         assert plan.completed_runs == 1
-        assert plan.next_due_at == date(2026, 2, 1)
+        assert plan.next_due_at == datetime(2026, 2, 1)
 
     def test_recording_a_run_on_a_paused_plan_is_rejected(self, build_plan):
         """A paused plan is paused precisely so that it does not run."""
@@ -337,7 +659,7 @@ class TestRunRecording:
 
     def test_a_paused_plan_does_not_lose_its_place(self, build_plan):
         """Pause then resume picks the missed payment back up; it is not skipped."""
-        plan = build_plan(anchor=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1))
         plan.record_run()
         before = plan.next_due_at
 
@@ -351,7 +673,7 @@ class TestRunRecording:
 class TestEnding:
     def test_a_run_past_the_end_date_completes_the_plan(self, build_plan):
         plan = build_plan(
-            anchor=date(2026, 1, 1),
+            anchor=datetime(2026, 1, 1),
             ends_on=date(2026, 3, 1),
             instructions=(payout("2000"),),
         )
@@ -365,7 +687,7 @@ class TestEnding:
 
     def test_an_ended_plan_reports_its_true_run_count(self, build_plan):
         plan = build_plan(
-            anchor=date(2026, 1, 1),
+            anchor=datetime(2026, 1, 1),
             ends_on=date(2026, 3, 1),
             instructions=(payout("2000"),),
         )
@@ -376,20 +698,115 @@ class TestEnding:
         assert plan.completed_runs == 3
 
     def test_recording_a_run_on_a_completed_plan_is_rejected(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1), ends_on=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1), ends_on=date(2026, 1, 1))
         plan.record_run()
 
         with pytest.raises(PlanNotActiveError):
             plan.record_run()
 
     def test_a_plan_without_an_end_date_keeps_going(self, build_plan):
-        plan = build_plan(anchor=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1))
 
         for _ in range(24):
             plan.record_run()
 
         assert plan.status is PlanStatus.ACTIVE
         assert plan.completed_runs == 24
+
+
+class TestTheLastDayIsIncluded:
+    """Decision A, as claims the aggregate has to keep.
+
+    A plan *fires at a moment* but *ends on a day*, and the end day counts.
+    ``--until 2026-07-02`` means through 2 July, so a noon run on 2 July
+    happens. If the end were a moment it would be midnight on the 2nd - twelve
+    hours *before* that run - and the last payment the user typed the date for
+    would silently not happen.
+
+    The failure this class pins down is quiet in both directions. Compare the
+    moment against a midnight end and the plan retires a day early; compare days
+    and it retires a day late. Neither raises, and neither is visible in the
+    ledger, which is why the boundary is stated here rather than left to the
+    happy-path tests.
+    """
+
+    def test_a_run_on_the_end_day_at_noon_still_happens(self, build_plan):
+        plan = build_plan(
+            anchor=datetime(2026, 3, 1, 12, 0),
+            ends_on=date(2026, 3, 1),
+            instructions=(payout("2000"),),
+        )
+
+        plan.record_run()
+
+        # The noon run happened, and only then did the plan retire.
+        assert plan.completed_runs == 1
+        assert plan.status is PlanStatus.COMPLETED
+
+    def test_the_plan_is_still_active_the_day_before_its_last_day(self, build_plan):
+        """The test that fails if ``ends_on`` is compared as a *moment*.
+
+        Four monthly runs from 2 March land on 2 June. The next due moment is
+        noon on 2 July, which is the last day - still owed, so the plan must
+        still be active. Read ``ends_on`` as midnight and noon-on-the-2nd is
+        already past it, so the plan would complete a day early and 2 July would
+        never be paid.
+        """
+        plan = build_plan(
+            anchor=datetime(2026, 3, 2, 12, 0),
+            ends_on=date(2026, 7, 2),
+            instructions=(payout("2000"),),
+        )
+
+        for _ in range(4):
+            plan.record_run()
+
+        assert plan.status is PlanStatus.ACTIVE
+        assert plan.next_due_at == datetime(2026, 7, 2, 12, 0)
+
+    def test_a_plan_running_through_july_pays_five_times_not_four(self, build_plan):
+        """The headline arithmetic of decision A, at the aggregate.
+
+        2 March, 2 April, 2 May, 2 June and 2 July - five payments. The moment
+        the fifth is recorded, the next due moment is in August, which is past
+        the end, and the plan completes.
+        """
+        plan = build_plan(
+            anchor=datetime(2026, 3, 2, 12, 0),
+            ends_on=date(2026, 7, 2),
+            instructions=(payout("2000"),),
+        )
+
+        for _ in range(5):
+            plan.record_run()
+
+        assert plan.completed_runs == 5
+        assert plan.status is PlanStatus.COMPLETED
+
+    def test_the_end_day_is_judged_by_the_days_the_runs_land_on(self, build_plan):
+        """A late-morning plan and a midnight plan end on the same day.
+
+        The time of day is part of the *moment* and no part of the *deadline*:
+        two plans agreeing on their days must agree on when they end, whatever
+        hour they fire at.
+        """
+        at_noon = build_plan(
+            anchor=datetime(2026, 1, 1, 12, 0),
+            ends_on=date(2026, 3, 1),
+            instructions=(payout("2000"),),
+        )
+        at_midnight = build_plan(
+            anchor=datetime(2026, 1, 1),
+            ends_on=date(2026, 3, 1),
+            instructions=(payout("2000"),),
+        )
+
+        for _ in range(3):
+            at_noon.record_run()
+            at_midnight.record_run()
+
+        assert at_noon.status is at_midnight.status is PlanStatus.COMPLETED
+        assert at_noon.completed_runs == at_midnight.completed_runs == 3
 
 
 class TestLifecycle:
@@ -446,7 +863,7 @@ class TestLifecycle:
 
     def test_cancelling_a_completed_plan_is_rejected(self, build_plan):
         """Terminal is terminal - a completed plan cannot be quietly reopened."""
-        plan = build_plan(anchor=date(2026, 1, 1), ends_on=date(2026, 1, 1))
+        plan = build_plan(anchor=datetime(2026, 1, 1), ends_on=date(2026, 1, 1))
         plan.record_run()
 
         with pytest.raises(PlanAlreadyFinishedError):
@@ -461,7 +878,7 @@ class TestLifecycle:
 
 
 def test_str_summarises_the_plan(build_plan):
-    plan = build_plan(anchor=date(2026, 1, 1))
+    plan = build_plan(anchor=datetime(2026, 1, 1))
 
     assert "active" in str(plan)
     assert "monthly from 2026-01-01" in str(plan)

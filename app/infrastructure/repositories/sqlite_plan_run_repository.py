@@ -1,5 +1,4 @@
 import sqlite3
-from datetime import date
 
 from app.domain.planning.planRun import PlanRun
 from app.domain.planning.runBlockReason import RunBlockReason
@@ -64,9 +63,13 @@ class SqlitePlanRunRepository(PlanRunRepository):
         return [self._row_to_run(row) for row in rows]
 
     def _row_to_run(self, row) -> PlanRun:
+        # text_to_datetime rather than a bare fromisoformat, so the reading rule
+        # lives with every other one. It is also what makes the migration safe to
+        # run in any order relative to this read: an un-migrated "2026-01-01"
+        # still parses, as midnight.
         return PlanRun(
             plan_id=text_to_uuid(row["plan_id"]),
-            due_at=date.fromisoformat(row["due_at"]),
+            due_at=text_to_datetime(row["due_at"]),
             status=text_to_enum(RunStatus, row["status"]),
             reason=text_to_optional_enum(RunBlockReason, row["reason"]),
             recorded_at=text_to_datetime(row["recorded_at"]),

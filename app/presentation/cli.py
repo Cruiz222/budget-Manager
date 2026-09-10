@@ -1,29 +1,84 @@
 """Command-line interface for Budget Manager.
 
 The presentation layer's only job is to translate user intent into calls on the
-application service and render the result. It touches one object - the
-WalletService built by the composition root - and never imports repositories or
-the Unit of Work.
+application service and render the result. It touches the services built by the
+composition root - never repositories, never the Unit of Work.
 
 Run from the repo root:
 
     .venv/bin/python -m app.presentation.cli --db budget.db open --currency NGN
     .venv/bin/python -m app.presentation.cli --db budget.db deposit <wallet_id> 5000
+
+    .venv/bin/python -m app.presentation.cli --db budget.db plan create \\
+        --wallet <wallet_id> --name "Salary 2026" \\
+        --source locked --every monthly --for 12 months \\
+        --pay 20000 0123456789 058 "Chinedu Okafor" salary
+    .venv/bin/python -m app.presentation.cli --db budget.db plan tick
+
+Where validation happens is worth noticing, because the split is deliberate.
+argparse checks *shape*: that a UUID parses, that a date is ISO, that a cadence
+is one of the four words, that an amount arrived at all. It does not check
+*meaning*, because meaning needs the wallet - amounts on this CLI are unitless
+and are read in the wallet's currency, and a plan's currency has to match it.
+So the amounts are converted only after the wallet is loaded, and the domain's
+own errors are what the user sees. Those errors all derive from MoneyError,
+which ``main`` already renders as ``error: ...`` with exit code 1, so a domain
+rejection needs no translation layer here at all.
+
+``plan tick`` also delivers any queued pre-payout warnings, but only if email is
+configured. It is configured entirely from the environment, so that the SMTP
+password never has to live in ``budget.db``:
+
+    SMTP_HOST=smtp.example.com     # required; nothing is sent without it
+    SMTP_PORT=587                  # default 587, the STARTTLS submission port
+    SMTP_USER=me@example.com       # optional; omit for a server needing no login
+    SMTP_PASSWORD=...              # optional, paired with SMTP_USER
+    BUDGET_NOTIFY_TO=me@example.com    # required; where warnings are sent
+    BUDGET_NOTIFY_FROM=me@example.com  # defaults to SMTP_USER
+    SMTP_STARTTLS=0                # only for a local test server with no cert
+
+An install with none of these set is not broken: the tick still warns, still
+records the warning, and still pays - the warnings simply have nowhere to go.
 """
 
 import argparse
 import sys
 import uuid
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
+from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
-from app.composition_root import build_wallet_service
+from app.composition_root import (
+    build_deliverer,
+    build_notifier,
+    build_plan_service,
+    build_scheduler,
+    build_wallet_service,
+)
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
-from app.domain.money.exception import MoneyError
+from app.domain.money.exception import InvalidAmountError, MoneyError
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
+from app.domain.planning.cadence import Cadence
+from app.domain.planning.duration import Duration
+from app.domain.planning.durationUnit import DurationUnit
+from app.domain.planning.exception import (
+    InvalidDurationAmountError,
+    InvalidDurationUnitError,
+)
+from app.domain.planning.instruction import Instruction
+from app.domain.planning.plannedAction import PlannedAction
+from app.domain.planning.planRun import PlanRun
+from app.domain.planning.planSource import PlanSource
+from app.domain.planning.savingsPlan import SavingsPlan
+from app.domain.planning.schedule import Schedule
+from app.infrastructure.notifications.email_settings import (
+    describe_configuration,
+    from_environment,
+)
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
@@ -49,6 +104,59 @@ def _decimal(value: str) -> Decimal:
         return Decimal(value)
     except InvalidOperation:
         raise argparse.ArgumentTypeError(f"invalid amount: {value!r}")
+
+
+def _date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid date (expected YYYY-MM-DD): {value!r}")
+
+
+def _datetime(value: str) -> datetime:
+    """A moment, from ``YYYY-MM-DDTHH:MM`` - or from a bare date, meaning midnight.
+
+    The bare-date form is accepted deliberately. ``--from 2026-01-01`` is what
+    existing habits and this project's own tests already say, and reading it as
+    midnight is both the least surprising answer and exactly the answer the old
+    date-based code gave. Accepting it also keeps the command line and the store
+    telling the same story: both read a bare date as midnight.
+
+    Note the asymmetry with ``--until``, which stays a plain date. A plan starts
+    at a moment but ends on a day, so the two flags genuinely want two parsers.
+    """
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid moment (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM): {value!r}"
+        )
+
+
+def _moment(value: datetime) -> str:
+    """Render a moment for display, to the minute.
+
+    Seconds are dropped because nothing here sets them: a plan's moment comes
+    from its anchor or from ``--as-of``, and both are typed by a human. Showing
+    "12:00:00" would report a precision the value does not have.
+    """
+    return value.isoformat(timespec="minutes")
+
+
+def _wait(until: timedelta) -> str:
+    """Render a wait for display, in whole minutes and floored.
+
+    Floored rather than rounded, and that direction is the point: a warning is
+    only useful if the number it gives can be trusted, and rounding 29 minutes
+    and 40 seconds up to "30 minutes" promises time that is not there. Rounding
+    down is never wrong about how long is left.
+
+    Minutes are the right unit for a wait measured in the tens of minutes; a
+    window in seconds would need a different helper rather than a cleverer one.
+    """
+    minutes = int(until.total_seconds() // 60)
+    unit = "minute" if minutes == 1 else "minutes"
+    return f"{minutes} {unit}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -128,7 +236,139 @@ def build_parser() -> argparse.ArgumentParser:
             help="idempotency key (auto-generated if omitted)",
         )
 
+    _add_plan_commands(subparsers)
+
     return parser
+
+
+def _add_plan_commands(subparsers) -> None:
+    """The ``plan`` command group.
+
+    Nested rather than flat (``create-plan``, ``list-plans``, ...) because plans
+    have their own vocabulary of eight verbs, and eight hyphenated top-level
+    commands would make the root help unreadable while hiding the fact that they
+    belong together. ``plan`` is a noun here; every verb under it acts on plans.
+    """
+    plan_parser = subparsers.add_parser("plan", help="create and steer savings plans")
+    plan_commands = plan_parser.add_subparsers(dest="plan_command", required=True)
+
+    create_parser = plan_commands.add_parser(
+        "create", help="create a plan against a wallet"
+    )
+    create_parser.add_argument("--wallet", type=_uuid, required=True)
+    create_parser.add_argument(
+        "--name",
+        required=True,
+        help="what to call the plan, e.g. 'Salary 2026'",
+    )
+    create_parser.add_argument(
+        "--source",
+        required=True,
+        choices=[source.value for source in PlanSource],
+        help="which balance the plan spends from",
+    )
+    create_parser.add_argument(
+        "--every",
+        required=True,
+        choices=[cadence.value for cadence in Cadence],
+        help="how often the plan repeats",
+    )
+    create_parser.add_argument(
+        "--from",
+        dest="start",
+        type=_datetime,
+        # Midnight today, not ``datetime.now()``. "Now" carries seconds and
+        # microseconds, and every occurrence is derived from the anchor - so a
+        # plan created at 14:37:22.814 would pay at 14:37:22.814 forever, and the
+        # jitter would be baked into every idempotency key it ever writes. The
+        # default deliberately reports a day rather than a moment of time.
+        default=datetime.combine(date.today(), time.min),
+        help="the moment of the first run, e.g. 2026-03-02T12:00 "
+        "(default: today at midnight)",
+    )
+
+    # A plan ends in one of two ways: an explicit date, or a term counted from
+    # the first run. They are mutually exclusive on purpose - accepting both
+    # would leave the question "which one wins?", and whichever answer we picked
+    # would be a rule the user could not see.
+    plan_end = create_parser.add_mutually_exclusive_group()
+    plan_end.add_argument(
+        "--until",
+        type=_date,
+        help="the date the plan stops being due, e.g. 2026-07-02 - a whole day, "
+        "so a run on that day still happens",
+    )
+    plan_end.add_argument(
+        "--for",
+        dest="term",
+        nargs=2,
+        metavar=("AMOUNT", "UNIT"),
+        help="how long the plan lasts, in days/weeks/months/years, "
+        "e.g. --for 12 months",
+    )
+
+    create_parser.add_argument(
+        "--pay",
+        nargs=5,
+        action="append",
+        metavar=("AMOUNT", "ACCOUNT", "BANK_CODE", "NAME", "LABEL"),
+        help="a payout line, repeated once per destination account",
+    )
+    create_parser.add_argument(
+        "--release",
+        nargs=2,
+        action="append",
+        metavar=("AMOUNT", "LABEL"),
+        help="a release-to-available line, repeated as needed",
+    )
+
+    list_parser = plan_commands.add_parser(
+        "list", help="list a wallet's plans, oldest first"
+    )
+    list_parser.add_argument("wallet_id", type=_uuid)
+
+    show_parser = plan_commands.add_parser(
+        "show", help="show a plan, its lines and its run history"
+    )
+    show_parser.add_argument("plan_id", type=_uuid)
+
+    edit_parser = plan_commands.add_parser(
+        "edit", help="replace a plan's instruction lines"
+    )
+    edit_parser.add_argument("plan_id", type=_uuid)
+    edit_parser.add_argument(
+        "--pay",
+        nargs=5,
+        action="append",
+        metavar=("AMOUNT", "ACCOUNT", "BANK_CODE", "NAME", "LABEL"),
+        help="a payout line, repeated once per destination account",
+    )
+    edit_parser.add_argument(
+        "--release",
+        nargs=2,
+        action="append",
+        metavar=("AMOUNT", "LABEL"),
+        help="a release-to-available line, repeated as needed",
+    )
+
+    for verb, help_text in (
+        ("pause", "stop a plan being due, keeping its place in the schedule"),
+        ("resume", "return a paused plan to service"),
+        ("cancel", "end a plan for good"),
+    ):
+        steering_parser = plan_commands.add_parser(verb, help=help_text)
+        steering_parser.add_argument("plan_id", type=_uuid)
+
+    tick_parser = plan_commands.add_parser(
+        "tick", help="run every due plan once (the scheduler entry point)"
+    )
+    tick_parser.add_argument(
+        "--as-of",
+        type=_datetime,
+        default=datetime.combine(date.today(), time.min),
+        help="the moment to treat as now, e.g. 2026-03-02T12:00 "
+        "(default: today at midnight)",
+    )
 
 
 def _open(service: WalletService, args) -> int:
@@ -221,6 +461,352 @@ def _history(service: WalletService, args) -> int:
     return 0
 
 
+def _money(text: str, currency: Currency) -> Money:
+    """Read a unitless CLI amount in the wallet's currency.
+
+    The failure is raised as ``InvalidAmountError`` - a MoneyError - so ``main``
+    renders it as a plain ``error: ...`` line instead of a traceback. That is
+    also why the conversion does not happen in an argparse ``type=``: at parse
+    time there is no currency to read the number in, because the currency comes
+    from the wallet, which cannot be loaded until afterwards.
+    """
+    try:
+        return Money(Decimal(text), currency)
+    except InvalidOperation:
+        raise InvalidAmountError(f"invalid amount: {text!r}")
+
+
+def _lines(args, currency: Currency) -> tuple[Instruction, ...]:
+    """Turn the parsed --pay/--release groups into domain Instructions.
+
+    A tuple, because that is what ``SavingsPlan`` demands - the aggregate
+    refuses a list so that nobody can hold a mutable reference to its lines and
+    append past every invariant. Built in one place so that ``plan create`` and
+    ``plan edit`` cannot drift apart in how they read a command line.
+
+    Payouts come out before releases regardless of the order typed, since
+    argparse hands the two flags back as separate lists. That is safe rather
+    than merely convenient: a run is checked against its total before anything
+    moves, so no ordering of the lines can leave the wallet half-spent.
+    """
+    instructions = []
+    for amount, account, bank_code, name, label in args.pay or ():
+        instructions.append(
+            Instruction(
+                action=PlannedAction.PAYOUT,
+                amount=_money(amount, currency),
+                label=label,
+                destination=Destination(
+                    kind=DestinationKind.BANK_ACCOUNT,
+                    identifier=account,
+                    name=name,
+                    details={"bank_code": bank_code},
+                ),
+            )
+        )
+    for amount, label in args.release or ():
+        instructions.append(
+            Instruction(
+                action=PlannedAction.RELEASE,
+                amount=_money(amount, currency),
+                label=label,
+            )
+        )
+    return tuple(instructions)
+
+
+def _end_date(args) -> date | None:
+    """The plan's end date, from --until or from --for resolved against --from.
+
+    ``--for`` is resolved *here*, into a concrete date, rather than being stored
+    on the plan as a term. The plan records the date because that is the thing
+    that stays true: a plan made "for 12 months" must answer "when does it end?"
+    the same way a year later, and storing the term would mean re-resolving it
+    against an anchor that is already doing that job. One source of truth.
+    """
+    if args.until is not None:
+        return args.until
+    if args.term is None:
+        return None
+
+    amount_text, unit_text = args.term
+    try:
+        amount = int(amount_text)
+    except ValueError:
+        raise InvalidDurationAmountError(
+            f"the term must be a whole number of units, got {amount_text!r}"
+        )
+    try:
+        unit = DurationUnit(unit_text)
+    except ValueError:
+        allowed = ", ".join(one.value for one in DurationUnit)
+        raise InvalidDurationUnitError(
+            f"the term unit must be one of {allowed}, got {unit_text!r}"
+        )
+    return Duration(amount, unit).end_from(args.start)
+
+
+def _run_outcome(run: PlanRun) -> str:
+    """Render a run's result, naming the block reason when there is one.
+
+    The reason is the whole value of the row. "blocked" alone tells the user
+    their plan stopped but not that topping the wallet up would restart it,
+    which is the only part of the news they can act on.
+    """
+    if run.reason is None:
+        return run.status.value
+    return f"{run.status.value} ({run.reason.value})"
+
+
+def _plan_command(args, factory, wallet_service: WalletService) -> int:
+    """Route a ``plan`` sub-command to its handler.
+
+    The scheduler and the notifier are built only for ``tick``, and that is not
+    just laziness: the scheduler wires two use cases onto one Unit of Work
+    factory (see ``build_scheduler``), and constructing that for a command that
+    will never run a plan would hide the fact that the sharing matters only
+    there.
+    """
+    plan_service = build_plan_service(unit_of_work_factory=factory)
+    if args.plan_command == "tick":
+        # Read once, for the whole tick, and handed to both use cases. The
+        # notifier needs the address to compose the message; the deliverer needs
+        # the credentials to send it. Reading it here rather than inside either
+        # one keeps ``os.environ`` out of the application layer, and reading it
+        # once means a tick cannot see two different configurations.
+        settings = from_environment()
+        return _plan_tick(
+            args,
+            build_scheduler(unit_of_work_factory=factory),
+            build_notifier(unit_of_work_factory=factory, settings=settings),
+            build_deliverer(unit_of_work_factory=factory, settings=settings),
+            # Why there is no email, if there is none. Computed here because it
+            # is a fact about *this* installation's environment, and the
+            # deliverer - which only sees messages - has no way to know it.
+            deferred_reason=describe_configuration() if settings is None else None,
+        )
+    if args.plan_command == "create":
+        return _plan_create(args, plan_service, wallet_service)
+    if args.plan_command == "list":
+        return _plan_list(args, plan_service)
+    if args.plan_command == "show":
+        return _plan_show(args, plan_service)
+    if args.plan_command == "edit":
+        return _plan_edit(args, plan_service)
+    return _plan_steer(args, plan_service)
+
+
+def _plan_create(
+    args, service: PlanService, wallet_service: WalletService
+) -> int:
+    # The wallet supplies the currency every bare number on this command is read
+    # in, and loading it here has a useful side effect: an unknown wallet fails
+    # before anything is built. Its *balance* is deliberately not consulted. A
+    # plan may exist before it is affordable - that is what saving towards one
+    # means - and the shortfall is reported when a run actually fires.
+    wallet = wallet_service.get_wallet(args.wallet)
+    plan = service.create_plan(
+        wallet_id=args.wallet,
+        name=args.name,
+        source=PlanSource(args.source),
+        schedule=Schedule(cadence=Cadence(args.every), anchor=args.start),
+        instructions=_lines(args, wallet.currency),
+        ends_on=_end_date(args),
+    )
+    print(f"created {plan}")
+    return 0
+
+
+def _plan_list(args, service: PlanService) -> int:
+    plans = service.plans_for_wallet(args.wallet_id)
+    if not plans:
+        print(f"no plans for wallet {args.wallet_id}")
+        return 0
+    for plan in plans:
+        marker = "  (irreversible)" if plan.is_irreversible else ""
+        # The *full* plan_id, not a shortened one. A truncated id looks tidier
+        # and is useless: every command that takes a plan id parses a whole
+        # UUID, so the only thing a user can do with eight characters is fail to
+        # paste them back. This matches how `open` reports a wallet id.
+        print(
+            f"{plan.plan_id}  {plan.name:<20}  "
+            f"{plan.status.value:<9}  next {_moment(plan.next_due_at)}  "
+            f"{plan.total_to_move}{marker}"
+        )
+    return 0
+
+
+def _plan_show(args, service: PlanService) -> int:
+    plan = service.get_plan(args.plan_id)
+    print(f"name: {plan.name}")
+    print(f"id: {plan.plan_id}")
+    print(f"status: {plan.status.value}")
+    print(f"source: {plan.source.value}")
+    print(f"schedule: {plan.schedule}")
+    print(f"next due: {_moment(plan.next_due_at)}")
+    # A bare date, deliberately, while the two lines above and below show
+    # moments. That is the product rule made visible rather than an oversight: a
+    # plan starts at an instant and ends on a *day*, so "ends on: 2026-07-02"
+    # means through all of 2 July. Dressing it up as a moment would suggest the
+    # plan stops at midnight, which is the reading decision this exists to avoid.
+    print(f"ends on: {plan.ends_on.isoformat() if plan.ends_on else 'never'}")
+    print(f"runs completed: {plan.completed_runs}")
+    # Said outright rather than left for the user to infer from the lines. It is
+    # the one property of a plan that stops the usual remedies working, and
+    # finding that out by having `plan cancel` refused is a poor way to learn it.
+    print(f"can be cancelled: {'no' if plan.is_irreversible else 'yes'}")
+
+    print("lines:")
+    for index, instruction in enumerate(plan.instructions, start=1):
+        print(f"  {index}. {instruction}")
+
+    runs = service.runs_for_plan(args.plan_id)
+    print("runs:")
+    if not runs:
+        print("  (none yet)")
+    for run in runs:
+        print(f"  {_moment(run.due_at)}  {_run_outcome(run)}")
+    return 0
+
+
+def _plan_edit(args, service: PlanService) -> int:
+    # The currency comes from the plan rather than from a --wallet argument. A
+    # plan's currency cannot change - the aggregate allows only one across its
+    # lines, and the use case holds it equal to the wallet's - so the plan is
+    # the authority on how to read these numbers.
+    plan = service.get_plan(args.plan_id)
+    updated = service.edit_instructions(
+        args.plan_id, _lines(args, plan.total_to_move.currency)
+    )
+    print(f"updated {updated}")
+    return 0
+
+
+def _plan_steer(args, service: PlanService) -> int:
+    # pause, resume and cancel are the same shape from here: a plan id in, a
+    # new status out. The differences that matter - which statuses each accepts,
+    # and that a release plan refuses to be cancelled - belong to the aggregate,
+    # and it is the aggregate's error the user sees.
+    method = getattr(service, f"{args.plan_command}_plan")
+    plan = method(args.plan_id)
+    print(f"plan {plan.plan_id} is now {plan.status.value}")
+    return 0
+
+
+def _plan_tick(args, scheduler, notifier, deliverer, deferred_reason=None) -> int:
+    """Warn about plans that are nearly due, run the ones that are, then deliver.
+
+    This is the whole of "automated" at this layer: one command that does one
+    pass. Pairing it with cron (or systemd, or a loop) is what turns it into a
+    schedule, and doing it that way keeps the process short-lived and its
+    failures visible, instead of hiding them in a daemon nobody watches.
+
+    Three steps, and the order is the only thing tying them together. They are
+    otherwise independent: a plan is either coming up or due, never both, so the
+    warning and the runs in practice name different plans - and nothing about
+    the warning can affect whether a payout happens. Both use cases are invoked
+    unconditionally, which is what keeps the courtesy a courtesy.
+
+    **Delivery runs last**, after the money has moved, and that is defence in
+    depth rather than necessity. A warning tick and a payout tick are never the
+    same invocation, so a slow mail server could not delay a payout anyway -
+    but network I/O should sit as far from a payment as it can be made to, and
+    putting it at the end costs nothing at all. Saying so is cheap; relying on
+    it not being true later is not.
+    """
+    raised = notifier.execute(args.as_of)
+    for notice in raised:
+        # The full plan id, for the same reason `plan list` and the run lines
+        # below carry it: the actionable next step is pasting it into `plan show`
+        # to see what this warning is actually about.
+        print(
+            f"warning: {notice.plan_id}  {_moment(notice.due_at)}  "
+            f"{notice.plan_name!r} pays {notice.amount} "
+            f"in {_wait(notice.due_at - notice.raised_at)}"
+        )
+    if raised and deferred_reason is not None:
+        # There was something to say and nowhere to send it. Worth one line,
+        # because the alternative is a user who reads `warning:` in the log
+        # every month and never learns that these could reach their phone.
+        #
+        # Printed only when a warning was actually raised, so a quiet tick stays
+        # quiet - and phrased as "only in this log" rather than "queued", because
+        # nothing was queued: with no address there is no message, which is the
+        # same reason the queue below stays empty.
+        print(
+            f"note: this warning is only in this log - "
+            f"{deferred_reason} (see 'Running the scheduler' in the README)"
+        )
+
+    runs = scheduler.execute(args.as_of)
+    if not runs:
+        print(f"nothing due as of {_moment(args.as_of)}")
+    else:
+        for run in runs:
+            # Full id again, for the same reason as `plan list`: the actionable
+            # part of a blocked line is that you can paste the id straight into
+            # `plan show` to find out what happened.
+            print(f"{run.plan_id}  {_moment(run.due_at)}  {_run_outcome(run)}")
+
+    # Deliberately not gated on anything above: the queue is drained whether or
+    # not this tick found a run, and whether or not the notifier raised anything
+    # new. A message queued by an earlier tick is owed regardless of what this
+    # one did.
+    _report_delivery(deliverer.execute(args.as_of), deferred_reason)
+    return 0
+
+
+def _report_delivery(report, deferred_reason=None) -> None:
+    """Print one line per message this pass touched, and nothing when there is none.
+
+    A quiet pass is the ordinary case - most ticks find an empty queue - so
+    printing "nothing to deliver" would fill the log with the one line that
+    carries no information. Every line here is something that happened.
+
+    ``failed`` and ``deferred`` repeat on every tick until they clear, which is
+    intended: a message stuck behind a dead mail server should be visible in the
+    log every five minutes until someone fixes it. Silence there is precisely the
+    failure this feature exists to make impossible.
+
+    ``deferred`` is rarer than it looks and is worth naming, because the two
+    states are easy to confuse. A message is deferred when it is queued *and*
+    there is no channel - so it can only happen to a message queued while email
+    was configured and still owed after the configuration went away (the send
+    failed, or the tick was killed before the drain). A fresh unconfigured
+    install has no recipient, composes no message, and so has nothing to defer;
+    that case prints the ``note`` in ``_plan_tick`` instead.
+
+    ``deferred_reason`` names the environment variable that is missing, when the
+    CLI knows it. "queued" on its own is a line the reader has to go and
+    investigate; "queued (email not configured: SMTP_HOST is not set)" is a
+    two-minute fix. That sentence is the entire reason
+    ``describe_configuration`` exists separately from ``from_environment``.
+    """
+    for message in report.sent:
+        print(
+            f"emailed {message.plan_id}  {_moment(message.due_at)}  "
+            f"to {message.recipient}"
+        )
+    for message in report.expired:
+        # Not an error: the occurrence came and went before the message could be
+        # sent, and a warning about it would now be wrong rather than late.
+        print(
+            f"expired {message.plan_id}  {_moment(message.due_at)}  "
+            f"(occurrence passed before it could be sent)"
+        )
+    for message in report.failed:
+        print(
+            f"failed  {message.plan_id}  {_moment(message.due_at)}  "
+            f"{message.last_error} (will retry)"
+        )
+    if report.deferred:
+        reason = deferred_reason or "email not configured"
+        for message in report.deferred:
+            print(
+                f"queued  {message.plan_id}  {_moment(message.due_at)}  "
+                f"({reason})"
+            )
+
 def _describe(exc: MoneyError) -> str:
     return str(exc) if str(exc) else exc.__class__.__name__
 
@@ -228,10 +814,14 @@ def _describe(exc: MoneyError) -> str:
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    service = build_wallet_service(
-        unit_of_work_factory=SqliteUnitOfWorkFactory(args.db)
-    )
+    # One factory for the whole invocation. Every service built from it opens
+    # its own unit per business operation, which is the intended transaction
+    # boundary - sharing the factory is not the same as sharing a transaction.
+    factory = SqliteUnitOfWorkFactory(args.db)
+    service = build_wallet_service(unit_of_work_factory=factory)
     try:
+        if args.command == "plan":
+            return _plan_command(args, factory, service)
         if args.command == "open":
             return _open(service, args)
         if args.command == "balance":

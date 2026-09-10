@@ -31,6 +31,17 @@ class InvalidOccurrenceIndexError(PlanError):
     pass
 
 
+# --- Duration ---------------------------------------------------------------
+
+
+class InvalidDurationAmountError(PlanError):
+    pass
+
+
+class InvalidDurationUnitError(PlanError):
+    pass
+
+
 # --- Instruction ------------------------------------------------------------
 
 
@@ -62,6 +73,10 @@ class UnexpectedInstructionDestinationError(PlanError):
 
 
 class InvalidPlanIDError(PlanError):
+    pass
+
+
+class InvalidPlanNameError(PlanError):
     pass
 
 
@@ -102,6 +117,14 @@ class MixedInstructionCurrenciesError(PlanError):
 
 
 class ReleaseRequiresLockedSourceError(PlanError):
+    pass
+
+
+class ReleasePlanRequiresEndDateError(PlanError):
+    pass
+
+
+class IrreversibleReleasePlanError(PlanError):
     pass
 
 
@@ -149,4 +172,19 @@ class MissingRunBlockReasonError(PlanError):
 
 
 class UnexpectedRunBlockReasonError(PlanError):
+    pass
+
+
+# --- PlanNotice -------------------------------------------------------------
+
+
+class InvalidPlanNoticePlanIDError(PlanError):
+    pass
+
+
+class InvalidPlanNoticeDueAtError(PlanError):
+    pass
+
+
+class InvalidPlanNoticeRaisedAtError(PlanError):
     pass
