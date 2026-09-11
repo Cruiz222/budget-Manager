@@ -19,6 +19,21 @@ def opened_wallet_id(db_path, capsys):
     return match.group(1)
 
 
+def opened_pot(db_path, capsys, wallet_id, name="Savings", matures=None):
+    """Open a pot and swallow its output.
+
+    The two-step shape of every fund test now: a pot has to exist before money
+    can be locked into it, exactly as it does on the command line. Returns the
+    name rather than the id because that is what the commands take.
+    """
+    argv = ["fund", "open", "--wallet", wallet_id, "--name", name, "--kind", "personal"]
+    if matures is not None:
+        argv += ["--matures", matures]
+    assert run(db_path, *argv) == 0, capsys.readouterr().err
+    capsys.readouterr()
+    return name
+
+
 def test_open_then_balance_round_trip(tmp_path, capsys):
     db = str(tmp_path / "cli.db")
     wallet_id = opened_wallet_id(db, capsys)
@@ -153,7 +168,8 @@ def test_payout_sends_locked_funds_to_a_bank_account(tmp_path, capsys):
     wallet_id = opened_wallet_id(db, capsys)
     run(db, "deposit", wallet_id, "10000")
     capsys.readouterr()
-    run(db, "lock", wallet_id, "6000")
+    pot = opened_pot(db, capsys, wallet_id)
+    run(db, "fund", "lock", wallet_id, pot, "6000")
     capsys.readouterr()
 
     assert run(
@@ -204,7 +220,8 @@ def test_payout_appears_in_history(tmp_path, capsys):
     wallet_id = opened_wallet_id(db, capsys)
     run(db, "deposit", wallet_id, "10000")
     capsys.readouterr()
-    run(db, "lock", wallet_id, "6000")
+    pot = opened_pot(db, capsys, wallet_id)
+    run(db, "fund", "lock", wallet_id, pot, "6000")
     capsys.readouterr()
     run(
         db,

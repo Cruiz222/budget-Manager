@@ -18,6 +18,7 @@ from app.domain.money.exception import (
     InvalidTransactionDestinationError,
     MissingDestinationError,
     UnexpectedDestinationError,
+    InvalidTransactionFundIDError,
     InvalidInternalReference,
     InvalidproviderReference,
     InvalidTransactionNarration,
@@ -36,6 +37,7 @@ class Transaction:
     narration: str | None
     _metadata: dict[str, object]
     _destination: Destination | None
+    _fund_id: uuid.UUID | None
 
     _transaction_id: uuid.UUID
     _status: TransactionStatus
@@ -60,6 +62,7 @@ class Transaction:
     reversed_at: datetime | None = None,
     status: TransactionStatus = TransactionStatus.PENDING,
     destination: Destination | None = None,
+    fund_id: uuid.UUID | None = None,
 ):
         self._wallet_id = wallet_id
         self._type = type
@@ -77,6 +80,7 @@ class Transaction:
         self._metadata = dict(metadata)
 
         self._destination = destination
+        self._fund_id = fund_id
 
         self._transaction_id = transaction_id or uuid.uuid4()
 
@@ -142,7 +146,21 @@ class Transaction:
 
     @property
     def destination(self) -> Destination | None:
-        return self._destination                                   
+        return self._destination
+
+    @property
+    def fund_id(self) -> uuid.UUID | None:
+        """Which locked pot this movement went through, when one was named.
+
+        Unlike ``destination`` there is no type-based rule here, and the absence
+        is deliberate rather than unfinished. A lock, a release and a deposit
+        into a pot each name exactly one pot; a payout in this phase may draw on
+        several, so it names none. Until a payout names its pot - which is the
+        next phase's work - "a PAYOUT has no fund" is a true statement about the
+        data, and encoding the opposite as a rule would refuse the rows the
+        system is actually writing.
+        """
+        return self._fund_id                                   
 
 
     def mark_successful(self):
@@ -262,4 +280,15 @@ class Transaction:
         if self.type is not TransactionType.PAYOUT and self.destination is not None:
             raise UnexpectedDestinationError(
                 f"a {self.type.value} transaction must not carry a destination"
+            )
+
+        # --- Fund invariant ---
+        # One direction only: a fund id, when there is one, must be a UUID. The
+        # reverse rule - which types may or may not carry one - is deliberately
+        # absent; see the ``fund_id`` property for why a payout legitimately has
+        # none while a lock legitimately has one.
+        if self.fund_id is not None and not isinstance(self.fund_id, uuid.UUID):
+            raise InvalidTransactionFundIDError(
+                f"fund_id must be a UUID or None, got "
+                f"{type(self.fund_id).__name__}"
             )

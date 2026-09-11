@@ -15,6 +15,26 @@ Run from the repo root:
         --pay 20000 0123456789 058 "Chinedu Okafor" salary
     .venv/bin/python -m app.presentation.cli --db budget.db plan tick
 
+Reserving money means naming a pot, because "the locked balance" cannot say
+where an amount was meant to go:
+
+    # a pot that opens for release on a date, and takes deposits until then
+    .venv/bin/python -m app.presentation.cli --db budget.db fund open \\
+        --wallet <wallet_id> --name Vacation --kind personal --matures 2026-06-01
+    .venv/bin/python -m app.presentation.cli --db budget.db fund deposit \\
+        <wallet_id> Vacation 5000       # money in from outside
+    .venv/bin/python -m app.presentation.cli --db budget.db fund lock \\
+        <wallet_id> Vacation 5000       # available -> pot
+    .venv/bin/python -m app.presentation.cli --db budget.db fund release \\
+        <wallet_id> Vacation 5000       # refused until 2026-06-01
+    .venv/bin/python -m app.presentation.cli --db budget.db fund list <wallet_id>
+
+``deposit`` and ``lock`` are the same two verbs the root used to carry, and the
+distinction between them is unchanged - a deposit brings money in, a lock moves
+money already in the wallet. What changed is that both name a pot. The root's
+bare ``lock`` and ``release`` are gone rather than renamed, because an amount
+with no pot cannot be acted on once pots are what the locked balance *is*.
+
 Where validation happens is worth noticing, because the split is deliberate.
 argparse checks *shape*: that a UUID parses, that a date is ISO, that a cadence
 is one of the four words, that an amount arrived at all. It does not check
@@ -73,6 +93,7 @@ from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.exception import InvalidAmountError, MoneyError
+from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.planning.cadence import Cadence
@@ -97,11 +118,31 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 )
 
 #: Which operations move money, and the verb to report on success.
+#:
+#: ``lock`` and ``release`` used to be here and are gone rather than renamed:
+#: once money is reserved in *named* pots, "lock 5000" does not say which pot to
+#: put it in, so there is no honest way to run it. Both moved under ``fund``,
+#: where the pot is named - see ``_add_fund_commands``.
 OPERATIONS = {
     "deposit": "deposited",
     "withdraw": "withdrew",
-    "lock": "locked",
-    "release": "released",
+}
+
+#: The ``fund`` verbs that actually move money, and how to run each.
+#:
+#: Maps the sub-command to the service method, the verb to report it with, and
+#: whether the call needs the moment it runs at. That last flag is not
+#: decoration: ``release_from_fund`` needs one because a pot may refuse a release
+#: before it has come due, while depositing into a pot and moving available money
+#: into one are allowed at any time and so have no moment to consult.
+#:
+#: ``open``, ``extend`` and ``list`` are deliberately absent - they move no
+#: money, so they have no amount, no idempotency reference and nothing to report
+#: in a balance line. They are handled on their own below.
+_FUND_MONEY = {
+    "deposit": ("deposit_into_fund", "deposited into", False),
+    "lock": ("lock_into_fund", "locked into", False),
+    "release": ("release_from_fund", "released from", True),
 }
 
 
@@ -175,8 +216,8 @@ def _wait(until: timedelta) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="budget-manager",
-        description="A personal savings wallet with deposit, withdraw, "
-        "lock and release operations.",
+        description="A personal savings wallet with deposit, withdraw and "
+        "named locked pots (fund open/deposit/lock/release/extend/list).",
     )
     parser.add_argument(
         "--db",
@@ -250,8 +291,88 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     _add_plan_commands(subparsers)
+    _add_fund_commands(subparsers)
 
     return parser
+
+
+def _add_fund_commands(subparsers) -> None:
+    """The ``fund`` command group - the wallet's named pots.
+
+    Nested for the same reason ``plan`` is: six verbs that all act on one noun,
+    and six more hyphenated top-level commands would bury the four that act on
+    the wallet itself. ``fund`` is that noun's name.
+
+    The two verbs worth pausing on are ``deposit`` and ``lock``, because they are
+    the *same two words* the top level used to have and they do not mean the same
+    thing here. ``deposit`` brings money in from outside; ``lock`` moves money
+    that is already in the wallet. That distinction is unchanged - what changed
+    is that both now name the pot they act on, which is the whole reason they
+    moved. ``fund deposit`` and ``fund lock`` are also the difference between a
+    pot that grows from outside and one that grows from the available balance,
+    and the ledger records them as different types for that reason.
+    """
+    fund_parser = subparsers.add_parser(
+        "fund", help="open named pots and move money in and out of them"
+    )
+    fund_commands = fund_parser.add_subparsers(dest="fund_command", required=True)
+
+    open_parser = fund_commands.add_parser(
+        "open", help="open a named pot on a wallet"
+    )
+    open_parser.add_argument("--wallet", type=_uuid, required=True)
+    open_parser.add_argument(
+        "--name",
+        required=True,
+        help="what to call the pot, e.g. 'Vacation' - unique within the wallet",
+    )
+    open_parser.add_argument(
+        "--kind",
+        required=True,
+        choices=[kind.value for kind in FundKind],
+        help="personal (release blocked until maturity) or business "
+        "(also payable to an external account before maturity)",
+    )
+    open_parser.add_argument(
+        "--matures",
+        type=_date,
+        help="the date the pot opens for release, e.g. 2026-06-01 - a whole "
+        "day, so a release on that day is allowed; omit for a pot that is "
+        "never sealed",
+    )
+
+    # deposit, lock, release: the same shape as each other and as the top-level
+    # deposit/withdraw - wallet, pot, amount, optional reference.
+    for verb, help_text in (
+        ("deposit", "bring money in from outside, straight into a pot"),
+        ("lock", "move money from the available balance into a pot"),
+        ("release", "move money out of a pot, back to the available balance "
+                    "(refused before the pot matures)"),
+    ):
+        money_parser = fund_commands.add_parser(verb, help=help_text)
+        money_parser.add_argument("wallet_id", type=_uuid)
+        money_parser.add_argument("fund_name", help="the pot's name")
+        money_parser.add_argument("amount", type=_decimal)
+        money_parser.add_argument(
+            "--ref",
+            help="idempotency key (auto-generated if omitted)",
+        )
+
+    extend_parser = fund_commands.add_parser(
+        "extend", help="push a pot's maturity date later (never earlier)"
+    )
+    extend_parser.add_argument("wallet_id", type=_uuid)
+    extend_parser.add_argument("fund_name", help="the pot's name")
+    extend_parser.add_argument(
+        "--to",
+        type=_date,
+        required=True,
+        help="the new maturity date, which must be in the future and later "
+        "than the current one",
+    )
+
+    list_parser = fund_commands.add_parser("list", help="list a wallet's pots")
+    list_parser.add_argument("wallet_id", type=_uuid)
 
 
 def _add_plan_commands(subparsers) -> None:
@@ -399,6 +520,20 @@ def _balance(service: WalletService, args) -> int:
     print(f"status: {wallet.status.name.lower()}")
     print(f"available: {wallet.available_balance}")
     print(f"locked: {wallet.locked_balance}")
+    # The pots come last, under the total they add up to, and the order is the
+    # point rather than the layout. ``locked`` is *defined* as the sum of these
+    # lines, so showing the breakdown underneath is what makes the two readings
+    # check out in front of the user - a wallet whose pots do not add up to its
+    # locked total would be visible here rather than a mystery later.
+    #
+    # No line at all when there are no pots: a wallet that never locked anything
+    # is the ordinary case, and an empty "funds:" heading would be noise. Note
+    # that a wallet with a locked balance *always* has pots now, because the
+    # locked balance is nothing but their sum.
+    if wallet.funds:
+        print("funds:")
+        for fund in wallet.funds:
+            print(f"  {fund}")
     return 0
 
 
@@ -470,7 +605,15 @@ def _payout(service: WalletService, args, factory, settings, deferred_reason) ->
     internal_reference = args.ref if args.ref is not None else str(uuid.uuid4())
 
     service.payout_from_locked(
-        args.wallet_id, amount, internal_reference, destination
+        args.wallet_id,
+        amount,
+        internal_reference,
+        destination,
+        # The moment this command is running, read here at the adapter rather
+        # than inside the use case. It is not decoration: a payout may only spend
+        # pots that have come due, so the use case needs to know when "now" is -
+        # and being told makes it answerable about a moment other than this one.
+        datetime.now(),
     )
 
     current = service.get_wallet(args.wallet_id)
@@ -481,6 +624,124 @@ def _payout(service: WalletService, args, factory, settings, deferred_reason) ->
     )
     _deliver_after(factory, settings, deferred_reason)
     return 0
+
+
+def _fund_command(args, service, factory, settings, deferred_reason) -> int:
+    """Route a ``fund`` sub-command to its handler.
+
+    The money-moving verbs are a table lookup and the rest are named explicitly,
+    which mirrors how they differ: ``deposit``, ``lock`` and ``release`` share one
+    shape and one handler, while opening a pot, extending one and listing them
+    each do something no other does and move nothing at all.
+    """
+    if args.fund_command in _FUND_MONEY:
+        return _fund_money(service, args, factory, settings, deferred_reason)
+    if args.fund_command == "open":
+        return _fund_open(service, args)
+    if args.fund_command == "extend":
+        return _fund_extend(service, args)
+    return _fund_list(service, args)
+
+
+def _fund_money(service, args, factory, settings, deferred_reason) -> int:
+    """Run ``fund deposit``, ``fund lock`` or ``fund release``.
+
+    Three verbs, one shape, so they share a handler. The one difference that is
+    not cosmetic is the moment: ``release_from_fund`` has to know when it is
+    running, because a pot may refuse a release before it has come due, while
+    depositing into a pot and moving available money into one are allowed at any
+    time and so have no moment to consult.
+
+    The moment is read *here*, at the edge, and passed down. Reading it inside
+    the service would mean the same use case could not be asked what it would do
+    at a given time - which is exactly what a test of a maturity date needs to do
+    without freezing a clock.
+    """
+    method_name, verb, needs_moment = _FUND_MONEY[args.fund_command]
+
+    # The wallet is loaded for the same reason the top-level commands load it:
+    # the amount on this command line carries no currency of its own, and only
+    # the wallet can say how to read it.
+    wallet = service.get_wallet(args.wallet_id)
+    amount = Money(args.amount, wallet.currency)
+    internal_reference = args.ref if args.ref is not None else str(uuid.uuid4())
+
+    method = getattr(service, method_name)
+    if needs_moment:
+        method(
+            args.wallet_id,
+            args.fund_name,
+            amount,
+            internal_reference,
+            datetime.now(),
+        )
+    else:
+        method(args.wallet_id, args.fund_name, amount, internal_reference)
+
+    _report_fund(service, args.wallet_id, args.fund_name, f"{verb} {amount}")
+    # Only one of these three queues anything - a deposit from outside is the
+    # boundary event, while locking and releasing only reshuffle the wallet's own
+    # money. Draining is unconditional anyway, for the reason the top-level
+    # commands drain unconditionally: a receipt left owed by an earlier failure
+    # gets its chance here, and an empty queue costs nothing.
+    _deliver_after(factory, settings, deferred_reason)
+    return 0
+
+
+def _fund_open(service, args) -> int:
+    """Open a pot.
+
+    Note what is *not* here: no ``_deliver_after``, and no receipt. Opening a pot
+    moves no money and says nothing to the owner - see
+    ``WalletService.ANNOUNCED`` - so there is nothing queued to drain, and a
+    delivery pass would only be a slower way of doing nothing.
+    """
+    fund = service.open_fund(args.wallet, args.name, FundKind(args.kind), args.matures)
+    print(f"opened {fund}")
+    return 0
+
+
+def _fund_extend(service, args) -> int:
+    """Push a pot's maturity date later.
+
+    Also silent, for the same reason as ``_fund_open``. The refusals - a date in
+    the past, or one that is not later than the current date - come from the
+    aggregate and reach the user through ``main``'s ``MoneyError`` handler.
+    """
+    fund = service.extend_fund(
+        args.wallet_id, args.fund_name, args.to, datetime.now()
+    )
+    print(f"extended {fund}")
+    return 0
+
+
+def _fund_list(service, args) -> int:
+    funds = service.funds_for_wallet(args.wallet_id)
+    if not funds:
+        print(f"no funds on wallet {args.wallet_id}")
+        return 0
+    for fund in funds:
+        print(fund)
+    return 0
+
+
+def _report_fund(service, wallet_id, fund_name, headline) -> None:
+    """Report a pot after a change to it, then the wallet's two totals.
+
+    The pot's own balance comes first because the pot is what the command was
+    about - naming a pot is the whole point, so seeing *that* pot move is the
+    answer. The wallet's totals follow because a pot is not a separate account:
+    money moved into one is still the wallet's, and a line showing only the pot
+    would leave a user reasonably wondering where the rest went.
+    """
+    current = service.get_wallet(wallet_id)
+    fund = current.fund_by_name(fund_name)
+    print(
+        f"{headline} | "
+        f"{fund.name} {fund.balance} | "
+        f"available {current.available_balance} | "
+        f"locked {current.locked_balance}"
+    )
 
 
 def _freeze(service: WalletService, args) -> int:
@@ -948,6 +1209,8 @@ def main(argv=None) -> int:
             return _plan_command(
                 args, factory, service, settings, deferred_reason
             )
+        if args.command == "fund":
+            return _fund_command(args, service, factory, settings, deferred_reason)
         if args.command == "open":
             return _open(service, args)
         if args.command == "balance":

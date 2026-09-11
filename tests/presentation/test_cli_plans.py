@@ -90,15 +90,21 @@ def opened_wallet_id(db_path, capsys, currency="NGN"):
 
 
 def funded_locked_wallet(db_path, capsys, amount="100000"):
-    """A wallet with ``amount`` sitting in the locked balance.
+    """A wallet with ``amount`` sitting in an open pot called "Savings".
 
-    Depositing and then locking, because the two are separate operations - there
-    is no "deposit straight to locked", and the plan has to spend a balance that
-    actually holds the money.
+    Depositing, opening a pot, and then locking into it - because the three are
+    separate operations, and the plan has to spend money that is actually in a
+    pot. The pot has no maturity date, so it is spendable at every moment: the
+    plan tests below are about plans, and a sealed pot here would make every one
+    of them a test about maturity instead.
     """
     wallet_id = opened_wallet_id(db_path, capsys)
     assert run(db_path, "deposit", wallet_id, amount) == 0
-    assert run(db_path, "lock", wallet_id, amount) == 0
+    assert run(
+        db_path, "fund", "open", "--wallet", wallet_id,
+        "--name", "Savings", "--kind", "personal",
+    ) == 0
+    assert run(db_path, "fund", "lock", wallet_id, "Savings", amount) == 0
     capsys.readouterr()
     return wallet_id
 

@@ -7,8 +7,20 @@ commit() - or are all discarded by rollback().
 """
 
 import sqlite3
+import uuid
+from datetime import datetime
 
 from app.application.unit_of_work import UnitOfWork
+from app.domain.money.currency import Currency
+from app.domain.money.fundKind import FundKind
+from app.infrastructure.persistence.serialization import (
+    datetime_to_text,
+    enum_to_text,
+    money_to_text,
+    text_to_enum,
+    text_to_money,
+    uuid_to_text,
+)
 from app.infrastructure.repositories.sqlite_plan_notice_repository import (
     SqlitePlanNoticeRepository,
 )
@@ -37,8 +49,29 @@ CREATE TABLE IF NOT EXISTS wallets (
     user_id           TEXT NOT NULL,
     currency          TEXT NOT NULL,
     status            TEXT NOT NULL,
-    available_balance TEXT NOT NULL,   -- decimal as text, e.g. "10000.00"
-    locked_balance    TEXT NOT NULL
+    available_balance TEXT NOT NULL    -- decimal as text, e.g. "10000.00"
+);
+
+CREATE TABLE IF NOT EXISTS funds (
+    fund_id       TEXT PRIMARY KEY,
+    wallet_id     TEXT NOT NULL REFERENCES wallets(wallet_id),
+    name          TEXT NOT NULL,    -- the handle a human types, e.g. "Vacation"
+    kind          TEXT NOT NULL,    -- enum name: PERSONAL / BUSINESS
+    balance       TEXT NOT NULL,    -- decimal as text, e.g. "50000.00"
+    maturity_date TEXT,             -- ISO date; NULL means no maturity at all
+    created_at    TEXT NOT NULL,    -- ISO moment; fixes the payout draw order
+    -- There is deliberately no ``currency`` column. A fund is in its wallet's
+    -- currency by construction - ``Wallet.__post_init__`` refuses one that is
+    -- not - so a stored copy would be a second place for the same fact to live,
+    -- free to disagree with the wallet it belongs to. See decision 33.
+    --
+    -- The UNIQUE is not tidiness either: a fund's name is the handle a human
+    -- types (``fund release Vacation 5000``), so two funds called "Vacation" on
+    -- one wallet would make that command ambiguous and the failure would be
+    -- "some fund, chosen by the wrong rule" rather than "no such fund". The
+    -- aggregate refuses a duplicate before it gets here; this is the backstop
+    -- for the gap between the check and the write. See decision 37.
+    UNIQUE (wallet_id, name)
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
@@ -52,6 +85,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     narration          TEXT,
     metadata           TEXT,                   -- JSON
     destination        TEXT,                   -- JSON, payouts only
+    fund_id            TEXT,                   -- which pot moved, when one did
     status             TEXT NOT NULL,
     created_at         TEXT NOT NULL,
     completed_at       TEXT,
@@ -297,6 +331,128 @@ def _migrate_plan_run_due_at_to_datetime(connection: sqlite3.Connection) -> None
     )
 
 
+def _migrate_add_fund_id_column(connection: sqlite3.Connection) -> None:
+    """Add transactions.fund_id to a database created before pots existed.
+
+    Which pot a movement went through, when one did. Nullable, and not only
+    because ALTER cannot add NOT NULL without a default: a payout in this phase
+    legitimately names no pot, and a deposit to the available balance never had
+    one. NULL here means "no pot was involved", which is a real answer rather
+    than missing data.
+
+    Structurally this is ``_migrate_add_destination_column`` again, and the
+    reasoning there applies unchanged - ``CREATE TABLE IF NOT EXISTS`` gives a
+    new column to new databases only, so old ones need the explicit ALTER, and
+    the PRAGMA guard is what makes re-running on every connection safe.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(transactions)")
+    }
+    if "fund_id" not in columns:
+        connection.execute("ALTER TABLE transactions ADD COLUMN fund_id TEXT")
+
+
+#: The first SQLite release with ``ALTER TABLE ... DROP COLUMN`` (2021-03-12).
+#: Checked rather than assumed: the linked SQLite is a property of the machine
+#: and the Python build, not of this code, so it is not something to be right
+#: about on the developer's laptop and wrong on the user's.
+_DROP_COLUMN_MINIMUM = (3, 35, 0)
+
+
+def _migrate_locked_balance_into_funds(connection: sqlite3.Connection) -> None:
+    """Move each wallet's locked balance into a pot, then drop the column.
+
+    Before pots, a wallet's locked money was one number in
+    ``wallets.locked_balance``. Now it is the sum of that wallet's funds, and the
+    column has nowhere to fit - so this is the one migration in the file that
+    *removes* something rather than adding it.
+
+    **The migration is invisible on purpose.** Every pot it creates is named
+    "Locked", is ``PERSONAL``, and has ``maturity_date = NULL``, which is defined
+    to mean "no maturity, always open". So money that was releasable
+    unconditionally before this ran is releasable unconditionally after it. A
+    user's database does not gain a lock they never asked for; it gains a name
+    for money that was already set aside.
+
+    **Why the rows are moved in Python and not by an ``INSERT ... SELECT``.** The
+    fund needs a ``fund_id``, and SQLite has no ``uuid()`` function to generate
+    one in the SELECT. Reading the rows and inserting them one at a time is what
+    lets a real UUID be minted for each.
+
+    **Idempotence comes from the WHERE clause**, not a PRAGMA guard on the shape
+    of the table - the same choice ``_migrate_plan_run_due_at_to_datetime`` made,
+    and for a sharper reason here. Migrations run in autocommit, before the unit
+    of work's transaction begins, so a process killed between the inserts and the
+    DROP would leave the column still present with the pots already written. On
+    the next start, skipping wallets that already have funds means the inserts do
+    nothing rather than colliding with themselves on ``UNIQUE (wallet_id, name)``.
+    A failure there would be loud rather than silent, but an app that will not
+    start is its own kind of wrong.
+
+    Money decisions are made in Python rather than SQL. ``locked_balance`` is
+    stored as text, so "is this balance non-zero?" in SQL would mean either
+    comparing strings that may be written "0", "0.00" or "0.000" and are not
+    equal, or casting to REAL - and this is the one codebase where reaching for a
+    float to answer a question about money should look wrong. "Does this wallet
+    already have funds?" is a question about existence, not about money, and SQL
+    answers it exactly.
+    """
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(wallets)")
+    }
+    if "locked_balance" not in columns:
+        # Already migrated, or a database created fresh from SCHEMA above, which
+        # no longer has the column at all. Either way there is nothing to move.
+        return
+
+    if sqlite3.sqlite_version_info < _DROP_COLUMN_MINIMUM:
+        raise RuntimeError(
+            "this database still has wallets.locked_balance and needs "
+            f"ALTER TABLE ... DROP COLUMN, which requires SQLite "
+            f"{'.'.join(str(part) for part in _DROP_COLUMN_MINIMUM)} or newer; "
+            f"this Python is linked against {sqlite3.sqlite_version}. "
+            "Either upgrade SQLite, or move each wallet's locked balance into a "
+            "fund by hand and drop the column."
+        )
+
+    rows = connection.execute(
+        """
+        SELECT wallet_id, currency, locked_balance
+        FROM wallets
+        WHERE NOT EXISTS (
+            SELECT 1 FROM funds WHERE funds.wallet_id = wallets.wallet_id
+        )
+        """
+    ).fetchall()
+
+    for row in rows:
+        locked = text_to_money(
+            row["locked_balance"], text_to_enum(Currency, row["currency"])
+        )
+        if locked.amount <= 0:
+            # An empty pot is not a thing to open. A wallet that never locked
+            # anything ends up with no funds, which is what it had before.
+            continue
+        connection.execute(
+            """
+            INSERT INTO funds
+                (fund_id, wallet_id, name, kind, balance, maturity_date, created_at)
+            VALUES (?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                uuid_to_text(uuid.uuid4()),
+                row["wallet_id"],
+                "Locked",
+                enum_to_text(FundKind.PERSONAL),
+                money_to_text(locked),
+                datetime_to_text(datetime.now()),
+            ),
+        )
+
+    connection.execute("ALTER TABLE wallets DROP COLUMN locked_balance")
+
+
 def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     """Open a connection in autocommit mode with the schema applied.
 
@@ -318,6 +474,12 @@ def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     _migrate_add_plan_name_column(connection)
     _migrate_plan_run_due_at_to_datetime(connection)
     _migrate_legacy_transaction_types(connection)
+    # After the two above and after executescript, which is what has just created
+    # the ``funds`` table this migration writes into - it is new, so per the note
+    # inside it there is no migration for its creation, only for filling it from
+    # the column it replaces.
+    _migrate_add_fund_id_column(connection)
+    _migrate_locked_balance_into_funds(connection)
     return connection
 
 

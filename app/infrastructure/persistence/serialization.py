@@ -53,6 +53,21 @@ def text_to_uuid(value: str) -> uuid.UUID:
     return uuid.UUID(value)
 
 
+def optional_uuid_to_text(value: uuid.UUID | None) -> str | None:
+    """Store a UUID by its text form, or NULL when there is nothing to store.
+
+    ``uuid_to_text`` would happily turn ``None`` into the four-character string
+    "None" - a value that looks like data, is not, and would later fail in
+    ``text_to_uuid`` with a message about an invalid UUID rather than about a
+    missing one. An optional reference needs this spelling instead.
+    """
+    return uuid_to_text(value) if value is not None else None
+
+
+def text_to_optional_uuid(value: str | None) -> uuid.UUID | None:
+    return text_to_uuid(value) if value is not None else None
+
+
 def enum_to_text(member) -> str:
     return member.name
 

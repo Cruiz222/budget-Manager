@@ -16,18 +16,23 @@ For the architectural designs, we are using simple systemic and domain design de
 
 Wallet initialization
 │
-├── currency is Currency                  ✅
-├── status is WalletStatus                ✅
-├── available_balance is Money            ✅
-├── locked_balance is Money               ✅
-├── available currency == wallet currency ✅
-└── locked currency == wallet currency    ✅
+├── currency is Currency                       ✅
+├── status is WalletStatus                     ✅
+├── available_balance is Money                 ✅
+├── funds is a tuple of Fund                   ✅
+├── available currency == wallet currency      ✅
+├── every fund's currency == wallet currency   ✅
+└── every fund's name is unique in the wallet  ✅
+
+locked_balance is NOT initialized. It is derived - sum(fund.balance) - so there
+is no second number to keep in step with the pots. See decision 33.
 
 ## What Wallet Knows and Does
 Can I deposit? → Wallet decides.
 Can I withdraw? → Wallet decides.
-Can I lock funds? → Wallet decides.
-Can I release funds? → Wallet decides.
+Can I lock money into a pot? → Wallet decides.
+Can I release money out of a pot? → Wallet decides.
+May this pot be released or paid yet? → Wallet decides, and the date is the answer.
 Is the wallet frozen? → Wallet knows.
 Is the amount in the correct currency? → Wallet verifies.
 
@@ -61,7 +66,7 @@ Wallet
  │
  └── available_balance += ₦50,000
 
- # Its either available balance and locked funds updates successfully or the operation fails during lock funds and release funds
+ # Its either available balance and a pot balance updates successfully together, or the operation fails - the two move as one or not at all.
 
                  WALLET
                   │
@@ -71,8 +76,11 @@ Wallet
        │                     │
        ├─ currency           ├─ deposit
        ├─ status             ├─ withdraw
-       ├─ Money types        ├─ lock
-       └─ currency match     ├─ release
+       ├─ Money types        ├─ open_fund
+       ├─ currency match     ├─ deposit_into_fund
+       └─ unique fund names  ├─ lock_into_fund
+                             ├─ release_from_fund
+                             ├─ extend_fund
                              ├─ freeze
                              └─ unfreeze
 
@@ -670,6 +678,18 @@ a dict rather than four branches in the flow every operation shares, so adding o
 later is a line and "does a release send an email?" has one answer in one place.
 It is a reversible bet, not a gate.
 
+Named funds did not move that line, and it is worth saying so because *six*
+operations now sit under `fund` where two top-level commands used to. `fund lock`
+and `fund release` reshuffle the wallet's own money exactly as `lock` and
+`release` did, so they stay silent; `fund open` and `fund extend` change the
+wallet's shape but move nothing at all, so they are silent with even less
+argument; and **`fund deposit` is the one that speaks** - it is money arriving
+from outside, which is the boundary the whole notice set is drawn around. Note
+that this is not "the fund commands are quiet": it is the same rule as before,
+applied to a command group that happens to contain one crossing and five
+non-crossings. `ANNOUNCED` therefore gained exactly one entry in this phase and
+lost none.
+
 The wallet half adds one thing the plan half did not need: **"immediately" means
 the command delivers after itself.** `deposit`, `withdraw` and `payout` drain the
 receipt queue before they exit, where previously only `plan tick` drained
@@ -677,8 +697,140 @@ anything. That puts a ten-second SMTP timeout in front of an interactive command
 which is acceptable *only* because the money has already committed before any
 socket opens - a hang costs latency and can never cost correctness.
 
+### Named funds
+
+Locking used to be one number. `Wallet` held an `available_balance` and a
+`locked_balance`, both stored, and "lock" was a one-shot move into that single
+pool whose release was unconditional - no date, no condition, nothing.
+
+The request that changed it was this:
+
+> a locked fund cannot be reversed until its scheduled conditions are met, but it
+> should still be able to accept additions or further deposits. Like if I lock
+> 50,000 I should still be able to add money continuously, instead of having to
+> create another plan for each deposit.
+
+The answer is **named pots** - "Vacation", "Salary", "Personal savings" - each
+with its own balance, its own kind, and its own maturity date:
+
+| | Deposits | Release → available | Payout → external account |
+|---|---|---|---|
+| **Personal** pot | always allowed | blocked until the date | blocked until the date |
+| **Business** pot | always allowed | blocked until the date | **allowed on schedule** |
+
+Continuous deposits are not a feature bolted onto a lock; they are the reason
+the pots are named at all. A pot that could not be fed would mean a new plan per
+top-up, which is exactly the thing being designed away.
+
+**33. A pot is part of the `Wallet` aggregate, and `locked_balance` is derived
+from it.** `locked_balance = sum(pot.balance)`. Funds are not a second aggregate
+with their own transaction: a rule spans both ("no pot may exceed the locked
+balance"), and one aggregate is one transaction is one truth. The alternative -
+keeping `wallets.locked_balance` as a written cache beside a `funds` table -
+would be two records of one fact with a "they must agree" rule enforced by hope,
+and every "the pot says 5,000 but the wallet says 4,900" bug lives in exactly
+that gap. A derived number cannot drift. The read path loads the pots anyway
+(every release and every payout needs them), so the column would have bought
+nothing. So `locked_balance` stops being a stored field and becomes a property,
+and decision 18's "no column that no code writes" gets a second half: **no number
+that no code writes either.**
+
+**34. `maturity_date = None` means *no maturity* - always open.** Not "unknown",
+not "infinite", not an epoch date. It is a real value with one meaning, and it is
+the state every pre-existing locked balance migrates into, which is what makes
+that migration invisible: money locked before pots existed stays exactly as
+releasable as it was. `is_open` asks that question ("never had a date"), which is
+a different question from `is_matured` ("may money leave yet") - a pot with a past
+date is matured without being open, and `extend_to` is the one place that needs
+to tell them apart.
+
+**35. A maturity date is a day, and it opens the pot for the whole of that day.**
+`as_of.date() >= maturity_date`. The same reduction `SavingsPlan` already makes
+of a run's moment against `ends_on`, and for the same reason: a date a human
+wrote is a whole day, not a midnight in some other timezone's sense of it. So a
+pot maturing on 1 June refuses a release at 23:59 on 31 May and allows one at
+00:00 on 1 June.
+
+**36. Extending is forward-only.** A date can move later; never earlier. Moving a
+date forward is an early release wearing a different hat, and refusing it is the
+entire product promise - so `extend_to` refuses a date that is not in the future
+*and* refuses one that is not after the current date. Setting a date on a pot
+that has none **is** allowed: that is how an open pot is re-sealed, and it is the
+only way the migrated `"Locked"` pot becomes a real commitment. Rendered on the
+command line as `fund extend W N --to 2026-06-01`.
+
+**37. A pot's name is unique within its wallet.** Validated in the aggregate *and*
+enforced by `UNIQUE (wallet_id, name)`. The name is the handle a human types -
+`fund release Vacation 5000` - so two "Vacation" pots would not fail as "no such
+pot" but as "some pot, chosen by the wrong rule". This is decision 21's
+claim-by-insert reasoning again: a check-then-write in the service leaves a gap
+that a constraint closes, and the aggregate check is for the good error message
+rather than for the guarantee.
+
+**38. In Phase A a payout draws from matured pots in creation order and records
+no pot.** A payout *cannot* avoid choosing a pot once pots are the locked balance,
+and "payouts untouched" is therefore not literally available - so the honest thing
+is to say which rule was picked rather than to leave it implicit. "Which pot" has
+no single true answer while several may fund one payment, so Phase A does not
+answer it: it spends matured pots oldest-first (`created_at`, then `rowid` in the
+store) and writes **no fund onto the PAYOUT ledger row**. The row still says what
+it always said - value left the wallet for a named account. Phase B makes the pot
+explicit ("the payout names its pot"), which is both stricter and simpler, and
+which is when `transactions.fund_id` starts being written on payout rows.
+
+**Scheduling has never required locking, and pots do not change that.**
+`PlanSource.AVAILABLE` exists precisely so a plan can pay an external account out
+of the available balance, and `ExecutePlanRun` already funds such a run from
+there. Pots add a richer place to *put* locked money; they do not unlock the
+ability to schedule. A user who wants a monthly payout to a landlord and no
+commitment to anything locks nothing and creates the plan today.
+
+Two consequences of decision 33 are worth naming, because they are the kind of
+thing that only shows up later. First, **`ExecutePlanRun` had to learn which
+locked balance is *spendable***: `_funding_balance` now returns
+`wallet.matured_locked_balance(as_of)` for a `LOCKED` plan, not the full sum. Had
+it kept returning the full sum, a run funded only by an immature pot would pass
+the pre-flight and then have `PayoutFromLocked` raise mid-run - the half-executed
+run the pre-flight exists to prevent. Money that is not yet spendable is money
+that is not there, so the reason stays `INSUFFICIENT_BALANCE`; a dedicated
+`LOCKED_FUNDS_NOT_MATURED` is Phase B's job, when a pot is named and "your pot has
+not matured" becomes distinguishable from "you have no money" in the message.
+
+Second, **the old locked balance is migrated, not abandoned.** A database that
+predates pots has `wallets.locked_balance` holding real money that was releasable
+unconditionally. Opening it writes one pot per wallet - named `"Locked"`, kind
+`PERSONAL`, `maturity_date = NULL` - and drops the column. Per decision 18 the
+`funds` table itself costs nothing: `CREATE TABLE IF NOT EXISTS` builds it on an
+older database without touching the tables already there, so a brand-new table is
+free and only a changed one is a migration. The `transactions.fund_id` column is
+therefore the one that needs the PRAGMA-guarded `ALTER` (the `destination`
+idiom), and dropping `locked_balance` is the one *real* migration in this phase,
+because `ALTER TABLE ... DROP COLUMN` needs SQLite 3.35.0. The drop
+checks `sqlite3.sqlite_version_info` **before** writing any pot, and raises a
+message naming the requirement rather than half-migrating a database on an older
+install. Migrations run in autocommit before the unit of work's `BEGIN`, so a
+process killed between the inserts and the drop leaves pots written and the
+column standing - which is why the inset is guarded by `WHERE NOT EXISTS` and not
+by a PRAGMA check on the column: rerunning it must be a no-op, and the second run
+is the one that has to cope.
+
 ### Still open
 
+- **The Phase A / Phase B boundary in named funds, and decision 38 is what
+  closes it.** Phase A shipped pots as a *concept*: they exist, they hold the
+  locked balance, they are named, they have dates, and money can be moved in and
+  out of them by name. What it did **not** ship is pots as the things *plans and
+  payouts name*. So in Phase A a `BUSINESS` pot is not yet special - it refuses a
+  release before its date exactly like a `PERSONAL` one, and a payout spends
+  matured pots oldest-first without recording which. `Fund.pay(amount, as_of)`
+  already carries the business rule and is simply never reached with an immature
+  pot. Phase B takes: `savings_plans.fund_id` (nullable) so a plan names its pot,
+  `plan create --from-fund NAME` required iff `--source locked`, `payout --fund
+  NAME`, `transactions.fund_id` written on PAYOUT rows, and
+  `RunBlockReason.LOCKED_FUNDS_NOT_MATURED` so "your pot has not matured" stops
+  looking like "you have no money". It is deliberately *not* half-done: a
+  business pot that behaved differently in one code path and not another would be
+  worse than one that is uniformly conservative for a phase.
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
   reads "salary" instead of a bare internal reference.
 - Renaming `MoneyError`. It has quietly become "any domain rejection" and the

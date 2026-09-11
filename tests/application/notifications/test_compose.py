@@ -517,19 +517,29 @@ class TestAWalletMovement:
     def test_the_announced_set_is_exactly_the_kinds_that_move_value(
         self, build_wallet
     ):
-        """Locking and releasing are absent, and their absence is a decision.
+        """The fund operations are absent, and their absence is a decision.
 
-        They move money between the wallet's own two balances, so nothing the
-        owner holds changes - and they are typed at a terminal that has already
+        A pot changes *where* the wallet's money sits, not how much of it there
+        is - and the user typed the pot's name at a terminal that has already
         printed the result. Asserted here so that adding one is a deliberate edit
         to ``ANNOUNCED`` rather than a quiet side effect of a refactor.
+
+        ``DepositIntoFund`` is the exception and is asserted present, because it
+        is the one fund operation that brings money in from outside. The full set
+        is checked in ``tests/application/test_wallet_service.py``; what this
+        test guards is the *shape* of the rule - crossing the wallet's boundary
+        speaks, moving money around inside it does not.
         """
-        from app.application.lock.lock_funds import LockFunds
-        from app.application.release.release_funds import ReleaseFunds
+        from app.application.fund.deposit_into_fund import DepositIntoFund
+        from app.application.fund.lock_into_fund import LockIntoFund
+        from app.application.fund.release_from_fund import ReleaseFromFund
+        from app.application.release.release_from_locked import ReleaseFromLocked
         from app.application.wallet_service import WalletService
 
-        assert LockFunds not in WalletService.ANNOUNCED
-        assert ReleaseFunds not in WalletService.ANNOUNCED
+        assert DepositIntoFund in WalletService.ANNOUNCED
+        assert LockIntoFund not in WalletService.ANNOUNCED
+        assert ReleaseFromFund not in WalletService.ANNOUNCED
+        assert ReleaseFromLocked not in WalletService.ANNOUNCED
 
 
 def test_composing_reads_no_clock(build_wallet, build_noon_plan):

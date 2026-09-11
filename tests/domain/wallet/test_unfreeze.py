@@ -16,8 +16,7 @@ def test_unfreeze():
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.FROZEN,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(4000, Currency.NGN)
+        _available_balance=Money(10000, Currency.NGN)
     )
 
     wallet.unfreeze()
@@ -31,8 +30,7 @@ def test_unfreezing_active_wallet_raises_error():
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.ACTIVE,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(4000, Currency.NGN)
+        _available_balance=Money(10000, Currency.NGN)
     )    
 
     with pytest.raises(WalletAlreadyActiveError):
@@ -45,8 +43,7 @@ def test_unfreezing_closed_wallet_raises_error():
         user_id=uuid4(),
         currency=Currency.NGN,
         status=WalletStatus.CLOSED,
-        _available_balance=Money(10000, Currency.NGN),
-        _locked_balance=Money(4000, Currency.NGN)
+        _available_balance=Money(10000, Currency.NGN)
     )    
 
     with pytest.raises(WalletClosedError):

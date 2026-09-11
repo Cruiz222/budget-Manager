@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from app.domain.money.exception import (
     WalletClosedError,
     WalletNotFoundError,
 )
+from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
@@ -30,6 +32,12 @@ NGN = Currency.NGN
 #: environment, because ``WalletService`` takes its inputs as arguments -
 #: reading ``os.environ`` is the CLI's job, not the use case's.
 RECIPIENT = "chinedu@example.com"
+
+#: A moment after every pot these tests build. The pots brought in by
+#: ``build_wallet(locked=...)`` have no maturity date and so are open at every
+#: moment; the dated ones below are sealed against a later date. No test in this
+#: file reads a clock.
+MOMENT = datetime(2026, 1, 1)
 
 DESTINATION = Destination(
     kind=DestinationKind.BANK_ACCOUNT,
@@ -113,19 +121,72 @@ def test_withdrawal_persists_new_balance(tmp_path, build_wallet):
     )
 
 
-def test_lock_moves_both_balances(tmp_path, build_wallet):
+def test_lock_into_fund_moves_both_balances(tmp_path, build_wallet):
+    """The same fact as the old ``test_lock_moves_both_balances``, pot-scoped.
+
+    Two balances still move in opposite directions; what is new is that the
+    locked half of it now has a name, and the round trip through SQLite is what
+    proves the pot was persisted rather than only the wallet's available balance.
+    """
     wallet = build_wallet()
+    wallet.open_fund("Vacation", FundKind.PERSONAL)
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
 
-    service.lock(
+    service.lock_into_fund(
         wallet.wallet_id,
+        "Vacation",
         Money(Decimal("3000"), NGN),
         internal_reference=str(uuid4()),
     )
 
     stored = get_wallet(factory, wallet.wallet_id)
     assert stored.available_balance == Money(Decimal("7000"), NGN)
+    assert stored.locked_balance == Money(Decimal("3000"), NGN)
+    assert stored.fund_by_name("Vacation").balance == Money(Decimal("3000"), NGN)
+
+
+def test_deposit_into_fund_round_trips_through_sqlite(tmp_path, build_wallet):
+    """A pot's balance and its ``fund_id`` both survive the database.
+
+    The deposit path is where the ``fund_id`` column on the ledger first gets
+    written, so this is the round trip that covers the serialization helpers as
+    well as the funds table itself.
+    """
+    wallet = build_wallet(available="0")
+    fund = wallet.open_fund("Vacation", FundKind.PERSONAL)
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    transaction = service.deposit_into_fund(
+        wallet.wallet_id,
+        "Vacation",
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+
+    assert transaction.fund_id == fund.fund_id
+    stored = get_wallet(factory, wallet.wallet_id)
+    assert stored.locked_balance == Money(Decimal("5000"), NGN)
+    assert stored.available_balance == Money(Decimal("0"), NGN)
+    assert stored.fund_by_name("Vacation").fund_id == fund.fund_id
+
+
+def test_release_from_fund_round_trips_through_sqlite(tmp_path, build_wallet):
+    wallet = build_wallet(available="0", locked="5000")
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    service.release_from_fund(
+        wallet.wallet_id,
+        "Locked",
+        Money(Decimal("2000"), NGN),
+        internal_reference=str(uuid4()),
+        as_of=MOMENT,
+    )
+
+    stored = get_wallet(factory, wallet.wallet_id)
+    assert stored.available_balance == Money(Decimal("2000"), NGN)
     assert stored.locked_balance == Money(Decimal("3000"), NGN)
 
 
@@ -140,6 +201,7 @@ def test_payout_from_locked_spends_the_locked_balance(tmp_path, build_wallet):
         Money(Decimal("3000"), NGN),
         str(uuid4()),
         DESTINATION,
+        MOMENT,
     )
 
     assert transaction.type is TransactionType.PAYOUT
@@ -159,6 +221,7 @@ def test_payout_destination_survives_the_database(tmp_path, build_wallet):
         Money(Decimal("3000"), NGN),
         str(uuid4()),
         DESTINATION,
+        MOMENT,
     )
 
     stored_transaction = get_transaction(factory, transaction.internal_reference)
@@ -178,6 +241,7 @@ def test_rejected_payout_persists_a_failed_audit_row_and_no_balance_change(tmp_p
             Money(Decimal("15000"), NGN),
             internal_reference,
             DESTINATION,
+            MOMENT,
         )
 
     assert (
@@ -436,6 +500,7 @@ class TestTheReceiptForAWalletCommand:
             Money(Decimal("3000"), NGN),
             str(uuid4()),
             DESTINATION,
+            MOMENT,
         )
 
         queued = notifications_of(factory)
@@ -468,12 +533,19 @@ class TestTheReceiptForAWalletCommand:
         owner holds changes, and they typed the command at a terminal that has
         already printed the result. A receipt for that is not information - it is
         a second acknowledgement of something the user did themselves.
+
+        Which pot it went into is the one new fact - and it is not enough to
+        change the answer, because the user typed the pot's name in the same
+        breath as the amount.
         """
         wallet = build_wallet()
+        wallet.open_fund("Vacation", FundKind.PERSONAL)
         service, factory = build_service(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet)
 
-        service.lock(wallet.wallet_id, Money(Decimal("3000"), NGN), str(uuid4()))
+        service.lock_into_fund(
+            wallet.wallet_id, "Vacation", Money(Decimal("3000"), NGN), str(uuid4())
+        )
 
         assert notifications_of(factory) == []
 
@@ -482,7 +554,50 @@ class TestTheReceiptForAWalletCommand:
         service, factory = build_service(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet)
 
-        service.release(wallet.wallet_id, Money(Decimal("2000"), NGN), str(uuid4()))
+        service.release_from_fund(
+            wallet.wallet_id,
+            "Locked",
+            Money(Decimal("2000"), NGN),
+            str(uuid4()),
+            MOMENT,
+        )
+
+        assert notifications_of(factory) == []
+
+    def test_depositing_into_a_pot_says_something(self, tmp_path, build_wallet):
+        """The one new fund operation that is loud, and the rule that says which.
+
+        The notice set is unchanged in *shape*: an operation notifies when it
+        moves value across the wallet's boundary, and stays silent when it only
+        moves it around inside. Opening, locking, releasing and extending are all
+        internal (or move nothing at all), so they are silent; a deposit into a
+        pot brings money in from outside, so it speaks - exactly as a plain
+        deposit does.
+        """
+        wallet = build_wallet(available="0")
+        wallet.open_fund("Vacation", FundKind.PERSONAL)
+        service, factory = build_service(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet)
+
+        service.deposit_into_fund(
+            wallet.wallet_id, "Vacation", Money(Decimal("5000"), NGN), str(uuid4())
+        )
+
+        queued = notifications_of(factory)
+        assert len(queued) == 1
+        assert queued[0].kind is NotificationKind.WALLET_DEPOSIT
+
+    def test_opening_a_pot_says_nothing(self, tmp_path, build_wallet):
+        """No ledger row either - opening a pot moves no money.
+
+        Pinned because it is easy to assume every new fund command speaks; this
+        one has nothing to report and nothing to record.
+        """
+        wallet = build_wallet()
+        service, factory = build_service(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet)
+
+        service.open_fund(wallet.wallet_id, "Vacation", FundKind.PERSONAL)
 
         assert notifications_of(factory) == []
 

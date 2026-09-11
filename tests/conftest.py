@@ -22,6 +22,7 @@ import pytest
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
+from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
@@ -33,6 +34,7 @@ from app.domain.planning.planSource import PlanSource
 from app.domain.planning.planStatus import PlanStatus
 from app.domain.planning.savingsPlan import SavingsPlan
 from app.domain.planning.schedule import Schedule
+from app.domain.repositories.transaction_repository import TransactionRepository
 
 #: A well-formed bank destination, reused by the plan fixture below.
 BANK_DESTINATION = Destination(
@@ -95,7 +97,19 @@ class FakeChannel(NotificationChannel):
 
 @pytest.fixture
 def build_wallet():
-    """Return a fresh Wallet in the requested state."""
+    """Return a fresh Wallet in the requested state.
+
+    ``locked`` builds one open pot named "Locked" rather than a locked balance,
+    because a wallet no longer *has* a locked balance to set - it is the sum of
+    its pots. The same name and the same openness are what the migration gives
+    every pre-existing locked balance (see ``_migrate_locked_balance_into_funds``),
+    so a test written against ``locked="4000"`` describes exactly the wallet it
+    always did: 4000 reserved, and nothing preventing its release.
+
+    That equivalence is what keeps this factory worth having. Roughly fifty tests
+    reach the locked balance only through ``locked=``, and none of them should
+    have to learn what a pot is to keep testing what they were testing.
+    """
 
     def _build(
         available: str = "10000",
@@ -103,14 +117,30 @@ def build_wallet():
         status: WalletStatus = WalletStatus.ACTIVE,
         currency: Currency = Currency.NGN,
     ) -> Wallet:
-        return Wallet(
+        # Built ACTIVE and given its pot first, with the requested status applied
+        # at the end. Not a detail: ``open_fund`` refuses a closed wallet, which
+        # is correct domain behaviour, so a fixture that set the status up front
+        # could not build the very states its callers ask for. Constructing a
+        # state is also not the same as transitioning to it - ``freeze`` and
+        # ``unfreeze`` are tested on their own, and this factory is entitled to
+        # start where it likes.
+        wallet = Wallet(
             wallet_id=uuid4(),
             user_id=uuid4(),
-            status=status,
+            status=WalletStatus.ACTIVE,
             _available_balance=Money(Decimal(available), currency),
-            _locked_balance=Money(Decimal(locked), currency),
             currency=currency,
         )
+        if Decimal(locked) != 0:
+            # Only when there is something to put in it: a wallet with no locked
+            # money should have no pots, not an empty one. An empty pot would make
+            # ``locked=0`` build a wallet differing in *shape* from
+            # ``build_wallet()``, and shape is exactly what the payout draw order
+            # depends on.
+            fund = wallet.open_fund("Locked", FundKind.PERSONAL)
+            wallet.deposit_into_fund(fund.fund_id, Money(Decimal(locked), currency))
+        wallet.status = status
+        return wallet
 
     return _build
 
@@ -179,3 +209,55 @@ def build_channel():
         return FakeChannel(failures=failures)
 
     return _build
+
+
+class RecordingTransactionRepository(TransactionRepository):
+    """A ledger that keeps every save, in order, and nothing else.
+
+    ``InMemoryTransactionRepository`` keeps only the latest row per transaction,
+    which is what most tests want - they ask what the *final* row says. This one
+    exists for the tests that ask what the *sequence* said, which is how the
+    PENDING-then-SUCCESSFUL shape of ``WalletOperation.execute`` is observable at
+    all: by the time an operation returns, PENDING has been overwritten and the
+    in-memory repository has forgotten it ever existed.
+
+    Five test modules used to define their own copy of this class. The three fund
+    modules share the fixture instead; consolidating the older five onto it is a
+    cleanup that belongs with whatever touches them next, not with this change.
+
+    **The statuses are snapshots, taken at save time, and that is load-bearing.**
+    ``save`` is called twice for one transaction, and the second call is after
+    the *same object* has been marked FAILED or SUCCESSFUL - so a property
+    reading ``[transaction.status for transaction in self.saved]`` would report
+    the final status twice and never show PENDING at all. The only way to observe
+    the PENDING-then-SUCCESSFUL sequence is to record what the status was when
+    the save happened, which is what the original per-module copies did and what
+    this one has to keep doing.
+    """
+
+    def __init__(self):
+        self.saved = []
+        self.saved_statuses = []
+
+    def save(self, transaction):
+        self.saved.append(transaction)
+        self.saved_statuses.append(transaction.status)
+        return transaction
+
+    def get_by_id(self, transaction_id):
+        raise NotImplementedError
+
+    def get_by_internal_reference(self, internal_reference):
+        return None
+
+    def get_by_wallet_id(self, wallet_id):
+        raise NotImplementedError
+
+    def get_by_provider_reference(self, provider_reference):
+        raise NotImplementedError
+
+
+@pytest.fixture
+def recording_transactions():
+    """A ``RecordingTransactionRepository``, fresh for each test."""
+    return RecordingTransactionRepository()

@@ -74,6 +74,8 @@ class InvalidTransactionDateStamp(MoneyError):
     pass
 class TransactionNotFoundError(MoneyError):
     pass
+class InvalidTransactionFundIDError(MoneyError):
+    pass
 
 class InvalidDestinationKindError(MoneyError):
     pass
@@ -90,4 +92,36 @@ class InvalidTransactionDestinationError(MoneyError):
 class MissingDestinationError(MoneyError):
     pass
 class UnexpectedDestinationError(MoneyError):
+    pass
+
+# --- Funds (named locked pots) -------------------------------------------
+# A fund is a breakdown of a wallet's locked balance, so these are money errors
+# like the rest: refusing an operation is a *domain* outcome, not a bug.
+#
+# Note what is deliberately not here: a "maturity passed" error for the fund
+# itself. A pot that has matured is not exceptional - it is a pot that is open,
+# and ``is_matured`` is a question rather than a check. The refusal happens in
+# the other direction, ``FundNotMaturedError``, when something tries to take
+# money out too early.
+class InvalidFundIDError(MoneyError):
+    pass
+class InvalidFundNameError(MoneyError):
+    pass
+class InvalidFundKindError(MoneyError):
+    pass
+class InvalidFundMaturityError(MoneyError):
+    pass
+class InvalidFundBalanceError(MoneyError):
+    pass
+class InvalidFundCreatedAtError(MoneyError):
+    pass
+class DuplicateFundNameError(MoneyError):
+    pass
+class FundNotFoundError(MoneyError):
+    pass
+class FundNotMaturedError(MoneyError):
+    pass
+class MaturityNotExtendedError(MoneyError):
+    pass
+class InvalidWalletFundsError(MoneyError):
     pass

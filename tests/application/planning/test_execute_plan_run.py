@@ -7,6 +7,7 @@ from app.application.planning.execute_plan_run import ExecutePlanRun
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
+from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
@@ -134,17 +135,22 @@ class ExplodingCommitFactory:
 
 
 def top_up_locked(factory, wallet_id, amount):
-    """Deposit and then lock, so the money lands in the balance the plan spends.
+    """Deposit and then lock into a pot, so the money lands where the plan spends.
 
     A plain deposit would not do: it credits the *available* balance, and a
     LOCKED-source plan is funded by locked money only. A test that deposited and
     expected the plan to run would be testing the fallback the design forbids.
+
+    The pot is looked up by name rather than taken as an argument because the
+    plan cannot name one either - see ``execute_plan_run``'s ``_operation_for``.
+    A plan draws on the pool of matured pots, so the pot the money sits in is
+    immaterial here as long as it is open.
     """
     uow = factory.start()
     try:
         wallet = uow.wallets.get_by_id(wallet_id)
         wallet.apply_deposit(Money(Decimal(amount), NGN))
-        wallet.lock_funds(Money(Decimal(amount), NGN))
+        wallet.lock_into_fund(wallet.fund_by_name("Locked").fund_id, Money(Decimal(amount), NGN))
         uow.wallets.save(wallet)
         uow.commit()
     except BaseException:
@@ -467,7 +473,7 @@ class TestRunsThatAreBlocked:
 class TestFrozenIsNotSimplyRefused:
     """The subtle case the pre-flight status check exists for.
 
-    A frozen wallet permits release_funds - money does not leave, it only moves
+    A frozen wallet permits a release - money does not leave, it only moves
     between balances. It refuses every payout. So "frozen" is not a blanket no,
     and a plan mixing both would half-execute if status were discovered
     instruction-by-instruction.
@@ -561,6 +567,145 @@ class TestAtomicity:
         assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
             Decimal("0"), NGN
         )
+
+
+class TestMoneyThatIsLockedButNotYetSpendable:
+    """A pot's maturity date, seen from a run - the pre-flight's half of the rule.
+
+    The pre-flight and the execution must answer the same question about the same
+    money, and the failure mode when they do not is the half-executed run the
+    pre-flight exists to prevent: funded on paper by a pot that cannot be spent
+    yet, blocked only when the operation finally tries it. These tests are that
+    agreement, stated from the outside.
+    """
+
+    def test_a_run_funded_only_by_an_immature_pot_is_blocked(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The wallet holds the money. The plan still cannot pay.
+
+        Note the balance: 5,000 is locked and the plan needs 2,000, so every
+        "is there enough money" question answered against ``locked_balance``
+        says yes. The run must consult the *matured* total instead.
+        """
+        wallet = build_wallet(available="0")
+        pot = wallet.open_fund(
+            "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.INSUFFICIENT_BALANCE
+        # And nothing was half-done on the way to finding out.
+        assert ledger_of(factory, wallet.wallet_id) == []
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("5000"), NGN
+        )
+
+    def test_the_same_plan_pays_once_the_pot_has_come_due(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The other side of the same boundary, and the point of the phase.
+
+        The identical wallet and plan are run again with a later ``as_of`` and
+        succeed - so the block above was about the date, not about the amount or
+        about the wallet being unusable.
+        """
+        wallet = build_wallet(available="0")
+        pot = wallet.open_fund(
+            "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, datetime(2026, 6, 1, 9, 0))
+
+        assert run.status is RunStatus.SUCCEEDED
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("3000"), NGN
+        )
+
+    def test_the_funding_balance_counts_only_the_matured_pots(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """One matured pot and one sealed one, and the run is judged on the first.
+
+        A plan needing 2,000 against 1,000 matured and 9,000 sealed is blocked:
+        being unable to spend money you can see is the correct answer, not a bug
+        in the arithmetic, and it is reported as an ordinary insufficient balance
+        because from the run's point of view that is what it is.
+        """
+        wallet = build_wallet(available="0")
+        open_pot = wallet.open_fund("Salary", FundKind.PERSONAL)
+        sealed = wallet.open_fund(
+            "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
+        )
+        wallet.deposit_into_fund(open_pot.fund_id, Money(Decimal("1000"), NGN))
+        wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("9000"), NGN))
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.INSUFFICIENT_BALANCE
+
+    def test_a_release_plan_is_judged_on_matured_money_too(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The rule is not specific to payouts.
+
+        A RELEASE instruction moves money back to the available balance, and it
+        is a *release* that a maturity date most obviously governs - so the same
+        maturing-only arithmetic has to apply to the pre-flight for it.
+        """
+        wallet = build_wallet(available="0")
+        pot = wallet.open_fund(
+            "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=date(2026, 12, 1),
+        )
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.BLOCKED
+        assert wallet_after(factory, wallet.wallet_id).available_balance == Money(
+            Decimal("0"), NGN
+        )
+
+    def test_an_open_pot_funds_a_run_at_any_moment(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """``maturity_date = None`` means no maturity, so it is never the reason.
+
+        The state every pre-existing locked balance is migrated into, and the one
+        that makes the migration invisible: money that was spendable by a plan
+        yesterday is spendable by that plan today.
+        """
+        wallet = build_wallet(available="0")
+        pot = wallet.open_fund("Locked", FundKind.PERSONAL, maturity_date=None)
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.SUCCEEDED
 
 
 # --- catching up -----------------------------------------------------------

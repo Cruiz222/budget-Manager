@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import uuid
 
 from app.domain.money.destination import Destination
 from app.domain.money.exception import InvalidAmountError, MoneyError
@@ -31,14 +32,29 @@ class WalletOperation(ABC):
     ``destination`` is passed straight through to the Transaction, which is
     where the rule about it lives: a payout must carry one, every other type
     must not. The base does not police it - it only delivers it.
+
+    ``fund_id`` is the same shape of pass-through, for the same reason. A
+    pot-scoped operation records which pot it moved money through, and the base
+    has no opinion about when that must be set: the ledger's rules about it are
+    the Transaction's, and there is currently only one - that a fund id, if
+    present, is a UUID. Note the asymmetry with ``destination``, which *does*
+    have a rule tying it to the transaction type. A payout in this phase has no
+    single pot (see ``Wallet.payout_from_locked``), so "PAYOUT implies a fund"
+    would be a rule the code cannot keep.
     """
 
     #: Transaction type recorded for this operation (set by each subclass).
     transaction_type: TransactionType
 
-    def __init__(self, wallet: Wallet, transaction_repository: TransactionRepository):
+    def __init__(
+        self,
+        wallet: Wallet,
+        transaction_repository: TransactionRepository,
+        fund_id: uuid.UUID | None = None,
+    ):
         self.wallet = wallet
         self.transaction_repository = transaction_repository
+        self.fund_id = fund_id
 
     def execute(
         self,
@@ -65,6 +81,7 @@ class WalletOperation(ABC):
             amount=amount,
             internal_reference=internal_reference,
             destination=destination,
+            fund_id=self.fund_id,
         )
         self.transaction_repository.save(transaction)
 

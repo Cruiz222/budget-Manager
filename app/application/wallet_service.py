@@ -1,18 +1,22 @@
+from datetime import datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 from app.application.deposit.deposit_money import DepositMoney
-from app.application.lock.lock_funds import LockFunds
+from app.application.fund.deposit_into_fund import DepositIntoFund
+from app.application.fund.lock_into_fund import LockIntoFund
+from app.application.fund.release_from_fund import ReleaseFromFund
 from app.application.notifications import compose
 from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
-from app.application.release.release_funds import ReleaseFunds
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from app.application.wallet_operation import WalletOperation
 from app.application.withdraw.withdraw_money import WithdrawMoney
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.exception import MoneyError
+from app.domain.money.fund import Fund
+from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
 from app.domain.money.wallet import Wallet
@@ -48,18 +52,25 @@ class WalletService:
 
     #: Which operations say something to the user, and what they say.
     #:
-    #: A dict rather than four ``if`` statements in ``_run`` so that the answer
-    #: is readable in one place, and so that changing it is a line rather than an
-    #: edit to the flow every operation shares. The question "does a release send
-    #: an email?" is answered by looking here, not by tracing a branch.
+    #: A dict rather than a row of ``if`` statements in ``_run`` so that the
+    #: answer is readable in one place, and so that changing it is a line rather
+    #: than an edit to the flow every operation shares. The question "does a
+    #: release send an email?" is answered by looking here, not by tracing a
+    #: branch.
     #:
-    #: Locking and releasing are **absent on purpose**. They move money between
-    #: the wallet's own two balances, which changes nothing the owner holds, and
-    #: they are performed by the person reading the mail at a terminal that has
-    #: already printed the result. A receipt for a command someone just typed is
-    #: not information. See ``NotificationKind`` for the full argument.
+    #: Everything that only *reshuffles* the wallet's own balances is absent on
+    #: purpose: locking into a pot, releasing out of one, opening one, extending
+    #: one. None of them changes what the owner holds, and all of them are
+    #: performed by the person reading the mail, at a terminal that has already
+    #: printed the result. A receipt for a command someone just typed is not
+    #: information.
+    #:
+    #: ``DepositIntoFund`` *is* here, and the contrast is the point: money
+    #: arriving from outside is a boundary event even when it lands in a pot
+    #: rather than in the available balance. See ``NotificationKind``.
     ANNOUNCED = {
         DepositMoney: NotificationKind.WALLET_DEPOSIT,
+        DepositIntoFund: NotificationKind.WALLET_DEPOSIT,
         WithdrawMoney: NotificationKind.WALLET_WITHDRAWAL,
         PayoutFromLocked: NotificationKind.WALLET_PAYOUT,
         PayoutFromAvailable: NotificationKind.WALLET_PAYOUT,
@@ -78,17 +89,13 @@ class WalletService:
         # moving money, only on where the words about it go.
         self._recipient = recipient
 
+    # --- the two balances ---------------------------------------------------
+
     def deposit(self, wallet_id, amount: Money, internal_reference: str) -> Transaction:
         return self._run(DepositMoney, wallet_id, amount, internal_reference)
 
     def withdraw(self, wallet_id, amount: Money, internal_reference: str) -> Transaction:
         return self._run(WithdrawMoney, wallet_id, amount, internal_reference)
-
-    def lock(self, wallet_id, amount: Money, internal_reference: str) -> Transaction:
-        return self._run(LockFunds, wallet_id, amount, internal_reference)
-
-    def release(self, wallet_id, amount: Money, internal_reference: str) -> Transaction:
-        return self._run(ReleaseFunds, wallet_id, amount, internal_reference)
 
     def payout_from_locked(
         self,
@@ -96,14 +103,16 @@ class WalletService:
         amount: Money,
         internal_reference: str,
         destination: Destination,
+        as_of: datetime,
     ) -> Transaction:
-        """Spend the locked balance, sending value out to an external account."""
+        """Spend the locked pots, sending value out to an external account."""
         return self._run(
             PayoutFromLocked,
             wallet_id,
             amount,
             internal_reference,
             destination=destination,
+            as_of=as_of,
         )
 
     def payout_from_available(
@@ -127,24 +136,117 @@ class WalletService:
             destination=destination,
         )
 
-    def open_wallet(self, user_id: UUID, currency: Currency) -> Wallet:
-        """Open a new empty wallet for a user, in the given currency."""
+    # --- pots ---------------------------------------------------------------
+
+    def open_fund(
+        self,
+        wallet_id: UUID,
+        name: str,
+        kind: FundKind,
+        maturity_date=None,
+        as_of: datetime | None = None,
+    ) -> Fund:
+        """Open a named pot on a wallet.
+
+        No ledger row: opening a pot moves no money, so the only thing to persist
+        is the wallet's new shape. That is why this is a method here rather than a
+        ``WalletOperation`` - there is no movement to record, and nothing to
+        deduplicate, because the aggregate already refuses a duplicate name.
+        """
         uow = self._unit_of_work_factory.start()
         try:
-            wallet = Wallet(
-                wallet_id=uuid4(),
-                user_id=user_id,
-                status=WalletStatus.ACTIVE,
-                _available_balance=Money(Decimal("0"), currency),
-                _locked_balance=Money(Decimal("0"), currency),
-                currency=currency,
-            )
+            wallet = uow.wallets.get_by_id(wallet_id)
+            fund = wallet.open_fund(name, kind, maturity_date, as_of)
             uow.wallets.save(wallet)
             uow.commit()
-            return wallet
+            return fund
         except BaseException:
             uow.rollback()
             raise
+
+    def extend_fund(
+        self, wallet_id: UUID, name: str, new_date, as_of: datetime
+    ) -> Fund:
+        """Push a pot's maturity date later - never earlier.
+
+        Also no ledger row, for the same reason as ``open_fund``: a date changing
+        moves no money. The refusal for a date that is not later, or not in the
+        future, comes from the aggregate.
+
+        ``as_of`` is required rather than defaulted to ``datetime.now()`` here,
+        because "is this date in the future?" is a judgement this method makes -
+        and a use case that reads its own clock cannot be asked what it would do
+        at a given moment. The adapter holding the command line supplies the
+        moment, which is the arrangement every other use case already has.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            wallet = uow.wallets.get_by_id(wallet_id)
+            fund = wallet.fund_by_name(name)
+            wallet.extend_fund(fund.fund_id, new_date, as_of)
+            uow.wallets.save(wallet)
+            uow.commit()
+            return fund
+        except BaseException:
+            uow.rollback()
+            raise
+
+    def deposit_into_fund(
+        self, wallet_id, fund_name: str, amount: Money, internal_reference: str
+    ) -> Transaction:
+        """Bring money in from outside, straight into a named pot."""
+        return self._run(
+            DepositIntoFund,
+            wallet_id,
+            amount,
+            internal_reference,
+            fund_name=fund_name,
+        )
+
+    def lock_into_fund(
+        self, wallet_id, fund_name: str, amount: Money, internal_reference: str
+    ) -> Transaction:
+        """Move money from the available balance into a named pot."""
+        return self._run(
+            LockIntoFund,
+            wallet_id,
+            amount,
+            internal_reference,
+            fund_name=fund_name,
+        )
+
+    def release_from_fund(
+        self,
+        wallet_id,
+        fund_name: str,
+        amount: Money,
+        internal_reference: str,
+        as_of: datetime,
+    ) -> Transaction:
+        """Move money out of a named pot, refused until the pot has come due."""
+        return self._run(
+            ReleaseFromFund,
+            wallet_id,
+            amount,
+            internal_reference,
+            fund_name=fund_name,
+            as_of=as_of,
+        )
+
+    def funds_for_wallet(self, wallet_id: UUID) -> list[Fund]:
+        """Read a wallet's pots, in the order they were opened.
+
+        Pure read like ``get_wallet``. The wallet itself is validated first so
+        that "no such wallet" and "a wallet with no pots yet" stay
+        distinguishable - the same distinction ``transactions_for_wallet`` makes.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            return list(uow.wallets.get_by_id(wallet_id).funds)
+        finally:
+            uow.rollback()
+
+    # --- reading and status -------------------------------------------------
 
     def get_wallet(self, wallet_id: UUID) -> Wallet:
         """Read a wallet's current state.
@@ -156,6 +258,24 @@ class WalletService:
             return uow.wallets.get_by_id(wallet_id)
         finally:
             uow.rollback()
+
+    def open_wallet(self, user_id: UUID, currency: Currency) -> Wallet:
+        """Open a new empty wallet for a user, in the given currency."""
+        uow = self._unit_of_work_factory.start()
+        try:
+            wallet = Wallet(
+                wallet_id=uuid4(),
+                user_id=user_id,
+                status=WalletStatus.ACTIVE,
+                _available_balance=Money(Decimal("0"), currency),
+                currency=currency,
+            )
+            uow.wallets.save(wallet)
+            uow.commit()
+            return wallet
+        except BaseException:
+            uow.rollback()
+            raise
 
     def transactions_for_wallet(self, wallet_id: UUID) -> list[Transaction]:
         """Read a wallet's full transaction ledger, oldest first.
@@ -204,12 +324,22 @@ class WalletService:
         amount: Money,
         internal_reference: str,
         destination: Destination | None = None,
+        **extra,
     ) -> Transaction:
+        """Open a unit, build the operation against the loaded wallet, run it.
+
+        ``**extra`` exists because the operations no longer share one constructor
+        shape. A pot-scoped operation needs to know *which* pot, and only the
+        loaded wallet can answer that - so the name travels here as an argument
+        and the operation resolves it itself. ``operation_cls`` is still taken
+        separately, and still the real class, because ``ANNOUNCED`` is keyed on
+        it; a builder callable would have hidden the very thing the lookup needs.
+        """
         uow = self._unit_of_work_factory.start()
         try:
             wallet = uow.wallets.get_by_id(wallet_id)
             operation: WalletOperation = operation_cls(
-                wallet, uow.transactions
+                wallet, uow.transactions, **extra
             )
             transaction = operation.execute(amount, internal_reference, destination)
             # The wallet changed (or would have) - persist the aggregate's new
@@ -244,10 +374,11 @@ class WalletService:
     ) -> None:
         """Queue the receipt for an operation, when that operation is announced.
 
-        Silent for the two operations that say nothing - locking and releasing -
-        and the silence is a lookup rather than a condition. Keeping the list in
-        ``ANNOUNCED`` means "does this operation notify?" has one answer in one
-        place, instead of being spread through the flow every operation shares.
+        Silent for every operation that only moves money between the wallet's own
+        balances, and the silence is a lookup rather than a condition. Keeping the
+        list in ``ANNOUNCED`` means "does this operation notify?" has one answer
+        in one place, instead of being spread through the flow every operation
+        shares.
 
         ``enqueue`` answers whether this call was the one that claimed the event,
         and the answer is deliberately discarded. Nothing here branches on it:

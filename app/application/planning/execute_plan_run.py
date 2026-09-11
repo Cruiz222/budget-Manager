@@ -10,7 +10,7 @@ from datetime import datetime
 from app.application.notifications import compose
 from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
-from app.application.release.release_funds import ReleaseFunds
+from app.application.release.release_from_locked import ReleaseFromLocked
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
@@ -106,11 +106,11 @@ class ExecutePlanRun:
             wallet = uow.wallets.get_by_id(plan.wallet_id)
             due_at = plan.next_due_at
 
-            reason = self._blocking_reason(plan, wallet)
+            reason = self._blocking_reason(plan, wallet, as_of)
             if reason is not None:
                 return self._record_blocked(uow, plan, due_at, reason)
 
-            self._move_the_money(uow, plan, wallet, due_at)
+            self._move_the_money(uow, plan, wallet, due_at, as_of)
             return self._record_success(uow, plan, wallet, due_at)
         except BaseException:
             uow.rollback()
@@ -119,7 +119,7 @@ class ExecutePlanRun:
     # --- the decision -------------------------------------------------------
 
     def _blocking_reason(
-        self, plan: SavingsPlan, wallet: Wallet
+        self, plan: SavingsPlan, wallet: Wallet, as_of: datetime
     ) -> RunBlockReason | None:
         """Whether anything stops this run, checked *before* a single instruction runs.
 
@@ -138,9 +138,9 @@ class ExecutePlanRun:
         this moment.
 
         Status is checked here too, and that is subtler than it looks. A FROZEN
-        wallet permits ``release_funds`` (money does not leave, it only moves
-        between balances) but refuses every payout (money leaving is the one
-        thing freezing stops). A plan holding both a release and a payout would
+        wallet permits a release (money does not leave, it only moves between
+        balances) but refuses every payout (money leaving is the one thing
+        freezing stops). A plan holding both a release and a payout would
         therefore release successfully and then fail on the payout - the exact
         half-execution this method exists to prevent, arriving through the one
         door a balance check cannot see. So a frozen wallet blocks any run that
@@ -152,7 +152,7 @@ class ExecutePlanRun:
         if wallet.status is WalletStatus.FROZEN and self._sends_value_out(plan):
             return RunBlockReason.WALLET_FROZEN
 
-        if self._funding_balance(plan, wallet) < plan.total_to_move:
+        if self._funding_balance(plan, wallet, as_of) < plan.total_to_move:
             return RunBlockReason.INSUFFICIENT_BALANCE
 
         return None
@@ -171,8 +171,8 @@ class ExecutePlanRun:
         )
 
     @staticmethod
-    def _funding_balance(plan: SavingsPlan, wallet: Wallet) -> Money:
-        """Which of the wallet's two balances this plan spends.
+    def _funding_balance(plan: SavingsPlan, wallet: Wallet, as_of: datetime) -> Money:
+        """Which of the wallet's balances this plan spends.
 
         The mapping lives here, in the application layer, for the same reason
         the plan-currency-matches-wallet rule does: it is the only place both
@@ -185,9 +185,27 @@ class ExecutePlanRun:
         allowance. Available balance is not a fallback for a plan that spends
         locked funds - a locked-source plan is funded by locked money only, and
         vice versa.
+
+        **For a locked plan it is the *matured* locked total, not the locked
+        total**, and that is not a detail - it is what keeps this method honest
+        about what the run will do. Only a pot that has come due may be spent, so
+        judging the run against the full locked balance would pass a run funded
+        entirely by a pot that has not matured, and then have the payout raise
+        partway through. That is the half-paid payroll this pre-flight exists to
+        prevent, reintroduced through the pre-flight's own arithmetic - the same
+        shape of mistake as the frozen-wallet case above.
+
+        The converse is a fair reading, so it is worth stating: from a run's
+        point of view, money that cannot be spent yet is money that is not there.
+        A locked plan whose only pot is immature is reported as
+        ``INSUFFICIENT_BALANCE``. The block reason does not distinguish "empty"
+        from "not yet spendable" because in this phase a run cannot act
+        differently on the difference - it is blocked either way. A dedicated
+        reason arrives with the phase that lets a plan name its pot, where the
+        user can do something about it.
         """
         if plan.source is PlanSource.LOCKED:
-            return wallet.locked_balance
+            return wallet.matured_locked_balance(as_of)
         return wallet.available_balance
 
     # --- the outcomes -------------------------------------------------------
@@ -198,6 +216,7 @@ class ExecutePlanRun:
         plan: SavingsPlan,
         wallet: Wallet,
         due_at: datetime,
+        as_of: datetime,
     ) -> None:
         """Apply every instruction, through the operation that owns its rules.
 
@@ -206,28 +225,48 @@ class ExecutePlanRun:
         all the ones a manual operation would get. Nothing here bypasses the
         wallet to edit a balance directly - if a run could do that, the plan
         would be a second, unchecked way to spend money.
+
+        Note which moment the operations are handed, because the two moments in
+        this method are easy to confuse. The *reference* is keyed on ``due_at`` -
+        the occurrence being run - because that is what identifies the payment.
+        The operations are given ``as_of`` - when the run is actually happening -
+        because that is what decides whether a pot has matured. Using ``due_at``
+        for maturity would judge a pot against the date the payment was *meant*
+        to happen, so a run executed late would be refused for a pot that has
+        since opened, and - worse - the pre-flight, which can only know
+        ``as_of``, would have approved it. Pre-flight and execution must be
+        answering the same question or the pre-flight is worth nothing.
         """
         for index, instruction in enumerate(plan.instructions):
-            operation_cls = self._operation_for(plan.source, instruction)
-            operation_cls(wallet, uow.transactions).execute(
+            operation_cls, extra = self._operation_for(plan.source, instruction, as_of)
+            operation_cls(wallet, uow.transactions, **extra).execute(
                 amount=instruction.amount,
                 internal_reference=self._reference(plan.plan_id, due_at, index),
                 destination=instruction.destination,
             )
 
     @staticmethod
-    def _operation_for(source: PlanSource, instruction: Instruction):
-        """Pick the operation an instruction implies. The planning-to-money seam.
+    def _operation_for(source: PlanSource, instruction: Instruction, as_of: datetime):
+        """Pick the operation an instruction implies, and how to build it.
+
+        The planning-to-money seam, and it returns **a class and its keyword
+        arguments** rather than a bare class, because the operations no longer
+        share one constructor shape. A RELEASE and a locked-source payout both
+        need the moment they run at - a pot pays out and releases only once it
+        has come due - while an available-source payout has no pots in it at all
+        and needs nothing. Pairing class with arguments here keeps that decision
+        in the seam that exists to hold it, instead of a conditional scattered
+        where the operation happens to be built.
 
         A RELEASE is a locked -> available move whatever the plan's source, and
         the aggregate has already refused to build an AVAILABLE-source plan
         containing one - so the source only has to disambiguate the payout case.
         """
         if instruction.action is PlannedAction.RELEASE:
-            return ReleaseFunds
+            return ReleaseFromLocked, {"as_of": as_of}
         if source is PlanSource.LOCKED:
-            return PayoutFromLocked
-        return PayoutFromAvailable
+            return PayoutFromLocked, {"as_of": as_of}
+        return PayoutFromAvailable, {}
 
     @staticmethod
     def _reference(plan_id: uuid.UUID, due_at: datetime, index: int) -> str:
