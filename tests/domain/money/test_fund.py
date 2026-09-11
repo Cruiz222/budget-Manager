@@ -5,11 +5,15 @@ shape of the file follows them:
 
   - **Deposits are never refused for a date reason.** The pot can be fed before,
     on, and after its date - that is the whole answer to "I want to keep adding
-    without opening a new plan for each deposit".
-  - **Money leaves a sealed pot by no route.** ``release`` refuses; ``pay``
-    refuses for a ``PERSONAL`` pot. The one exception is a ``BUSINESS`` pot
-    paying before its date, and it is the only place the two kinds differ.
-  - **Extending goes one way.** Later, never earlier, and never into the past.
+    without opening a new plan for each deposit". What a deposit *does* do is
+    stamp the pot's first funding moment, once.
+  - **Money leaves a sealed pot by no route** - ``release`` refuses always, and
+    ``pay`` refuses for a ``PERSONAL`` pot. The one exception is a ``BUSINESS``
+    pot paying before its date, and even that needs a commitment older than the
+    money: see ``authorises_early_payout``, which is the rule the whole feature
+    turns on.
+  - **Extending goes one way.** Later, never earlier, never into the past - and
+    it re-seals the pot, which is what makes a change of mind bind.
 """
 
 from datetime import date, datetime
@@ -44,6 +48,13 @@ MOMENT = datetime(2026, 1, 1)
 
 DUE = date(2026, 6, 1)
 
+#: The three moments the commitment rule compares, in the order that works:
+#: the pot's terms come into force (``MOMENT``), a plan commits money to it, and
+#: the money arrives. They are a day apart so that any pair being swapped is
+#: visible - equal values would make ``<=`` hide a mistake rather than catch one.
+COMMITTED = datetime(2026, 1, 2)
+FUNDED = datetime(2026, 1, 3)
+
 
 def ngn(amount: str) -> Money:
     return Money(Decimal(amount), NGN)
@@ -55,13 +66,25 @@ def a_fund(
     balance="0",
     maturity_date=None,
     currency=NGN,
+    sealed_at=MOMENT,
+    first_funded_at=None,
 ) -> Fund:
+    """A pot, with its two commitment moments settable.
+
+    ``sealed_at`` defaults to ``MOMENT`` rather than ``datetime.now()`` so that
+    every pot in this file is sealed at a moment a test can name. Nothing below
+    reads it unless it is asking about ``authorises_early_payout``, but a default
+    that moved with the clock would make the three-way ordering in that section
+    depend on when the suite ran - which is exactly what those tests are about.
+    """
     return Fund(
         fund_id=uuid4(),
         name=name,
         kind=kind,
         _balance=Money(Decimal(balance), currency),
         maturity_date=maturity_date,
+        sealed_at=sealed_at,
+        first_funded_at=first_funded_at,
         created_at=datetime(2026, 1, 1),
     )
 
@@ -197,7 +220,7 @@ def test_a_fund_with_a_date_is_not_open():
 def test_a_deposit_increases_the_balance():
     fund = a_fund(balance="1000")
 
-    fund.deposit(ngn("500"))
+    fund.deposit(ngn("500"), MOMENT)
 
     assert fund.balance == ngn("1500")
 
@@ -212,8 +235,8 @@ def test_a_sealed_fund_still_accepts_deposits():
     """
     fund = a_fund(balance="50000", maturity_date=DUE)
 
-    fund.deposit(ngn("2000"))
-    fund.deposit(ngn("1500"))
+    fund.deposit(ngn("2000"), MOMENT)
+    fund.deposit(ngn("1500"), MOMENT)
 
     assert fund.balance == ngn("53500")
     with pytest.raises(FundNotMaturedError):
@@ -224,9 +247,13 @@ def test_a_matured_fund_still_accepts_deposits():
     """And so does one whose date has passed - deposits are not gated either way."""
     fund = a_fund(balance="0", maturity_date=date(2020, 1, 1))
 
-    fund.deposit(ngn("500"))
+    fund.deposit(ngn("500"), MOMENT)
 
     assert fund.balance == ngn("500")
+    # Deposits are still not gated by the date, but they now *record* one - so a
+    # pot whose due date is in the past still takes a funding moment, and it is
+    # the moment it was given rather than the day.
+    assert fund.first_funded_at == MOMENT
 
 
 @pytest.mark.parametrize("amount", ["0", "-1000"])
@@ -234,7 +261,7 @@ def test_a_deposit_must_be_positive(amount):
     fund = a_fund(balance="1000")
 
     with pytest.raises(InvalidAmountError):
-        fund.deposit(ngn(amount))
+        fund.deposit(ngn(amount), MOMENT)
 
     assert fund.balance == ngn("1000")
 
@@ -243,7 +270,7 @@ def test_a_deposit_must_be_in_the_funds_currency():
     fund = a_fund(balance="1000")
 
     with pytest.raises(CurrencyMismatchError):
-        fund.deposit(Money(Decimal("500"), USD))
+        fund.deposit(Money(Decimal("500"), USD), MOMENT)
 
     assert fund.balance == ngn("1000")
 
@@ -252,7 +279,7 @@ def test_a_deposit_must_be_money():
     fund = a_fund(balance="1000")
 
     with pytest.raises(InvalidAmountError):
-        fund.deposit(500)
+        fund.deposit(500, MOMENT)
 
 
 # --- release --------------------------------------------------------------
@@ -339,20 +366,47 @@ def test_a_personal_fund_may_pay_once_it_has_come_due():
     assert fund.balance == ngn("3000")
 
 
-def test_a_business_fund_may_pay_before_its_date():
+def test_a_business_fund_may_pay_before_its_date_once_a_commitment_predates_it():
     """The one rule that distinguishes the two kinds, and the reason
     ``FundKind`` exists at all.
 
-    A scheduled obligation does not wait for the float to mature - that is what
-    a business pot is for. Phase A never reaches this with an immature pot,
-    because a plan cannot name its pot yet; the rule is here for the phase that
-    can.
+    A scheduled obligation does not wait for the float to mature - that is what a
+    business pot is for. Note what the exemption costs, though: the payment needs
+    a commitment that predates the money, which is the subject of the section
+    below. "Business" alone is not enough, and the test after this one shows it.
     """
-    fund = a_fund(balance="5000", kind=FundKind.BUSINESS, maturity_date=DUE)
+    fund = a_fund(
+        balance="5000",
+        kind=FundKind.BUSINESS,
+        maturity_date=DUE,
+        first_funded_at=datetime(2026, 1, 3),
+    )
 
-    fund.pay(ngn("2000"), MOMENT)
+    fund.pay(ngn("2000"), MOMENT, committed_at=datetime(2026, 1, 2))
 
     assert fund.balance == ngn("3000")
+
+
+def test_a_business_fund_may_not_pay_before_its_date_without_a_commitment():
+    """"Business" is necessary and not sufficient, which the old rule got wrong.
+
+    Before seeds and commitments existed, the kind alone let a business pot pay
+    early - and a hand-typed payout is a payment the owner chose a moment ago, so
+    the exemption was reachable by typing. It is now refused: the pot asks
+    whether a commitment predates its money, and an ad-hoc payout has no
+    commitment at all.
+    """
+    fund = a_fund(
+        balance="5000",
+        kind=FundKind.BUSINESS,
+        maturity_date=DUE,
+        first_funded_at=datetime(2026, 1, 3),
+    )
+
+    with pytest.raises(FundNotMaturedError):
+        fund.pay(ngn("2000"), MOMENT)
+
+    assert fund.balance == ngn("5000")
 
 
 def test_a_business_fund_still_refuses_an_early_release():
@@ -383,6 +437,130 @@ def test_a_payment_must_be_positive(amount):
 
     with pytest.raises(InvalidAmountError):
         fund.pay(ngn(amount), MOMENT)
+
+
+# --- who may pay early, and when -------------------------------------------
+
+
+def test_a_personal_pot_is_never_authorised_to_pay_early():
+    """The kind gate, asked directly.
+
+    Even with a perfect ordering, a personal pot answers no. Keeping this as a
+    ``False`` rather than an exception is what lets the pre-flight ask the
+    question about every pot without having to catch anything.
+    """
+    fund = a_fund(
+        kind=FundKind.PERSONAL, maturity_date=DUE, first_funded_at=FUNDED
+    )
+
+    assert fund.authorises_early_payout(COMMITTED) is False
+
+
+@pytest.mark.parametrize("committed_at", [None])
+def test_a_business_pot_without_a_commitment_is_not_authorised(committed_at):
+    """``None`` is not "unknown, so allow" - it is the hand-typed payout.
+
+    This is the temptation route closed at the pot: whoever types ``payout`` has
+    no plan, so no commitment can be supplied, so a sealed business pot waits.
+    """
+    fund = a_fund(kind=FundKind.BUSINESS, maturity_date=DUE, first_funded_at=FUNDED)
+
+    assert fund.authorises_early_payout(committed_at) is False
+
+
+def test_an_empty_business_pot_is_not_authorised():
+    """No money has arrived, so there is nothing for a commitment to predate.
+
+    The ``first_funded_at is None`` arm, which is reachable in practice: a pot
+    opened and committed to but not yet funded is exactly the state the workflow
+    passes through between ``plan create`` and ``fund deposit``.
+    """
+    fund = a_fund(
+        kind=FundKind.BUSINESS, maturity_date=DUE, first_funded_at=None
+    )
+
+    assert fund.authorises_early_payout(COMMITTED) is False
+
+
+def test_seal_then_commit_then_fund_is_authorised():
+    """The ordering, in the one arrangement that satisfies it."""
+    fund = a_fund(
+        kind=FundKind.BUSINESS,
+        maturity_date=DUE,
+        sealed_at=MOMENT,
+        first_funded_at=FUNDED,
+    )
+
+    assert fund.authorises_early_payout(COMMITTED) is True
+
+
+@pytest.mark.parametrize(
+    "committed_at",
+    [
+        datetime(2025, 12, 1),  # before the pot's terms came into force
+        datetime(2026, 1, 4),  # after the money arrived
+    ],
+    ids=["commitment predates the sealing", "commitment postdates the funding"],
+)
+def test_a_commitment_outside_the_window_is_not_authorised(committed_at):
+    """The two ways the ordering can fail, and neither is a boundary case.
+
+    A commitment older than the pot was made against nothing - the pot did not
+    exist. A commitment younger than the money is the manoeuvre the rule exists
+    for: fund a pot first, then write a plan that unlocks what you funded. Both
+    refuse, and both refuse for the same reason: the comparison is a window, not
+    a threshold.
+    """
+    fund = a_fund(
+        kind=FundKind.BUSINESS,
+        maturity_date=DUE,
+        sealed_at=MOMENT,
+        first_funded_at=FUNDED,
+    )
+
+    assert fund.authorises_early_payout(committed_at) is False
+
+
+def test_an_extension_moves_sealed_at_and_lapses_the_exemption():
+    """Re-sealing, observed at the level it happens.
+
+    ``extend_to`` sets ``sealed_at`` to the moment of the extension, which pushes
+    it past a commitment already made. Nothing else changes - the balance, the
+    kind and the funding moment are untouched - so this is the whole mechanism,
+    and it is why the exemption needs no separate "was it extended?" flag.
+    """
+    fund = a_fund(
+        kind=FundKind.BUSINESS,
+        maturity_date=DUE,
+        sealed_at=MOMENT,
+        first_funded_at=FUNDED,
+    )
+    assert fund.authorises_early_payout(COMMITTED) is True
+
+    extended_at = datetime(2026, 2, 1)
+    fund.extend_to(date(2026, 9, 1), extended_at)
+
+    assert fund.sealed_at == extended_at
+    assert fund.first_funded_at == FUNDED
+    assert fund.authorises_early_payout(COMMITTED) is False
+
+
+def test_retrying_a_payment_does_not_move_the_funding_moment():
+    """``first_funded_at`` is stamped once, and the once is the *first*.
+
+    The anti-temptation guarantee in its smallest form. If the anchor were the
+    latest funding, a pot sealed and committed to could be unlocked again by
+    depositing a token amount - the clock would reset and a plan created
+    yesterday would be authorised tomorrow. Nothing moves it but a fresh pot.
+    """
+    fund = a_fund(kind=FundKind.BUSINESS, maturity_date=DUE, sealed_at=MOMENT)
+
+    fund.deposit(ngn("1000"), FUNDED)
+    fund.deposit(ngn("1000"), datetime(2026, 2, 1))
+    fund.deposit(ngn("1000"), datetime(2026, 3, 1))
+
+    assert fund.balance == ngn("3000")
+    assert fund.first_funded_at == FUNDED
 
 
 # --- extend ---------------------------------------------------------------
@@ -478,7 +656,7 @@ def test_an_extended_pot_still_accepts_deposits():
     fund = a_fund(balance="5000", maturity_date=DUE)
 
     fund.extend_to(date(2027, 1, 1), MOMENT)
-    fund.deposit(ngn("1000"))
+    fund.deposit(ngn("1000"), MOMENT)
 
     assert fund.balance == ngn("6000")
 

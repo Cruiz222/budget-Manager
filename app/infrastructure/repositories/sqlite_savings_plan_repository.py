@@ -10,11 +10,13 @@ from app.infrastructure.persistence.serialization import (
     datetime_to_text,
     enum_to_text,
     instructions_to_text,
+    optional_uuid_to_text,
     schedule_to_text,
     text_to_date,
     text_to_datetime,
     text_to_enum,
     text_to_instructions,
+    text_to_optional_uuid,
     text_to_schedule,
     text_to_uuid,
     uuid_to_text,
@@ -22,7 +24,7 @@ from app.infrastructure.persistence.serialization import (
 
 _COLUMNS = (
     "plan_id, wallet_id, name, source, schedule, instructions, "
-    "status, completed_runs, ends_on, created_at"
+    "status, completed_runs, ends_on, fund_id, created_at"
 )
 
 
@@ -48,8 +50,8 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
             """
             INSERT INTO savings_plans
                 (plan_id, wallet_id, name, source, schedule, instructions,
-                 status, completed_runs, ends_on, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 status, completed_runs, ends_on, fund_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(plan_id) DO UPDATE SET
                 wallet_id      = excluded.wallet_id,
                 name           = excluded.name,
@@ -59,6 +61,7 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
                 status         = excluded.status,
                 completed_runs = excluded.completed_runs,
                 ends_on        = excluded.ends_on,
+                fund_id        = excluded.fund_id,
                 created_at     = excluded.created_at
             """,
             (
@@ -71,6 +74,7 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
                 enum_to_text(plan.status),
                 plan.completed_runs,
                 date_to_text(plan.ends_on),
+                optional_uuid_to_text(plan.fund_id),
                 datetime_to_text(plan.created_at),
             ),
         )
@@ -120,5 +124,6 @@ class SqliteSavingsPlanRepository(SavingsPlanRepository):
             status=text_to_enum(PlanStatus, row["status"]),
             completed_runs=row["completed_runs"],
             ends_on=text_to_date(row["ends_on"]),
+            fund_id=text_to_optional_uuid(row["fund_id"]),
             created_at=text_to_datetime(row["created_at"]),
         )

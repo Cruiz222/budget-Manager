@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -16,6 +16,14 @@ from app.infrastructure.repositories.sqlite_wallet_repository import (
 )
 
 NGN = Currency.NGN
+
+#: The moment the deposits in this file arrive at.
+#:
+#: Fixed rather than "now", because a deposit stamps ``first_funded_at`` and this
+#: file asserts the *round trip* - so the value has to be one a test can write
+#: down as an expectation. Reading the clock would make the assertion "the pot
+#: was funded whenever this suite happened to run".
+MOMENT = datetime(2026, 1, 1)
 
 
 def ngn(amount: str) -> Money:
@@ -73,8 +81,8 @@ def test_a_wallets_pots_round_trip(build_wallet):
     wallet = build_wallet(available="1000")
     wallet.open_fund("Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1))
     wallet.open_fund("Float", FundKind.BUSINESS, maturity_date=None)
-    wallet.deposit_into_fund(wallet.fund_by_name("Vacation").fund_id, ngn("4000"))
-    wallet.deposit_into_fund(wallet.fund_by_name("Float").fund_id, ngn("2500"))
+    wallet.deposit_into_fund(wallet.fund_by_name("Vacation").fund_id, ngn("4000"), MOMENT)
+    wallet.deposit_into_fund(wallet.fund_by_name("Float").fund_id, ngn("2500"), MOMENT)
     repository = build_repository()
 
     repository.save(wallet)
@@ -139,7 +147,7 @@ def test_saving_again_does_not_duplicate_pots(build_wallet):
     repository = build_repository()
     repository.save(wallet)
 
-    wallet.deposit_into_fund(wallet.fund_by_name("Vacation").fund_id, ngn("500"))
+    wallet.deposit_into_fund(wallet.fund_by_name("Vacation").fund_id, ngn("500"), MOMENT)
     repository.save(wallet)
     stored = repository.get_by_id(wallet.wallet_id)
 

@@ -109,7 +109,7 @@ def test_a_pot_that_has_not_come_due_refuses_release(build_wallet):
     wallet = build_wallet(available="0")
     due = date(2026, 6, 1)
     pot = wallet.open_fund("Vacation", FundKind.PERSONAL, maturity_date=due)
-    wallet.deposit_into_fund(pot.fund_id, ngn("5000"))
+    wallet.deposit_into_fund(pot.fund_id, ngn("5000"), MOMENT)
 
     with pytest.raises(FundNotMaturedError):
         wallet.release_from_fund(
@@ -138,7 +138,7 @@ def test_a_refused_release_leaves_the_pot_untouched(build_wallet):
     pot = wallet.open_fund(
         "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
     )
-    wallet.deposit_into_fund(pot.fund_id, ngn("5000"))
+    wallet.deposit_into_fund(pot.fund_id, ngn("5000"), MOMENT)
 
     for _ in range(3):
         with pytest.raises(FundNotMaturedError):

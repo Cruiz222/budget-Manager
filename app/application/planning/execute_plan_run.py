@@ -12,7 +12,6 @@ from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.release.release_from_locked import ReleaseFromLocked
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
-from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notification import Notification
@@ -108,7 +107,7 @@ class ExecutePlanRun:
 
             reason = self._blocking_reason(plan, wallet, as_of)
             if reason is not None:
-                return self._record_blocked(uow, plan, due_at, reason)
+                return self._record_blocked(uow, plan, wallet, due_at, reason)
 
             self._move_the_money(uow, plan, wallet, due_at, as_of)
             return self._record_success(uow, plan, wallet, due_at)
@@ -152,10 +151,7 @@ class ExecutePlanRun:
         if wallet.status is WalletStatus.FROZEN and self._sends_value_out(plan):
             return RunBlockReason.WALLET_FROZEN
 
-        if self._funding_balance(plan, wallet, as_of) < plan.total_to_move:
-            return RunBlockReason.INSUFFICIENT_BALANCE
-
-        return None
+        return self._money_block(plan, wallet, as_of)
 
     @staticmethod
     def _sends_value_out(plan: SavingsPlan) -> bool:
@@ -170,43 +166,76 @@ class ExecutePlanRun:
             for instruction in plan.instructions
         )
 
-    @staticmethod
-    def _funding_balance(plan: SavingsPlan, wallet: Wallet, as_of: datetime) -> Money:
-        """Which of the wallet's balances this plan spends.
+    def _money_block(
+        self, plan: SavingsPlan, wallet: Wallet, as_of: datetime
+    ) -> RunBlockReason | None:
+        """Whether the plan's source can cover this run, and if not, why not.
 
-        The mapping lives here, in the application layer, for the same reason
-        the plan-currency-matches-wallet rule does: it is the only place both
-        aggregates are loaded at once. Putting it on the plan would mean the
-        plan reaching into a wallet; putting it on the wallet would mean the
-        money domain knowing what a ``PlanSource`` is. Neither aggregate can
-        hold a rule that spans both, so the use case holds it.
+        Which of the wallet's balances a plan spends is decided here, in the
+        application layer, for the same reason the plan-currency-matches-wallet
+        rule is: it is the only place both aggregates are loaded at once. Putting
+        it on the plan would mean the plan reaching into a wallet; putting it on
+        the wallet would mean the money domain knowing what a ``PlanSource`` is.
+        Neither aggregate can hold a rule that spans both, so the use case holds
+        it.
 
         Note this is deliberately the *whole* balance, not a per-instruction
         allowance. Available balance is not a fallback for a plan that spends
         locked funds - a locked-source plan is funded by locked money only, and
         vice versa.
 
-        **For a locked plan it is the *matured* locked total, not the locked
-        total**, and that is not a detail - it is what keeps this method honest
-        about what the run will do. Only a pot that has come due may be spent, so
-        judging the run against the full locked balance would pass a run funded
-        entirely by a pot that has not matured, and then have the payout raise
-        partway through. That is the half-paid payroll this pre-flight exists to
-        prevent, reintroduced through the pre-flight's own arithmetic - the same
-        shape of mistake as the frozen-wallet case above.
+        **A locked plan names its pot, and the pot is what is asked.** The
+        previous phase asked ``matured_locked_balance`` - the sum over every
+        matured pot - because a plan could not say which pot it meant, and this
+        method's docstring then promised that "a dedicated reason arrives with
+        the phase that lets a plan name its pot". This is that phase, and the
+        promise is kept by removing the arithmetic rather than by adding a
+        second check beside it: there is now one pot, so there is no sum to get
+        wrong, and the answer comes from ``Fund.authorises_early_payout`` - the
+        very method the payout itself calls. Pre-flight and execution ask one
+        question in one place, which is the only way the pre-flight is worth
+        anything.
 
-        The converse is a fair reading, so it is worth stating: from a run's
-        point of view, money that cannot be spent yet is money that is not there.
-        A locked plan whose only pot is immature is reported as
-        ``INSUFFICIENT_BALANCE``. The block reason does not distinguish "empty"
-        from "not yet spendable" because in this phase a run cannot act
-        differently on the difference - it is blocked either way. A dedicated
-        reason arrives with the phase that lets a plan name its pot, where the
-        user can do something about it.
+        **The maturity test comes before the balance test**, and the order is
+        the advice. A pot that may not be spent at all cannot be helped by the
+        size of its balance, so "this pot is not available yet" is the more
+        useful thing to say even when it is also short. Reversed, a user would
+        be told to top up a pot that topping up would not free.
+
+        **``is_irreversible`` is load-bearing in that test, not decoration.** The
+        business-pot exemption is for a *scheduled payout to an external
+        account*; a RELEASE moves money between the wallet's own balances and is
+        never exempt, for either kind of pot (see ``Fund.release``). A plan
+        holding a release is exactly ``plan.is_irreversible``, so granting the
+        exemption here for such a plan would approve a run that the release then
+        refuses - the half-executed run this pre-flight exists to prevent,
+        reappearing inside the pre-flight.
+
+        The last branch is the legacy draw, and it stays because a plan on disk
+        may have no pot. Its reasoning is unchanged: money that cannot be spent
+        yet is, from a run's point of view, money that is not there - reported as
+        ``INSUFFICIENT_BALANCE`` rather than ``FUND_NOT_MATURED``, because with
+        no pot named there is no pot to point at.
         """
-        if plan.source is PlanSource.LOCKED:
-            return wallet.matured_locked_balance(as_of)
-        return wallet.available_balance
+        if plan.source is not PlanSource.LOCKED:
+            if wallet.available_balance < plan.total_to_move:
+                return RunBlockReason.INSUFFICIENT_BALANCE
+            return None
+
+        if plan.fund_id is None:
+            if wallet.matured_locked_balance(as_of) < plan.total_to_move:
+                return RunBlockReason.INSUFFICIENT_BALANCE
+            return None
+
+        fund = wallet.fund_by_id(plan.fund_id)
+        if not fund.is_matured(as_of) and not (
+            not plan.is_irreversible
+            and fund.authorises_early_payout(plan.created_at)
+        ):
+            return RunBlockReason.FUND_NOT_MATURED
+        if fund.balance < plan.total_to_move:
+            return RunBlockReason.INSUFFICIENT_BALANCE
+        return None
 
     # --- the outcomes -------------------------------------------------------
 
@@ -238,7 +267,7 @@ class ExecutePlanRun:
         answering the same question or the pre-flight is worth nothing.
         """
         for index, instruction in enumerate(plan.instructions):
-            operation_cls, extra = self._operation_for(plan.source, instruction, as_of)
+            operation_cls, extra = self._operation_for(plan, instruction, as_of)
             operation_cls(wallet, uow.transactions, **extra).execute(
                 amount=instruction.amount,
                 internal_reference=self._reference(plan.plan_id, due_at, index),
@@ -246,7 +275,7 @@ class ExecutePlanRun:
             )
 
     @staticmethod
-    def _operation_for(source: PlanSource, instruction: Instruction, as_of: datetime):
+    def _operation_for(plan: SavingsPlan, instruction: Instruction, as_of: datetime):
         """Pick the operation an instruction implies, and how to build it.
 
         The planning-to-money seam, and it returns **a class and its keyword
@@ -258,14 +287,35 @@ class ExecutePlanRun:
         in the seam that exists to hold it, instead of a conditional scattered
         where the operation happens to be built.
 
+        It takes the whole ``plan`` rather than only its ``source``, and the
+        reason is the new middle argument: a locked payout needs to know *which*
+        pot it draws on and *when the commitment to pay was made*, and both of
+        those are facts about the plan. Passing them as loose parameters would
+        have made the signature a list of things the plan owns.
+
+        ``committed_at`` is ``plan.created_at``, and that is the whole
+        anti-temptation rule in one expression. The pot decides whether a
+        commitment old enough to authorise an early payment exists, and the only
+        commitment a plan has is the moment it was created. Passing ``None``
+        here - as an ad-hoc payout does - would mean "no commitment", not "any
+        commitment", which is why this cannot be defaulted.
+
         A RELEASE is a locked -> available move whatever the plan's source, and
         the aggregate has already refused to build an AVAILABLE-source plan
         containing one - so the source only has to disambiguate the payout case.
+        It is *not* given ``plan.created_at`` even when the plan names a pot: the
+        exemption is for scheduled payments to external accounts, and a release
+        is not one. Passing it would have no effect today, since ``Fund.release``
+        takes no such argument - which is exactly why it would be a trap.
         """
         if instruction.action is PlannedAction.RELEASE:
-            return ReleaseFromLocked, {"as_of": as_of}
-        if source is PlanSource.LOCKED:
-            return PayoutFromLocked, {"as_of": as_of}
+            return ReleaseFromLocked, {"as_of": as_of, "fund_id": plan.fund_id}
+        if plan.source is PlanSource.LOCKED:
+            return PayoutFromLocked, {
+                "as_of": as_of,
+                "fund_id": plan.fund_id,
+                "committed_at": plan.created_at,
+            }
         return PayoutFromAvailable, {}
 
     @staticmethod
@@ -294,6 +344,7 @@ class ExecutePlanRun:
         self,
         uow: UnitOfWork,
         plan: SavingsPlan,
+        wallet: Wallet,
         due_at: datetime,
         reason: RunBlockReason,
     ) -> PlanRun:
@@ -325,7 +376,12 @@ class ExecutePlanRun:
         # Note it is queued on the blocked path for the same reason as on the
         # successful one - a plan that cannot be funded is not a non-event, it is
         # a payment the user is expecting that is not going to arrive.
-        self._announce(uow, compose.payout_blocked(plan, run, self._recipient))
+        self._announce(
+            uow,
+            compose.payout_blocked(
+                plan, run, self._recipient, self._pot_name(plan, wallet)
+            ),
+        )
         uow.commit()
         return run
 
@@ -354,9 +410,33 @@ class ExecutePlanRun:
         plan.record_run()
         uow.plans.save(plan)
         uow.wallets.save(wallet)
-        self._announce(uow, compose.payout_succeeded(plan, run, self._recipient))
+        self._announce(
+            uow,
+            compose.payout_succeeded(
+                plan, run, self._recipient, self._pot_name(plan, wallet)
+            ),
+        )
         uow.commit()
         return run
+
+    @staticmethod
+    def _pot_name(plan: SavingsPlan, wallet: Wallet) -> str | None:
+        """The name of the pot a run drew on, or ``None`` if it named none.
+
+        The translation from what the plan holds to what a human reads, and it
+        lives here rather than on the aggregate deliberately: a plan holds a
+        ``fund_id`` and nothing more, because an aggregate references another by
+        identity and not by a copy of its name - a name copied onto a plan would
+        be a second record of a fact the pot already owns, and the two would
+        drift the first time a pot was renamed.
+
+        Only a receipt needs the name, and a receipt is written by the use case
+        that has both aggregates in hand, so this is exactly where the
+        translation belongs. See ``SavingsPlan.fund_id``.
+        """
+        if plan.fund_id is None:
+            return None
+        return wallet.fund_by_id(plan.fund_id).name
 
     @staticmethod
     def _announce(uow: UnitOfWork, notification: Notification | None) -> None:

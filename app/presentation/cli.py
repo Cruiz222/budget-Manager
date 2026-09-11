@@ -11,12 +11,19 @@ Run from the repo root:
 
     .venv/bin/python -m app.presentation.cli --db budget.db plan create \\
         --wallet <wallet_id> --name "Salary 2026" \\
-        --source locked --every monthly --for 12 months \\
+        --source locked --from-fund Payroll \\
+        --every monthly --for 12 months \\
         --pay 20000 0123456789 058 "Chinedu Okafor" salary
     .venv/bin/python -m app.presentation.cli --db budget.db plan tick
 
-Reserving money means naming a pot, because "the locked balance" cannot say
-where an amount was meant to go:
+A plan that spends the locked balance names the pot it draws from, because "the
+locked balance" is a sum over several pots and cannot say where an amount was
+meant to go:
+
+    --source locked     --from-fund NAME is required
+    --source available  --from-fund is refused; there is no pot to draw on
+
+Reserving money means naming a pot too:
 
     # a pot that opens for release on a date, and takes deposits until then
     .venv/bin/python -m app.presentation.cli --db budget.db fund open \\
@@ -28,6 +35,20 @@ where an amount was meant to go:
     .venv/bin/python -m app.presentation.cli --db budget.db fund release \\
         <wallet_id> Vacation 5000       # refused until 2026-06-01
     .venv/bin/python -m app.presentation.cli --db budget.db fund list <wallet_id>
+
+A business pot is the one kind that may pay a *scheduled* payout before its date,
+and only when the commitment predates the money. The order is the whole rule, and
+it is why a pot is opened empty, committed to, and funded last:
+
+    fund open --kind business --matures 2026-12-01 --name Payroll
+    plan create --source locked --from-fund Payroll ...      # the commitment
+    fund deposit <wallet_id> Payroll 500000                  # then the money
+
+Fund the pot first and the plan will block when it runs - the money has no
+commitment that predates it, so it waits for the date like any other. Pushing the
+date later with ``fund extend`` re-seals the pot, and a committed plan blocks
+until the new date. An ad-hoc ``payout --fund Payroll`` is never scheduled, so it
+is refused before maturity however the pot was funded.
 
 ``deposit`` and ``lock`` are the same two verbs the root used to carry, and the
 distinction between them is unchanged - a deposit brings money in, a lock moves
@@ -130,19 +151,22 @@ OPERATIONS = {
 
 #: The ``fund`` verbs that actually move money, and how to run each.
 #:
-#: Maps the sub-command to the service method, the verb to report it with, and
-#: whether the call needs the moment it runs at. That last flag is not
-#: decoration: ``release_from_fund`` needs one because a pot may refuse a release
-#: before it has come due, while depositing into a pot and moving available money
-#: into one are allowed at any time and so have no moment to consult.
+#: Maps the sub-command to the service method and the verb to report it with.
+#: Every one of them is now handed the moment it runs at, where a ``needs_moment``
+#: flag used to sit on ``release`` alone. That flag went because the reason it
+#: existed stopped being particular to one verb: ``release`` consults the moment
+#: to decide whether the pot has come due, and ``deposit`` and ``lock`` now stamp
+#: it onto the pot as its ``first_funded_at`` - the moment a commitment has to
+#: predate for a business pot to be allowed to pay early. Three verbs, one
+#: argument, so a flag deciding who gets it would only be a way to get it wrong.
 #:
 #: ``open``, ``extend`` and ``list`` are deliberately absent - they move no
 #: money, so they have no amount, no idempotency reference and nothing to report
 #: in a balance line. They are handled on their own below.
 _FUND_MONEY = {
-    "deposit": ("deposit_into_fund", "deposited into", False),
-    "lock": ("lock_into_fund", "locked into", False),
-    "release": ("release_from_fund", "released from", True),
+    "deposit": ("deposit_into_fund", "deposited into"),
+    "lock": ("lock_into_fund", "locked into"),
+    "release": ("release_from_fund", "released from"),
 }
 
 
@@ -267,6 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     payout_parser.add_argument("wallet_id", type=_uuid)
     payout_parser.add_argument("amount", type=_decimal)
+    payout_parser.add_argument(
+        "--fund",
+        help="the pot to draw on, by name - omit to spend the matured pots "
+        "oldest first, which is how a plan saved before pots could be named "
+        "is paid",
+    )
     payout_parser.add_argument(
         "--account", required=True, help="destination account number"
     )
@@ -402,6 +432,12 @@ def _add_plan_commands(subparsers) -> None:
         help="which balance the plan spends from",
     )
     create_parser.add_argument(
+        "--from-fund",
+        metavar="NAME",
+        help="the pot the plan draws on, by name - required when --source is "
+        "locked, refused when it is available",
+    )
+    create_parser.add_argument(
         "--every",
         required=True,
         choices=[cadence.value for cadence in Cadence],
@@ -470,6 +506,19 @@ def _add_plan_commands(subparsers) -> None:
         "edit", help="replace a plan's instruction lines"
     )
     edit_parser.add_argument("plan_id", type=_uuid)
+    # Note what is deliberately *absent*: there is no ``--from-fund`` here, so
+    # the pot is fixed for a plan's whole life. Changing it would point an
+    # existing commitment at a different pot - the redirect the whole
+    # anti-temptation rule exists to stop - and it would arrive through the one
+    # door that rule cannot see, because the *new* pot would be judged against
+    # the plan's *old* creation moment. A pot funded last week and named today
+    # would look like a pot funded after a commitment made last month.
+    #
+    # The refusal is the absence of a flag rather than an error message, which
+    # is a real choice: there is no arrangement of arguments to write, so there
+    # is nothing to explain at the moment of failure. Getting it wrong is
+    # recoverable anyway - ``plan cancel`` frees nothing, so the money stays
+    # sealed to its own date and a new plan can be made against it.
     edit_parser.add_argument(
         "--pay",
         nargs=5,
@@ -614,6 +663,15 @@ def _payout(service: WalletService, args, factory, settings, deferred_reason) ->
         # pots that have come due, so the use case needs to know when "now" is -
         # and being told makes it answerable about a moment other than this one.
         datetime.now(),
+        # The pot, if one was named. Omitted, this is the pooled draw - and the
+        # omission is honest rather than lazy: a human who does not know which
+        # pot they mean has not committed anything, and the wallet spends the
+        # matured pots oldest first, exactly as it always has.
+        #
+        # Note what is *not* passed alongside it: nothing here says when a
+        # commitment to pay was made. This is a hand-typed payment, so it has
+        # none, and a sealed business pot will refuse it on that ground alone.
+        args.fund,
     )
 
     current = service.get_wallet(args.wallet_id)
@@ -646,18 +704,14 @@ def _fund_command(args, service, factory, settings, deferred_reason) -> int:
 def _fund_money(service, args, factory, settings, deferred_reason) -> int:
     """Run ``fund deposit``, ``fund lock`` or ``fund release``.
 
-    Three verbs, one shape, so they share a handler. The one difference that is
-    not cosmetic is the moment: ``release_from_fund`` has to know when it is
-    running, because a pot may refuse a release before it has come due, while
-    depositing into a pot and moving available money into one are allowed at any
-    time and so have no moment to consult.
-
-    The moment is read *here*, at the edge, and passed down. Reading it inside
-    the service would mean the same use case could not be asked what it would do
-    at a given time - which is exactly what a test of a maturity date needs to do
-    without freezing a clock.
+    Three verbs, one shape, so they share a handler - and since this phase, one
+    argument list too: all three take the moment they run at. The moment is read
+    *here*, at the edge, and passed down. Reading it inside the service would
+    mean the same use case could not be asked what it would do at a given time -
+    which is exactly what a test of a maturity date needs to do without freezing
+    a clock, and now also what a test of a funding moment needs.
     """
-    method_name, verb, needs_moment = _FUND_MONEY[args.fund_command]
+    method_name, verb = _FUND_MONEY[args.fund_command]
 
     # The wallet is loaded for the same reason the top-level commands load it:
     # the amount on this command line carries no currency of its own, and only
@@ -667,16 +721,13 @@ def _fund_money(service, args, factory, settings, deferred_reason) -> int:
     internal_reference = args.ref if args.ref is not None else str(uuid.uuid4())
 
     method = getattr(service, method_name)
-    if needs_moment:
-        method(
-            args.wallet_id,
-            args.fund_name,
-            amount,
-            internal_reference,
-            datetime.now(),
-        )
-    else:
-        method(args.wallet_id, args.fund_name, amount, internal_reference)
+    method(
+        args.wallet_id,
+        args.fund_name,
+        amount,
+        internal_reference,
+        datetime.now(),
+    )
 
     _report_fund(service, args.wallet_id, args.fund_name, f"{verb} {amount}")
     # Only one of these three queues anything - a deposit from outside is the
@@ -904,7 +955,7 @@ def _plan_command(
     if args.plan_command == "list":
         return _plan_list(args, plan_service)
     if args.plan_command == "show":
-        return _plan_show(args, plan_service)
+        return _plan_show(args, plan_service, wallet_service)
     if args.plan_command == "edit":
         return _plan_edit(args, plan_service)
     return _plan_steer(args, plan_service)
@@ -918,6 +969,13 @@ def _plan_create(
     # before anything is built. Its *balance* is deliberately not consulted. A
     # plan may exist before it is affordable - that is what saving towards one
     # means - and the shortfall is reported when a run actually fires.
+    #
+    # The pot is *not* resolved here even though this method holds the wallet
+    # that could do it. It travels as the name the user typed, and
+    # ``create_plan`` turns it into an id - because the same method also holds
+    # the rule that a locked plan must name a pot and an available one must not,
+    # and resolving here would mean checking that rule before the lookup, or
+    # reporting "no such pot" for a pot the plan was never going to use.
     wallet = wallet_service.get_wallet(args.wallet)
     plan = service.create_plan(
         wallet_id=args.wallet,
@@ -926,6 +984,7 @@ def _plan_create(
         schedule=Schedule(cadence=Cadence(args.every), anchor=args.start),
         instructions=_lines(args, wallet.currency),
         ends_on=_end_date(args),
+        fund_name=args.from_fund,
     )
     print(f"created {plan}")
     return 0
@@ -950,12 +1009,24 @@ def _plan_list(args, service: PlanService) -> int:
     return 0
 
 
-def _plan_show(args, service: PlanService) -> int:
+def _plan_show(args, service: PlanService, wallet_service: WalletService) -> int:
     plan = service.get_plan(args.plan_id)
     print(f"name: {plan.name}")
     print(f"id: {plan.plan_id}")
     print(f"status: {plan.status.value}")
     print(f"source: {plan.source.value}")
+    # The pot, resolved to a *name* - and this is the one place a plan's pot can
+    # be read as one. The aggregate holds a ``fund_id`` on purpose (see
+    # ``SavingsPlan.fund_id``), and a UUID is not an answer to "which pot is my
+    # rent paid from?". The name lives on the wallet, so this command loads it.
+    #
+    # "(pooled)" is printed rather than a blank for a plan with no pot, because
+    # the two are different answers and only one of them is a fact about the
+    # plan. A plan saved before pots could be named really does spend the
+    # matured pots oldest first, and saying so is the honest description - a
+    # missing line would read as a rendering bug, and "(none)" would suggest the
+    # plan has no source of money at all.
+    print(f"pot: {_plan_pot(plan, wallet_service)}")
     print(f"schedule: {plan.schedule}")
     print(f"next due: {_moment(plan.next_due_at)}")
     # A bare date, deliberately, while the two lines above and below show
@@ -981,6 +1052,23 @@ def _plan_show(args, service: PlanService) -> int:
     for run in runs:
         print(f"  {_moment(run.due_at)}  {_run_outcome(run)}")
     return 0
+
+
+def _plan_pot(plan: SavingsPlan, wallet_service: WalletService) -> str:
+    """The pot a plan draws on, as a name. ``"(pooled)"`` when it names none.
+
+    A free function rather than an inline lookup in ``_plan_show`` so that the
+    two-line translation - id to name, or no id to "(pooled)" - has one home.
+
+    The wallet is only loaded when there is a pot to look up. A legacy plan
+    naming none is the case where an extra read would buy nothing, and loading a
+    wallet to print a constant is the kind of cost that is easy to accept and
+    never worth accepting.
+    """
+    if plan.fund_id is None:
+        return "(pooled)"
+    wallet = wallet_service.get_wallet(plan.wallet_id)
+    return wallet.fund_by_id(plan.fund_id).name
 
 
 def _plan_edit(args, service: PlanService) -> int:

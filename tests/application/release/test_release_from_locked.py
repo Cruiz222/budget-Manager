@@ -91,8 +91,8 @@ def test_a_pooled_release_draws_across_several_pots_when_it_has_to(build_wallet)
     wallet = build_wallet(available="0")
     older = wallet.open_fund("Rent", FundKind.PERSONAL)
     newer = wallet.open_fund("Car", FundKind.PERSONAL)
-    wallet.deposit_into_fund(older.fund_id, ngn("3000"))
-    wallet.deposit_into_fund(newer.fund_id, ngn("3000"))
+    wallet.deposit_into_fund(older.fund_id, ngn("3000"), MOMENT)
+    wallet.deposit_into_fund(newer.fund_id, ngn("3000"), MOMENT)
 
     ReleaseFromLocked(wallet, InMemoryTransactionRepository(), MOMENT).execute(
         ngn("4000"), internal_reference=str(uuid4())
@@ -128,7 +128,7 @@ def test_a_pooled_release_leaves_no_pot_sealed_early(build_wallet):
     sealed = wallet.open_fund(
         "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
     )
-    wallet.deposit_into_fund(sealed.fund_id, ngn("5000"))
+    wallet.deposit_into_fund(sealed.fund_id, ngn("5000"), MOMENT)
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InsufficientFundsError):

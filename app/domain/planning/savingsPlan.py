@@ -5,9 +5,12 @@ from datetime import date, datetime
 from app.domain.money.money import Money
 
 from .exception import (
+    CommittedPayoutRemovalError,
     EmptyPlanInstructionsError,
+    FundRequiresLockedSourceError,
     InvalidCompletedRunsError,
     InvalidPlanEndDateError,
+    InvalidPlanFundIDError,
     InvalidPlanIDError,
     InvalidPlanInstructionsError,
     InvalidPlanNameError,
@@ -60,6 +63,19 @@ class SavingsPlan:
     and it must name the date the promise comes due. A plan that only **pays
     out** is an instruction, not a vow - editable and stoppable, whether it
     spends the locked balance or the available one.
+
+    **A plan that spends the locked balance names the pot it draws on.** It has
+    to: once the locked balance is a set of named pots, "spend the locked
+    balance" no longer says which money leaves, and a plan that cannot say is a
+    plan whose payout rule has to be invented. The reference is by identity
+    (``fund_id``), not by name, for the same reason ``wallet_id`` is - a name is
+    what a human types, and renaming a pot must not orphan a plan.
+
+    Naming a pot is also what makes the business-pot exemption available at all.
+    Whether money may leave a business pot before its maturity date is a question
+    only the pot can answer (``Fund.authorises_early_payout``), and it needs the
+    plan's ``created_at`` to answer it - which is a fact this aggregate holds and
+    the pot cannot see.
     """
 
     wallet_id: uuid.UUID
@@ -67,6 +83,18 @@ class SavingsPlan:
     source: PlanSource
     schedule: Schedule
     _instructions: tuple[Instruction, ...]
+    #: The pot this plan draws on, or ``None``. Required for a LOCKED-source
+    #: plan and refused for an AVAILABLE-source one - but note *where* each half
+    #: of that rule is enforced, because the split is deliberate.
+    #:
+    #: "A pot may only be named by a locked plan" is checked here, in
+    #: ``_validate_instructions``: it is a fact about this aggregate alone.
+    #: "A locked plan must name one" is **not** checked here, and cannot be,
+    #: because ``None`` is also what a plan saved before pots could be named
+    #: looks like when it is loaded from the store. Enforcing it here would make
+    #: every such plan unhydratable. It lives in ``PlanService.create_plan``,
+    #: which is the door a *new* plan comes through.
+    fund_id: uuid.UUID | None = None
     plan_id: uuid.UUID = field(default_factory=uuid.uuid4)
     status: PlanStatus = PlanStatus.ACTIVE
     completed_runs: int = 0
@@ -200,6 +228,19 @@ class SavingsPlan:
 
         Refused for a plan that releases locked funds, and refused once the plan
         has finished - a cancelled or completed plan is history.
+
+        **A pot-named plan may not lose its last payout.** That is the one thing
+        editing may not do to a commitment, and it is a subtle thing to state:
+        the payout *line* is the commitment, so deleting it is not editing the
+        commitment, it is revoking it - the same act ``cancel`` performs, arriving
+        through the door that is supposed to be the safe one. Its destination and
+        its amount stay editable, because those change *who* and *how much*
+        without changing *whether*.
+
+        The check lives here rather than in ``_validate_instructions`` for a
+        plain reason: it needs both lists. "Does the new list still contain a
+        payout?" is only a question when you know the old one did, and
+        ``_validate_instructions`` sees a candidate list and nothing else.
         """
         if self.status is not PlanStatus.ACTIVE:
             raise PlanNotActiveError(
@@ -209,6 +250,13 @@ class SavingsPlan:
             raise IrreversibleReleasePlanError(
                 "a plan that releases locked funds cannot be edited; "
                 "its set date is the condition"
+            )
+        if self.fund_id is not None and self._contains_a_payout(
+            self._instructions
+        ) and not self._contains_a_payout(instructions):
+            raise CommittedPayoutRemovalError(
+                "a plan that draws on a pot cannot have its payout removed; "
+                "its destination and amount may change, but the commitment stands"
             )
         self._validate_instructions(instructions)
         self._instructions = instructions
@@ -232,6 +280,11 @@ class SavingsPlan:
         if not isinstance(self.source, PlanSource):
             raise InvalidPlanSourceError(
                 f"source must be a PlanSource, got {type(self.source).__name__}"
+            )
+
+        if self.fund_id is not None and not isinstance(self.fund_id, uuid.UUID):
+            raise InvalidPlanFundIDError(
+                f"fund_id must be a UUID or None, got {type(self.fund_id).__name__}"
             )
 
         if not isinstance(self.schedule, Schedule):
@@ -344,6 +397,33 @@ class SavingsPlan:
             raise ReleasePlanRequiresEndDateError(
                 "a plan that releases locked funds must set the date it ends"
             )
+
+        # A pot is a part of the *locked* balance, so a plan that spends the
+        # available balance naming one is referring to money it will never touch
+        # - a rule broken by the pairing, which is why it is checked here.
+        #
+        # The converse - a locked plan that names no pot - is deliberately not
+        # here. It cannot be: a plan saved before pots could be named loads with
+        # ``fund_id = None``, so this check would refuse to hydrate the user's own
+        # history. ``PlanService.create_plan`` holds that half, because it is the
+        # only door a *new* plan comes through. See the field's comment.
+        if self.fund_id is not None and self.source is not PlanSource.LOCKED:
+            raise FundRequiresLockedSourceError(
+                "a plan can only draw on a pot if it spends the locked balance"
+            )
+
+    @staticmethod
+    def _contains_a_payout(instructions) -> bool:
+        """Whether a list of instructions contains a payout.
+
+        The sibling of ``_holds_a_release``, and static for the same reason: it
+        is asked about the plan's own lines and about a candidate edit's, and
+        neither question needs an instance.
+        """
+        return any(
+            instruction.action is PlannedAction.PAYOUT
+            for instruction in instructions
+        )
 
     @staticmethod
     def _holds_a_release(instructions) -> bool:

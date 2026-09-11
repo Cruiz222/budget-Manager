@@ -12,7 +12,7 @@ distinction. A deposit brings money *into* the wallet; a lock moves money that
 is already in it. Both can end in a pot.
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -38,6 +38,16 @@ from app.infrastructure.repositories.in_memory_transaction_repository import (
 NGN = Currency.NGN
 USD = Currency.USD
 
+#: The moment every deposit in this file arrives at.
+#:
+#: Fixed rather than "now" for the reason the whole suite passes moments in: a
+#: deposit now *stamps* ``first_funded_at``, and a test that read the clock would
+#: have an expectation it could only write by knowing when the suite ran. Nothing
+#: here reads the value back - the deposits are refused for amount, currency,
+#: status and name reasons, none of which a date can change - but the moment is
+#: still recorded on the pot, so it has to be a moment someone chose.
+MOMENT = datetime(2026, 1, 1)
+
 
 def a_wallet_with_a_pot(
     build_wallet, name="Vacation", maturity_date=None, status=WalletStatus.ACTIVE, **kwargs
@@ -61,7 +71,7 @@ def test_a_deposit_lands_in_the_pot_and_leaves_available_alone(build_wallet):
     wallet = a_wallet_with_a_pot(build_wallet)
     repository = InMemoryTransactionRepository()
 
-    transaction = DepositIntoFund(wallet, repository, "Vacation").execute(
+    transaction = DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN),
         internal_reference=str(uuid4()),
     )
@@ -87,7 +97,7 @@ def test_a_deposit_is_recorded_as_one_movement_not_two(build_wallet):
     wallet = a_wallet_with_a_pot(build_wallet)
     repository = InMemoryTransactionRepository()
 
-    DepositIntoFund(wallet, repository, "Vacation").execute(
+    DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN), internal_reference=str(uuid4())
     )
 
@@ -108,7 +118,7 @@ def test_a_sealed_pot_keeps_accepting_deposits(build_wallet):
     repository = InMemoryTransactionRepository()
 
     for amount in ("50000", "2000", "1500"):
-        DepositIntoFund(wallet, repository, "Vacation").execute(
+        DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal(amount), NGN), internal_reference=str(uuid4())
         )
 
@@ -128,7 +138,7 @@ def test_a_deposit_into_a_matured_pot_is_allowed_too(build_wallet):
         build_wallet, maturity_date=date(2020, 1, 1), available="0"
     )
 
-    DepositIntoFund(wallet, InMemoryTransactionRepository(), "Vacation").execute(
+    DepositIntoFund(wallet, InMemoryTransactionRepository(), "Vacation", MOMENT).execute(
         Money(Decimal("500"), NGN), internal_reference=str(uuid4())
     )
 
@@ -143,7 +153,7 @@ def test_a_frozen_wallet_still_accepts_a_deposit(build_wallet):
     """
     wallet = a_wallet_with_a_pot(build_wallet, status=WalletStatus.FROZEN)
 
-    DepositIntoFund(wallet, InMemoryTransactionRepository(), "Vacation").execute(
+    DepositIntoFund(wallet, InMemoryTransactionRepository(), "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN), internal_reference=str(uuid4())
     )
 
@@ -155,7 +165,7 @@ def test_depositing_into_a_closed_wallet_fails(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(WalletClosedError):
-        DepositIntoFund(wallet, repository, "Vacation").execute(
+        DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("3000"), NGN), internal_reference=str(uuid4())
         )
 
@@ -168,7 +178,7 @@ def test_depositing_the_wrong_currency_fails(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(CurrencyMismatchError):
-        DepositIntoFund(wallet, repository, "Vacation").execute(
+        DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("3000"), USD), internal_reference=str(uuid4())
         )
 
@@ -186,7 +196,7 @@ def test_a_non_positive_deposit_fails_and_persists_nothing(build_wallet, amount)
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        DepositIntoFund(wallet, repository, "Vacation").execute(
+        DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal(amount), NGN), internal_reference=str(uuid4())
         )
 
@@ -199,7 +209,7 @@ def test_a_non_money_amount_fails_and_persists_nothing(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        DepositIntoFund(wallet, repository, "Vacation").execute(
+        DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             3000, internal_reference=str(uuid4())
         )
 
@@ -212,7 +222,7 @@ def test_a_rejected_deposit_is_persisted_as_pending_then_failed(
     wallet = a_wallet_with_a_pot(build_wallet, status=WalletStatus.CLOSED)
 
     with pytest.raises(WalletClosedError):
-        DepositIntoFund(wallet, recording_transactions, "Vacation").execute(
+        DepositIntoFund(wallet, recording_transactions, "Vacation", MOMENT).execute(
             Money(Decimal("3000"), NGN), internal_reference=str(uuid4())
         )
 
@@ -233,7 +243,7 @@ def test_replaying_the_same_internal_reference_deposits_only_once(build_wallet):
     """
     wallet = a_wallet_with_a_pot(build_wallet)
     repository = InMemoryTransactionRepository()
-    service = DepositIntoFund(wallet, repository, "Vacation")
+    service = DepositIntoFund(wallet, repository, "Vacation", MOMENT)
     reference = str(uuid4())
 
     first = service.execute(Money(Decimal("3000"), NGN), reference)
@@ -248,7 +258,7 @@ def test_caller_supplied_internal_reference_is_persisted(build_wallet):
     repository = InMemoryTransactionRepository()
     reference = "salary-topup-4f10"
 
-    transaction = DepositIntoFund(wallet, repository, "Vacation").execute(
+    transaction = DepositIntoFund(wallet, repository, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN), internal_reference=reference
     )
 
@@ -270,7 +280,7 @@ def test_depositing_into_an_unknown_pot_is_refused_before_anything_is_recorded(
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(FundNotFoundError):
-        DepositIntoFund(wallet, repository, "Holiday")
+        DepositIntoFund(wallet, repository, "Holiday", MOMENT)
 
     assert not repository.transactions
 
@@ -280,7 +290,7 @@ def test_a_deposit_lands_in_the_named_pot_and_not_in_another(build_wallet):
     wallet.open_fund("Vacation", FundKind.PERSONAL)
     wallet.open_fund("Salary", FundKind.PERSONAL)
 
-    DepositIntoFund(wallet, InMemoryTransactionRepository(), "Salary").execute(
+    DepositIntoFund(wallet, InMemoryTransactionRepository(), "Salary", MOMENT).execute(
         Money(Decimal("4000"), NGN), internal_reference=str(uuid4())
     )
 

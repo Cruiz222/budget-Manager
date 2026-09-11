@@ -51,6 +51,7 @@ def payout_succeeded(
     plan: SavingsPlan,
     run: PlanRun,
     recipient: str | None,
+    fund_name: str | None = None,
 ) -> Notification | None:
     """The receipt for a run that paid out.
 
@@ -68,6 +69,13 @@ def payout_succeeded(
     Note what this does *not* say: that the run "succeeded" in the abstract. It
     says what moved and where. A run can hold a release, which sends money
     nowhere outside the wallet, and the instruction line says so.
+
+    ``fund_name`` is the pot the run drew on, or ``None`` for a plan that names
+    none - a plan saved before pots could be named. It is passed rather than
+    looked up because this module is pure by design (see the docstring above):
+    the pot's name is a fact about *now*, and a receipt must describe the moment
+    it was written. It is also the one thing the receipt can say that the plan
+    cannot - the plan holds a ``fund_id``, and an id in a human's inbox is noise.
     """
     return _composed(
         event_key=for_plan_event(NotificationKind.PAYOUT_SUCCEEDED, plan.plan_id, run.due_at),
@@ -80,7 +88,8 @@ def payout_succeeded(
             f"The plan {plan.name!r} ran at "
             f"{run.due_at.isoformat(timespec='minutes')}:\n\n"
             f"{_lines(plan)}\n"
-            f"Total moved: {plan.total_to_move}.\n\n"
+            f"Total moved: {plan.total_to_move}.\n"
+            f"{_from_pot(fund_name)}\n"
             f"{_RECEIPT}"
         ),
     )
@@ -90,6 +99,7 @@ def payout_blocked(
     plan: SavingsPlan,
     run: PlanRun,
     recipient: str | None,
+    fund_name: str | None = None,
 ) -> Notification | None:
     """The receipt for a run that could not proceed.
 
@@ -108,6 +118,13 @@ def payout_blocked(
     ``run.reason`` is read without a fallback, because ``PlanRun`` refuses to
     exist as BLOCKED without one. A default here would paper over a broken
     aggregate with a receipt that explains nothing.
+
+    **``fund_name`` matters most on this message of the two.** A blocked run
+    names its reason, and ``fund_not_matured`` on its own is the least actionable
+    reason in the set: it says a date has not arrived, without saying which
+    date, whose, or what to do. Naming the pot turns it into one instruction -
+    wait for that pot's date - and it is the case where the reader is most likely
+    to be surprised, because the plan was set up to pay and has now stopped.
     """
     phrase = run.reason.value.replace("_", " ")
     return _composed(
@@ -126,11 +143,32 @@ def payout_blocked(
             "than skipping it.\n\n"
             f"It was due to move:\n\n"
             f"{_lines(plan)}\n"
-            f"Total: {plan.total_to_move}.\n\n"
+            f"Total: {plan.total_to_move}.\n"
+            f"{_from_pot(fund_name)}\n"
             "This is a receipt, not a request: no money moved, and there is "
             "nothing to confirm.\n"
         ),
     )
+
+
+def _from_pot(fund_name: str | None) -> str:
+    """One sentence naming the pot a run drew on, or an empty line if none.
+
+    The ``None`` case is a plan that names no pot - a plan saved before pots
+    could be named - and it says *nothing* rather than "(pooled)". A receipt is
+    not the place to explain a legacy shape to someone who never chose it: the
+    reader in that case has one pot, the migration's open ``"Locked"`` one, and
+    the sentence would raise a question the answer to which is "you can ignore
+    this". ``plan show`` prints "(pooled)" because that command exists to tell
+    you what a plan *is*; this one exists to tell you what happened.
+
+    Returns a string of one line either way, so the caller can concatenate it
+    without a branch - an empty string here is a blank line in the body, which is
+    exactly the spacing a missing sentence should leave.
+    """
+    if fund_name is None:
+        return ""
+    return f"Drawn from the pot {fund_name!r}.\n"
 
 
 def wallet_movement(

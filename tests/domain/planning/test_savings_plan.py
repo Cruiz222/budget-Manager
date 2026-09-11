@@ -10,9 +10,12 @@ from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.money import Money
 from app.domain.planning.cadence import Cadence
 from app.domain.planning.exception import (
+    CommittedPayoutRemovalError,
     EmptyPlanInstructionsError,
+    FundRequiresLockedSourceError,
     InvalidCompletedRunsError,
     InvalidPlanEndDateError,
+    InvalidPlanFundIDError,
     InvalidPlanIDError,
     InvalidPlanInstructionsError,
     InvalidPlanNameError,
@@ -288,6 +291,60 @@ class TestSourceAgainstAction:
         assert len(plan.instructions) == 2
 
 
+class TestTheNamedPot:
+    """Which pot a plan draws on, and the half of the rule the aggregate owns.
+
+    The pairing is checked in two places and both are needed. The *aggregate*
+    refuses a pot on anything but a locked-source plan, and it must: that rule
+    has to hold through hydration, through a direct construction, and through
+    ``edit_instructions``, none of which pass through a service. The *use case*
+    refuses a locked plan with no pot, and it must too - a plan saved before pots
+    existed has no pot, and enforcing "every locked plan names one" here would
+    make every row already on disk unreadable. So this class pins one half and
+    ``test_plan_service`` pins the other, deliberately.
+    """
+
+    def test_a_locked_plan_may_name_a_pot(self, build_plan):
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("1000"),),
+            fund_id=uuid4(),
+        )
+
+        assert plan.fund_id is not None
+
+    def test_a_locked_plan_may_name_no_pot(self, build_plan):
+        """Not a loophole - a legacy row, which is the only thing that looks like this.
+
+        Deliberately *not* refused here. Plans created before this phase exist on
+        disk with no pot, and they still have to hydrate and still have to run;
+        refusing them at construction would break every one of them at the moment
+        of the upgrade. The refusal that matters to a user - "you must name the
+        pot you're spending from" - happens where a human is typing, not here.
+        """
+        plan = build_plan(source=PlanSource.LOCKED, fund_id=None)
+
+        assert plan.fund_id is None
+
+    def test_an_available_plan_may_not_name_a_pot(self, build_plan):
+        """An available-balance plan spends no pot, so naming one is a mistake.
+
+        Refused rather than ignored: silently dropping the argument would leave
+        the user believing their plan was tied to a pot it has no relationship
+        with, and they would find out at the first run.
+        """
+        with pytest.raises(FundRequiresLockedSourceError):
+            build_plan(
+                source=PlanSource.AVAILABLE,
+                instructions=(payout("1000"),),
+                fund_id=uuid4(),
+            )
+
+    def test_a_fund_id_must_be_a_uuid(self, build_plan):
+        with pytest.raises(InvalidPlanFundIDError):
+            build_plan(source=PlanSource.LOCKED, fund_id="Supplier")
+
+
 class TestIrreversibility:
     """Locking is the commitment device, so releasing is the one act you cannot take back."""
 
@@ -487,6 +544,88 @@ class TestEditing:
         assert plan.is_irreversible
         with pytest.raises(IrreversibleReleasePlanError):
             plan.cancel()
+
+    def test_a_committed_plan_may_not_drop_its_payout(self, build_plan):
+        """Only removal is refused, and this is the removal.
+
+        The payout line *is* the commitment, so deleting it does not edit the
+        commitment - it revokes it, through the door that is supposed to be the
+        safe one. ``cancel`` is the operation that ends a plan; this is that
+        operation arriving without its name.
+        """
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("2000"),),
+            fund_id=uuid4(),
+        )
+
+        with pytest.raises(CommittedPayoutRemovalError):
+            plan.edit_instructions((release("2000"),))
+
+    def test_a_committed_plan_may_change_where_and_how_much_it_pays(self, build_plan):
+        """The other half of "only removal is refused", and it is the useful half.
+
+        A supplier's account changes, or the price does. Both are edits to *who*
+        and *how much*, neither changes *whether* the money leaves, so both are
+        allowed - and they have to be, or the rule would make a plan uneditable
+        the moment it named a pot.
+        """
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("2000"),),
+            fund_id=uuid4(),
+        )
+        elsewhere = Instruction(
+            action=PlannedAction.PAYOUT,
+            amount=Money(Decimal("2500"), NGN),
+            label="salary",
+            destination=Destination(
+                kind=DestinationKind.BANK_ACCOUNT,
+                identifier="0987654321",
+                name="Ada Nwosu",
+                details={"bank_code": "058"},
+            ),
+        )
+
+        plan.edit_instructions((elsewhere,))
+
+        assert plan.instructions[0].destination.name == "Ada Nwosu"
+
+    def test_a_committed_plan_may_not_swap_its_payout_for_a_release(self, build_plan):
+        """Replacing the payout is a removal wearing a disguise.
+
+        The rule is written against "does the new list still contain a payout?"
+        rather than "is it the same object?", which is what makes this refusal
+        fall out of the same check rather than needing its own.
+        """
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("2000"),),
+            fund_id=uuid4(),
+            ends_on=date(2026, 6, 1),
+        )
+
+        with pytest.raises(CommittedPayoutRemovalError):
+            plan.edit_instructions((release("2000"),))
+
+    def test_a_plan_with_no_pot_may_still_drop_its_payout(self, build_plan):
+        """The legacy plan keeps the freedom it had, because it has no commitment.
+
+        A plan with no pot draws on the pool, so there is no pot whose money is
+        committed to a payee. Removing the payout costs nothing it cannot afford,
+        and refusing it here would be enforcing the new rule against rows written
+        under the old one.
+        """
+        plan = build_plan(
+            source=PlanSource.LOCKED,
+            instructions=(payout("2000"),),
+            fund_id=None,
+            ends_on=date(2026, 6, 1),
+        )
+
+        plan.edit_instructions((release("2000"),))
+
+        assert plan.is_irreversible
 
 
 def usd_payout(amount: str = "100") -> Instruction:

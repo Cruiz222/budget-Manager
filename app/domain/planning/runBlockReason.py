@@ -35,3 +35,22 @@ class RunBlockReason(Enum):
 
     WALLET_CLOSED = "wallet_closed"
     """The wallet is closed and can no longer be drawn on."""
+
+    FUND_NOT_MATURED = "fund_not_matured"
+    """The pot the plan draws on may not pay this run yet.
+
+    Two facts land here, and they share one member because they share one
+    remedy: the pot has not come due yet, or an extension has moved its date
+    past the commitment that used to authorise paying it early. Either way the
+    answer to "what do I do?" is *wait for the date*, so the run reports the
+    pot as unspendable and says the true thing.
+
+    That is an *addition* to the set, not a widening of an existing member, and
+    the distinction in the docstring above is why it has to be: no row already
+    written under another member now means something different.
+
+    The split that does earn its own member is against
+    ``INSUFFICIENT_BALANCE``. A run that is short of money wants a top-up; a run
+    held back by a date wants patience, and until this member existed the run
+    could not tell the user which of the two it needed.
+    """

@@ -294,7 +294,7 @@ def test_a_payout_cannot_spend_a_pot_that_has_not_come_due(build_wallet):
     sealed = wallet.open_fund(
         "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
     )
-    wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("5000"), NGN))
+    wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("5000"), NGN), MOMENT)
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InsufficientFundsError):
@@ -323,7 +323,7 @@ def test_the_moment_is_the_operations_only_not_the_wallets(build_wallet):
     sealed = wallet.open_fund(
         "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
     )
-    wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("5000"), NGN))
+    wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("5000"), NGN), MOMENT)
 
     with pytest.raises(InsufficientFundsError):
         PayoutFromLocked(

@@ -142,15 +142,18 @@ def top_up_locked(factory, wallet_id, amount):
     expected the plan to run would be testing the fallback the design forbids.
 
     The pot is looked up by name rather than taken as an argument because the
-    plan cannot name one either - see ``execute_plan_run``'s ``_operation_for``.
-    A plan draws on the pool of matured pots, so the pot the money sits in is
-    immaterial here as long as it is open.
+    plans that call this helper are the *legacy* ones: they name no pot, so their
+    money goes into the one pot ``build_wallet`` opens and the pooled draw finds
+    it. A test about a plan that names a pot funds that pot directly instead -
+    which is the whole difference the phase is about.
     """
     uow = factory.start()
     try:
         wallet = uow.wallets.get_by_id(wallet_id)
         wallet.apply_deposit(Money(Decimal(amount), NGN))
-        wallet.lock_into_fund(wallet.fund_by_name("Locked").fund_id, Money(Decimal(amount), NGN))
+        wallet.lock_into_fund(
+            wallet.fund_by_name("Locked").fund_id, Money(Decimal(amount), NGN), ANCHOR
+        )
         uow.wallets.save(wallet)
         uow.commit()
     except BaseException:
@@ -171,6 +174,26 @@ def resume(factory, plan_id):
 
 
 ANCHOR = datetime(2026, 1, 1)
+
+#: When the pots in the maturity tests below are funded.
+#:
+#: Earlier than ``ANCHOR``, so the pot's money is already there when the plan's
+#: first run fires - which is the ordinary shape of a wallet that has been saving
+#: for a while. The plans in those tests name no pot (they are the legacy pooled
+#: draw), so no commitment is being tested and the value changes nothing; it is
+#: passed because a deposit now records ``first_funded_at`` and a test should not
+#: be the one place that gets to invent a moment implicitly.
+FUNDED_AT = datetime(2025, 12, 1)
+
+#: The commitment rule's three moments, a day apart so a swapped pair is visible,
+#: and the pot's due date. ``EARLY`` sits between the funding and the due date,
+#: so every "may this pay before its date?" case below is asking about roughly
+#: three months of grace - which is exactly the window a business pot is for.
+SEALED_AT = datetime(2026, 1, 1)
+COMMITTED_AT = datetime(2026, 1, 2)
+MONEY_ARRIVED_AT = datetime(2026, 1, 3)
+MATURES_ON = date(2026, 6, 1)
+EARLY = datetime(2026, 3, 1)
 
 
 # --- the happy path --------------------------------------------------------
@@ -592,7 +615,7 @@ class TestMoneyThatIsLockedButNotYetSpendable:
         pot = wallet.open_fund(
             "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
         )
-        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), FUNDED_AT)
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         executor, factory = build_executor(tmp_path)
         seed(factory, wallet, plan)
@@ -620,7 +643,7 @@ class TestMoneyThatIsLockedButNotYetSpendable:
         pot = wallet.open_fund(
             "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
         )
-        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), FUNDED_AT)
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         executor, factory = build_executor(tmp_path)
         seed(factory, wallet, plan)
@@ -647,8 +670,8 @@ class TestMoneyThatIsLockedButNotYetSpendable:
         sealed = wallet.open_fund(
             "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
         )
-        wallet.deposit_into_fund(open_pot.fund_id, Money(Decimal("1000"), NGN))
-        wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("9000"), NGN))
+        wallet.deposit_into_fund(open_pot.fund_id, Money(Decimal("1000"), NGN), FUNDED_AT)
+        wallet.deposit_into_fund(sealed.fund_id, Money(Decimal("9000"), NGN), FUNDED_AT)
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         executor, factory = build_executor(tmp_path)
         seed(factory, wallet, plan)
@@ -671,7 +694,7 @@ class TestMoneyThatIsLockedButNotYetSpendable:
         pot = wallet.open_fund(
             "Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1)
         )
-        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), FUNDED_AT)
         plan = build_plan(
             wallet_id=wallet.wallet_id,
             instructions=(release("2000"),),
@@ -698,7 +721,7 @@ class TestMoneyThatIsLockedButNotYetSpendable:
         """
         wallet = build_wallet(available="0")
         pot = wallet.open_fund("Locked", FundKind.PERSONAL, maturity_date=None)
-        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN))
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), FUNDED_AT)
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         executor, factory = build_executor(tmp_path)
         seed(factory, wallet, plan)
@@ -709,6 +732,245 @@ class TestMoneyThatIsLockedButNotYetSpendable:
 
 
 # --- catching up -----------------------------------------------------------
+
+
+class TestTheBusinessPotCommitment:
+    """The headline rule, decided where it actually decides anything: the run.
+
+    ``Fund.authorises_early_payout`` is unit-tested in its own file, and that is
+    not enough on its own. The rule only matters because a *run* obeys it, and a
+    run obeys it in two places that have to agree - the pre-flight that approves
+    the money and the operation that moves it. These tests are the agreement seen
+    from the outside: what the scheduler does on the day, with a plan, a pot and a
+    clock that a user could really have.
+
+    The ordering every passing case satisfies is one sentence:
+
+        **seal the pot -> commit money to it -> fund it**
+    """
+
+    @staticmethod
+    def a_business_pot(wallet, kind=FundKind.BUSINESS):
+        """An empty pot, sealed at ``SEALED_AT``, due at ``MATURES_ON``."""
+        return wallet.open_fund(
+            "Supplier", kind, maturity_date=MATURES_ON, as_of=SEALED_AT
+        )
+
+    def test_a_business_pot_pays_before_its_date_when_the_plan_predates_the_money(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The case the whole feature exists for, end to end.
+
+        A supplier is paid on 1 March out of a pot that does not come due until
+        1 June - because the plan committed to the payment on 2 January and the
+        money only arrived on the 3rd. The payment is early, scheduled, and
+        authorised, and the run simply succeeds.
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(payout("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), MONEY_ARRIVED_AT)
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, EARLY)
+
+        assert run.status is RunStatus.SUCCEEDED
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("3000"), NGN
+        )
+
+    def test_the_money_must_not_predate_the_plan(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The same wallet, plan and day - with the funding moved before the plan.
+
+        This is the temptation the rule exists to stop, expressed as two dates.
+        The pot holds the money the whole time and the plan is a real, scheduled
+        payment; what is missing is that the money was already there when the
+        commitment was made. So the run blocks, and the user is told to wait for
+        the pot's own date rather than to top anything up.
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet)
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), SEALED_AT)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(payout("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+        )
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, EARLY)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.FUND_NOT_MATURED
+        # Nothing was half-done, and the pot still holds every naira.
+        assert ledger_of(factory, wallet.wallet_id) == []
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("5000"), NGN
+        )
+
+    def test_extending_the_pot_after_the_commitment_blocks_the_payment(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """A change of mind, made loud rather than quiet.
+
+        With the working case above, the owner pushes the pot's date out. The
+        exemption lapses - not because anything was un-committed, but because the
+        pot's terms now postdate the plan, so the ordering that authorised the
+        early payment no longer holds.
+
+        The point of the test is what the owner *gets*: not a silently skipped
+        payment, but a blocked run that pauses the plan and queues a receipt. The
+        money still cannot be released early; all that has changed is that the
+        person waiting will hear about it.
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(payout("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), MONEY_ARRIVED_AT)
+        wallet.extend_fund(pot.fund_id, date(2026, 9, 1), datetime(2026, 2, 1))
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, EARLY)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.FUND_NOT_MATURED
+        assert plan_after(factory, plan.plan_id).status is PlanStatus.PAUSED
+
+    def test_a_personal_pot_blocks_whatever_the_plan_says(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The kind gate, from the run's side.
+
+        The identical arrangement that pays above is blocked here, and the only
+        difference is the pot's kind. A personal pot pays early by no route: the
+        exemption is for a scheduled obligation to an external payee, and no
+        ordering of events turns spending into one.
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet, kind=FundKind.PERSONAL)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(payout("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), MONEY_ARRIVED_AT)
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, EARLY)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.FUND_NOT_MATURED
+
+    def test_a_release_plan_naming_a_business_pot_is_not_exempt(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The one shape that must not slip through the pre-flight.
+
+        A plan holding a RELEASE moves money between the wallet's own balances,
+        and ``Fund.release`` refuses before maturity for *both* kinds. If the
+        pre-flight granted the business exemption to a release plan, it would
+        approve a run that the release then refused - the half-executed run the
+        pre-flight exists to prevent, arriving through the pre-flight itself.
+        So the exemption is gated on ``is_irreversible``, which is exactly "this
+        plan releases locked funds".
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(release("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+            ends_on=date(2026, 12, 1),
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), MONEY_ARRIVED_AT)
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, EARLY)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.FUND_NOT_MATURED
+
+    def test_the_ledger_row_names_the_pot_that_paid(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The half the pooled draw could not record, and the reason it cannot.
+
+        A pooled payout writes no ``fund_id`` because there is no honest single
+        answer. A plan that names its pot has one, so the row carries it - which
+        is what makes "which pot did this payment come from?" answerable by
+        reading the ledger rather than by re-deriving it from the plan.
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(payout("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), MONEY_ARRIVED_AT)
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, EARLY)
+
+        rows = ledger_of(factory, wallet.wallet_id)
+        assert [row.type for row in rows] == [TransactionType.PAYOUT]
+        assert rows[0].fund_id == pot.fund_id
+
+    def test_the_receipt_says_which_pot_paid(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The words a user reads, which is where "which pot?" is actually asked.
+
+        The ledger answers it for a database; the receipt has to answer it for a
+        person, or a wallet with three business pots produces three identical
+        emails.
+        """
+        wallet = build_wallet(available="0")
+        pot = self.a_business_pot(wallet)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            anchor=EARLY,
+            instructions=(payout("2000"),),
+            fund_id=pot.fund_id,
+            created_at=COMMITTED_AT,
+        )
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal("5000"), NGN), MONEY_ARRIVED_AT)
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, EARLY)
+
+        queued = notifications_of(factory)
+        assert len(queued) == 1
+        assert "Supplier" in queued[0].body
 
 
 class TestCatchingUp:

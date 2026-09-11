@@ -8,6 +8,7 @@ fails when the pot does not exist is a genuinely different shape from every
 other failure in this file.
 """
 
+from datetime import datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -33,6 +34,15 @@ from app.infrastructure.repositories.in_memory_transaction_repository import (
 
 NGN = Currency.NGN
 USD = Currency.USD
+
+#: The moment every lock in this file happens at.
+#:
+#: A lock does not stamp anything on the pot - only the first *deposit* does - but
+#: the wallet still asks for the moment, because a lock and a deposit are the same
+#: call underneath and a move that is refused for a date should be refused for it
+#: whichever door it came through. Nothing here is refused for a date, so the
+#: value is arbitrary; it is passed because the wallet requires one.
+MOMENT = datetime(2026, 1, 1)
 
 
 def a_wallet_with_a_pot(
@@ -60,7 +70,7 @@ def test_a_lock_moves_available_money_into_the_named_pot(build_wallet):
     wallet = a_wallet_with_a_pot(build_wallet)
     repository = InMemoryTransactionRepository()
 
-    transaction = LockIntoFund(wallet, repository, "Vacation").execute(
+    transaction = LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN),
         internal_reference=str(uuid4()),
     )
@@ -87,7 +97,7 @@ def test_the_ledger_row_names_the_pot(build_wallet):
     wallet = a_wallet_with_a_pot(build_wallet)
     repository = InMemoryTransactionRepository()
 
-    transaction = LockIntoFund(wallet, repository, "Vacation").execute(
+    transaction = LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN), internal_reference=str(uuid4())
     )
 
@@ -99,7 +109,7 @@ def test_lock_is_persisted_as_pending_before_wallet_is_touched(
 ):
     wallet = a_wallet_with_a_pot(build_wallet)
 
-    LockIntoFund(wallet, recording_transactions, "Vacation").execute(
+    LockIntoFund(wallet, recording_transactions, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN),
         internal_reference=str(uuid4()),
     )
@@ -117,7 +127,7 @@ def test_a_zero_amount_fails_and_persists_nothing(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        LockIntoFund(wallet, repository, "Vacation").execute(
+        LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("0"), NGN),
             internal_reference=str(uuid4()),
         )
@@ -132,7 +142,7 @@ def test_a_negative_amount_fails_and_persists_nothing(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        LockIntoFund(wallet, repository, "Vacation").execute(
+        LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("-3000"), NGN),
             internal_reference=str(uuid4()),
         )
@@ -146,7 +156,7 @@ def test_a_non_money_amount_fails_and_persists_nothing(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InvalidAmountError):
-        LockIntoFund(wallet, repository, "Vacation").execute(
+        LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             3000,
             internal_reference=str(uuid4()),
         )
@@ -161,7 +171,7 @@ def test_locking_more_than_the_available_balance_fails(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(InsufficientFundsError):
-        LockIntoFund(wallet, repository, "Vacation").execute(
+        LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("15000"), NGN),
             internal_reference=str(uuid4()),
         )
@@ -178,7 +188,7 @@ def test_locking_into_a_closed_wallet_fails(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(WalletClosedError):
-        LockIntoFund(wallet, repository, "Vacation").execute(
+        LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("3000"), NGN),
             internal_reference=str(uuid4()),
         )
@@ -192,7 +202,7 @@ def test_locking_the_wrong_currency_fails(build_wallet):
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(CurrencyMismatchError):
-        LockIntoFund(wallet, repository, "Vacation").execute(
+        LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
             Money(Decimal("3000"), USD),
             internal_reference=str(uuid4()),
         )
@@ -210,7 +220,7 @@ def test_a_rejected_lock_is_persisted_as_pending_then_failed(
     wallet = a_wallet_with_a_pot(build_wallet, available="10000")
 
     with pytest.raises(InsufficientFundsError):
-        LockIntoFund(wallet, recording_transactions, "Vacation").execute(
+        LockIntoFund(wallet, recording_transactions, "Vacation", MOMENT).execute(
             Money(Decimal("15000"), NGN),
             internal_reference=str(uuid4()),
         )
@@ -226,7 +236,7 @@ def test_a_rejected_lock_is_persisted_as_pending_then_failed(
 def test_replaying_the_same_internal_reference_locks_only_once(build_wallet):
     wallet = a_wallet_with_a_pot(build_wallet)
     repository = InMemoryTransactionRepository()
-    service = LockIntoFund(wallet, repository, "Vacation")
+    service = LockIntoFund(wallet, repository, "Vacation", MOMENT)
     reference = str(uuid4())
 
     first = service.execute(Money(Decimal("3000"), NGN), reference)
@@ -241,7 +251,7 @@ def test_caller_supplied_internal_reference_is_persisted(build_wallet):
     repository = InMemoryTransactionRepository()
     reference = "lock-reservation-9c21"
 
-    transaction = LockIntoFund(wallet, repository, "Vacation").execute(
+    transaction = LockIntoFund(wallet, repository, "Vacation", MOMENT).execute(
         Money(Decimal("3000"), NGN),
         internal_reference=reference,
     )
@@ -272,7 +282,7 @@ def test_locking_into_an_unknown_pot_is_refused_before_anything_is_recorded(
     repository = InMemoryTransactionRepository()
 
     with pytest.raises(FundNotFoundError):
-        LockIntoFund(wallet, repository, "Holiday")
+        LockIntoFund(wallet, repository, "Holiday", MOMENT)
 
     assert not repository.transactions
     assert wallet.available_balance == Money(Decimal("10000"), NGN)
@@ -289,7 +299,7 @@ def test_a_lock_lands_in_the_named_pot_and_not_in_another(build_wallet):
     wallet.open_fund("Vacation", FundKind.PERSONAL)
     wallet.open_fund("Salary", FundKind.PERSONAL)
 
-    LockIntoFund(wallet, InMemoryTransactionRepository(), "Salary").execute(
+    LockIntoFund(wallet, InMemoryTransactionRepository(), "Salary", MOMENT).execute(
         Money(Decimal("4000"), NGN), internal_reference=str(uuid4())
     )
 

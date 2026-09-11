@@ -104,8 +104,24 @@ class WalletService:
         internal_reference: str,
         destination: Destination,
         as_of: datetime,
+        fund_name: str | None = None,
     ) -> Transaction:
-        """Spend the locked pots, sending value out to an external account."""
+        """Spend the locked pots, sending value out to an external account.
+
+        ``fund_name`` names the pot to draw on, and leaving it out is not the
+        same command with a default - it is a different act. Naming one spends
+        that pot and records it on the ledger. Naming none falls back to the
+        pooled draw, which exists for the caller that genuinely cannot say: a
+        plan saved before pots could be named, whose ``fund_id`` is ``NULL``.
+
+        **This method never passes ``committed_at``, and that is the rule rather
+        than an omission.** The business-pot exemption is for a *scheduled*
+        payment - one with a plan behind it - and nothing reached from here has
+        a plan. So an ad-hoc ``payout --fund`` against a sealed business pot is
+        refused by the pot, before its maturity date, however the pot was named.
+        The substitution is silent if you only read this signature, which is why
+        it is written down.
+        """
         return self._run(
             PayoutFromLocked,
             wallet_id,
@@ -113,6 +129,7 @@ class WalletService:
             internal_reference,
             destination=destination,
             as_of=as_of,
+            fund_name=fund_name,
         )
 
     def payout_from_available(
@@ -192,27 +209,50 @@ class WalletService:
             raise
 
     def deposit_into_fund(
-        self, wallet_id, fund_name: str, amount: Money, internal_reference: str
+        self,
+        wallet_id,
+        fund_name: str,
+        amount: Money,
+        internal_reference: str,
+        as_of: datetime,
     ) -> Transaction:
-        """Bring money in from outside, straight into a named pot."""
+        """Bring money in from outside, straight into a named pot.
+
+        ``as_of`` is required because this is the operation that stamps the pot's
+        ``first_funded_at`` - the moment a commitment has to predate for the pot
+        to authorise an early business payment.
+        """
         return self._run(
             DepositIntoFund,
             wallet_id,
             amount,
             internal_reference,
             fund_name=fund_name,
+            as_of=as_of,
         )
 
     def lock_into_fund(
-        self, wallet_id, fund_name: str, amount: Money, internal_reference: str
+        self,
+        wallet_id,
+        fund_name: str,
+        amount: Money,
+        internal_reference: str,
+        as_of: datetime,
     ) -> Transaction:
-        """Move money from the available balance into a named pot."""
+        """Move money from the available balance into a named pot.
+
+        ``as_of`` is required for the same reason as ``deposit_into_fund``: money
+        arriving in a pot stamps its funding moment, and it makes no difference
+        to the pot whether that money came from outside or from the wallet's own
+        available balance.
+        """
         return self._run(
             LockIntoFund,
             wallet_id,
             amount,
             internal_reference,
             fund_name=fund_name,
+            as_of=as_of,
         )
 
     def release_from_fund(

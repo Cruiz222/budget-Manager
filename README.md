@@ -718,6 +718,48 @@ with its own balance, its own kind, and its own maturity date:
 | **Personal** pot | always allowed | blocked until the date | blocked until the date |
 | **Business** pot | always allowed | blocked until the date | **allowed on schedule** |
 
+The business row is the exception the whole feature was built for, and it is
+narrower than "a business pot pays early". It pays **scheduled** payments before
+its date - a plan committed to it beforehand - and it refuses a hand-typed
+`payout --fund` on exactly the same day, because a payment someone typed just now
+is not a scheduled one. Release is refused either way: an early release puts the
+money back in the available balance, where it can go anywhere, and that is the
+move the lock exists to prevent.
+
+So what makes an early payment legitimate is an **ordering**, and it is one
+sentence:
+
+> **seal the pot → commit money to it → fund it**
+
+Concretely: open the pot with its date, create the plan that pays out of it, and
+only then put money in. A pot sealed on 1 January, committed to by a plan on the
+2nd, and funded on the 3rd will pay an external account in March against a June
+maturity date. Fund it first and then invent a plan, and the pot waits for June -
+which is the manoeuvre the ordering exists to stop, because the person holding
+the money could otherwise lock it, get tempted, and *then* write the plan that
+unlocks it. Two dates on the pot record it: `sealed_at` (when its current date
+came into force) and `first_funded_at` (when money first arrived, stamped once
+and never moved). The rule is then one comparison, and it reads as the ordering:
+
+```python
+self.sealed_at <= committed_at <= self.first_funded_at
+```
+
+The anchor is **first** funding rather than most recent, and that choice is the
+security rather than a detail. Anchoring on the latest deposit would let anyone
+unlock a sealed pot by depositing a token amount after creating the plan. The
+cost is the conservative direction: a pot that already held money must wait for
+its date, and the exemption is obtained by opening an empty pot, committing to
+it, and funding it after. All or nothing - there are no per-deposit lots.
+
+Because `sealed_at` moves on `fund extend`, pushing a pot's date out **re-seals
+it against a plan that has already committed**. That was a deliberate ruling
+against the opposite recommendation, and it is coherent because of what the
+owner gets: not a payment quietly skipped, but a blocked run that pauses the plan
+and queues a `payout_blocked` receipt naming the pot. The owner runs the tick, so
+the machine cannot defend a payee against the owner - what it can do is make the
+owner's change of mind loud.
+
 Continuous deposits are not a feature bolted onto a lock; they are the reason
 the pots are named at all. A pot that could not be fed would mean a new plan per
 top-up, which is exactly the thing being designed away.
@@ -768,7 +810,8 @@ that a constraint closes, and the aggregate check is for the good error message
 rather than for the guarantee.
 
 **38. In Phase A a payout draws from matured pots in creation order and records
-no pot.** A payout *cannot* avoid choosing a pot once pots are the locked balance,
+no pot.** *Superseded by 41 - kept for the record, because the reasoning is why
+41 is shaped the way it is.* A payout *cannot* avoid choosing a pot once pots are the locked balance,
 and "payouts untouched" is therefore not literally available - so the honest thing
 is to say which rule was picked rather than to leave it implicit. "Which pot" has
 no single true answer while several may fund one payment, so Phase A does not
@@ -777,6 +820,83 @@ store) and writes **no fund onto the PAYOUT ledger row**. The row still says wha
 it always said - value left the wallet for a named account. Phase B makes the pot
 explicit ("the payout names its pot"), which is both stricter and simpler, and
 which is when `transactions.fund_id` starts being written on payout rows.
+
+**39. The commitment anchor is the pot's *first* funding, not its latest.**
+`Fund.first_funded_at` is stamped by the first `deposit` and never moves. The
+alternative - asking when the pot was most recently funded - is exploitable in
+one line: deposit a token amount after creating the plan and the exemption is
+yours. A moment that cannot move later cannot be gamed that way, so the only
+lever left is the ordering itself. A lock also stamps it, since
+`Wallet.lock_into_fund` calls `Fund.deposit` - the money was already in the
+available balance and already spendable, so setting it aside grants nothing that
+was not already granted. **The cost is that the exemption is all-or-nothing**:
+there is no notion of "the money that arrived after the plan", so a pot that
+already held anything must wait for its date. Ruled with the user, deliberately,
+over per-deposit lots.
+
+**40. `sealed_at` moves on `extend`, so extending re-seals against a committed
+plan.** `extend_to` sets `sealed_at` to the moment of the change, which pushes it
+past an already-made commitment and lapses the exemption - for free, with no
+extra state and no second rule to keep in step. I argued the other way (an owner
+could starve an external payee by extending forever); the ruling went the other
+way, and it is coherent for a reason worth writing down: **the owner runs the
+tick**, so the machine cannot defend a payee against the owner regardless. What
+it can do is make the change of mind *loud* - the run blocks, the plan pauses,
+and a `payout_blocked` receipt names the pot, so extending does not silently skip
+a payment. It also keeps `extend` uniform: a date moving later always re-seals,
+for every kind of pot.
+
+**41. A plan that spends the locked balance must name its pot, and the pot is
+fixed at creation.** `savings_plans.fund_id` is set at `plan create` via
+`--from-fund NAME` (required iff `--source locked`, refused for `available`) and
+there is deliberately no way to change it afterwards, because pointing an
+existing commitment at a different pot is the redirect the commitment test
+exists to stop - arriving through the one door that test cannot see, since the
+new pot would be judged against the plan's *old* creation moment. Getting it
+wrong is recoverable: `plan cancel` frees nothing, so the money stays sealed to
+its own maturity date and a new plan can be made against it. `plan edit` may
+therefore change a payout's destination and amount but **never remove the last
+payout line** - only removal is refused. The aggregate holds the check it can
+make about itself (`fund_id` only on a `LOCKED` source); the use case holds the
+one a pre-existing row is allowed to violate ("a `LOCKED` plan must name a pot"),
+because enforcing that in the aggregate would make every plan already on disk
+unhydratable. `create_plan` takes the pot's **name** rather than its id so the
+source/pot pairing is refused *before* the name is looked up.
+
+**42. An ad-hoc `payout --fund` is never exempt, and says so by passing nothing.**
+The ruling covers *scheduled* payments to external accounts. A hand-typed payout
+has no plan behind it, so it passes no `committed_at`, `authorises_early_payout`
+returns `False`, and a business pot must have matured before it will spend it.
+Closed at the pot rather than at the command - the command has no way to know
+whether the caller is tempted, and a pot asked without a commitment has a
+definite answer.
+
+**44. A pot asks about its date before it asks about the amount.** In
+`Fund.pay`, `Fund.release` and everywhere else a pot is asked to give money up,
+the maturity gate runs first and the amount and currency checks run after. Both
+refusals are true of `pay(-500)` on a pot maturing in June, so the order decides
+which one the user is told - and "locked until 2026-06-01" is the one they can
+act on. A pot that may not be spent at all cannot be helped by a well-formed
+amount, so telling someone to fix the number would send them off to repair a
+typo that would not have freed the money. The reverse reading is defensible (a
+malformed request is malformed whatever the date), which is exactly why this is
+written down rather than left to the order two `if` statements happened to be
+typed in: reversing them changes what a user is told, silently, and no test
+would catch it unless one was written to. A plan saved before pots could be named gets no backfill: its wallet's
+locked money may be spread across several pots, and picking one would silently
+commit money the user never committed. So `NULL` means exactly what is true -
+"this plan predates naming, draw on the pool as it always did" - and
+`Wallet.payout_from_locked` still implements that draw, reaching it only from
+such a plan. It is invisible in practice, because every pot that existed before
+this phase is the one open `"Locked"` pot the migration created
+(`maturity_date IS NULL`), so the pooled rule can only ever see a pot that is
+always matured. The two new pot columns are backfilled the conservative way:
+`sealed_at` from `created_at` unconditionally (a date is as old as its pot), and
+`first_funded_at` from `created_at` **only where the balance is non-zero**, since
+an earlier anchor makes the exemption harder to obtain and an empty pot has never
+been funded at all. "Is this balance zero?" is asked in SQL with a cast, which is
+the one place arithmetic on a money column is defensible - the question is
+yes/no and the answer is thrown away.
 
 **Scheduling has never required locking, and pots do not change that.**
 `PlanSource.AVAILABLE` exists precisely so a plan can pay an external account out
@@ -787,14 +907,32 @@ commitment to anything locks nothing and creates the plan today.
 
 Two consequences of decision 33 are worth naming, because they are the kind of
 thing that only shows up later. First, **`ExecutePlanRun` had to learn which
-locked balance is *spendable***: `_funding_balance` now returns
+locked balance is *spendable***: its pre-flight asked
 `wallet.matured_locked_balance(as_of)` for a `LOCKED` plan, not the full sum. Had
-it kept returning the full sum, a run funded only by an immature pot would pass
+it kept asking for the full sum, a run funded only by an immature pot would pass
 the pre-flight and then have `PayoutFromLocked` raise mid-run - the half-executed
-run the pre-flight exists to prevent. Money that is not yet spendable is money
-that is not there, so the reason stays `INSUFFICIENT_BALANCE`; a dedicated
-`LOCKED_FUNDS_NOT_MATURED` is Phase B's job, when a pot is named and "your pot has
-not matured" becomes distinguishable from "you have no money" in the message.
+run the pre-flight exists to prevent. Phase B replaced that arithmetic with the
+pot the plan names, and the reason `INSUFFICIENT_BALANCE` becomes
+`RunBlockReason.FUND_NOT_MATURED` - "your pot has not matured" is now
+distinguishable from "you have no money", and they have different remedies
+(wait for the date, versus top the pot up). One member, not two: "the pot has not
+come due" and "the commitment no longer authorises an early payment" have the
+*same* remedy, and `RunBlockReason`'s own docstring warns that widening one
+member to carry two meanings is the quiet danger while adding one is free. The
+maturity test also runs *before* the balance test, and the order is the advice -
+a pot that may not be spent at all cannot be helped by the size of its balance,
+so a user is never told to top up a pot that topping up would not free.
+
+The pre-flight and the operation that moves the money call the **same method**,
+`Fund.authorises_early_payout`, and that is the only thing that makes the
+pre-flight worth anything: if they could answer differently, the run would either
+approve a payment the pot then refuses (half-executed) or block one the pot would
+have allowed. The predicate lives on `Fund` because it is the pot's own rule
+about its own money; the *fact* it needs - the plan's creation moment - is
+supplied by the use case, because the pot cannot see a plan and the plan cannot
+see a pot's funding history. A plan holding a `RELEASE` is gated out of the
+exemption by `plan.is_irreversible`, which is exactly "this plan releases locked
+funds" - grant it and the pre-flight would approve a run the release then refuses.
 
 Second, **the old locked balance is migrated, not abandoned.** A database that
 predates pots has `wallets.locked_balance` holding real money that was releasable
@@ -802,13 +940,20 @@ unconditionally. Opening it writes one pot per wallet - named `"Locked"`, kind
 `PERSONAL`, `maturity_date = NULL` - and drops the column. Per decision 18 the
 `funds` table itself costs nothing: `CREATE TABLE IF NOT EXISTS` builds it on an
 older database without touching the tables already there, so a brand-new table is
-free and only a changed one is a migration. The `transactions.fund_id` column is
-therefore the one that needs the PRAGMA-guarded `ALTER` (the `destination`
-idiom), and dropping `locked_balance` is the one *real* migration in this phase,
+free and only a changed one is a migration. The `transactions.fund_id`,
+`savings_plans.fund_id`, `funds.sealed_at` and `funds.first_funded_at` columns are
+therefore what need the PRAGMA-guarded `ALTER` (the `destination` idiom), and
+dropping `locked_balance` is the one *real* migration in this phase,
 because `ALTER TABLE ... DROP COLUMN` needs SQLite 3.35.0. The drop
 checks `sqlite3.sqlite_version_info` **before** writing any pot, and raises a
 message naming the requirement rather than half-migrating a database on an older
-install. Migrations run in autocommit before the unit of work's `BEGIN`, so a
+install. `funds.sealed_at` has to exist *before* the pot-creating INSERT above
+runs, since that row carries a `NOT NULL sealed_at` - so the order of the
+migration functions is load-bearing, not alphabetical. `NOT NULL` needs a
+`DEFAULT`, which SQLite gives the existing rows only briefly before the backfill
+replaces it; a brand-new database never sees the default at all, because the
+`SCHEMA` already carries the real columns. Migrations run in autocommit before
+the unit of work's `BEGIN`, so a
 process killed between the inserts and the drop leaves pots written and the
 column standing - which is why the inset is guarded by `WHERE NOT EXISTS` and not
 by a PRAGMA check on the column: rerunning it must be a no-op, and the second run
@@ -816,21 +961,6 @@ is the one that has to cope.
 
 ### Still open
 
-- **The Phase A / Phase B boundary in named funds, and decision 38 is what
-  closes it.** Phase A shipped pots as a *concept*: they exist, they hold the
-  locked balance, they are named, they have dates, and money can be moved in and
-  out of them by name. What it did **not** ship is pots as the things *plans and
-  payouts name*. So in Phase A a `BUSINESS` pot is not yet special - it refuses a
-  release before its date exactly like a `PERSONAL` one, and a payout spends
-  matured pots oldest-first without recording which. `Fund.pay(amount, as_of)`
-  already carries the business rule and is simply never reached with an immature
-  pot. Phase B takes: `savings_plans.fund_id` (nullable) so a plan names its pot,
-  `plan create --from-fund NAME` required iff `--source locked`, `payout --fund
-  NAME`, `transactions.fund_id` written on PAYOUT rows, and
-  `RunBlockReason.LOCKED_FUNDS_NOT_MATURED` so "your pot has not matured" stops
-  looking like "you have no money". It is deliberately *not* half-done: a
-  business pot that behaved differently in one code path and not another would be
-  worse than one that is uniformly conservative for a phase.
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
   reads "salary" instead of a bare internal reference.
 - Renaming `MoneyError`. It has quietly become "any domain rejection" and the

@@ -20,7 +20,10 @@ from app.infrastructure.persistence.serialization import (
     uuid_to_text,
 )
 
-_FUND_COLUMNS = "fund_id, wallet_id, name, kind, balance, maturity_date, created_at"
+_FUND_COLUMNS = (
+    "fund_id, wallet_id, name, kind, balance, maturity_date, "
+    "sealed_at, first_funded_at, created_at"
+)
 
 
 class SqliteWalletRepository(WalletRepository):
@@ -90,7 +93,7 @@ class SqliteWalletRepository(WalletRepository):
             self._connection.execute(
                 f"""
                 INSERT INTO funds ({_FUND_COLUMNS})
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     uuid_to_text(fund.fund_id),
@@ -99,6 +102,8 @@ class SqliteWalletRepository(WalletRepository):
                     enum_to_text(fund.kind),
                     money_to_text(fund.balance),
                     date_to_text(fund.maturity_date),
+                    datetime_to_text(fund.sealed_at),
+                    datetime_to_text(fund.first_funded_at),
                     datetime_to_text(fund.created_at),
                 ),
             )
@@ -169,5 +174,7 @@ class SqliteWalletRepository(WalletRepository):
             kind=text_to_enum(FundKind, row["kind"]),
             _balance=text_to_money(row["balance"], currency),
             maturity_date=text_to_date(row["maturity_date"]),
+            sealed_at=text_to_datetime(row["sealed_at"]),
+            first_funded_at=text_to_datetime(row["first_funded_at"]),
             created_at=text_to_datetime(row["created_at"]),
         )

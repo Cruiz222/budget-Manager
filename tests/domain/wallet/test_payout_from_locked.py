@@ -141,7 +141,7 @@ def test_a_payout_cannot_spend_a_pot_that_has_not_come_due(build_wallet):
     sealed = wallet.open_fund(
         "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
     )
-    wallet.deposit_into_fund(sealed.fund_id, ngn("5000"))
+    wallet.deposit_into_fund(sealed.fund_id, ngn("5000"), MOMENT)
 
     with pytest.raises(InsufficientFundsError):
         wallet.payout_from_locked(ngn("1000"), datetime(2026, 5, 31, 23, 59))
@@ -156,7 +156,7 @@ def test_a_payout_can_spend_a_pot_once_it_has_come_due(build_wallet):
     sealed = wallet.open_fund(
         "Vacation", FundKind.PERSONAL, maturity_date=date(2026, 6, 1)
     )
-    wallet.deposit_into_fund(sealed.fund_id, ngn("5000"))
+    wallet.deposit_into_fund(sealed.fund_id, ngn("5000"), MOMENT)
 
     wallet.payout_from_locked(ngn("1000"), datetime(2026, 6, 1, 0, 0))
 
@@ -174,8 +174,8 @@ def test_only_the_matured_pots_count_towards_the_amount(build_wallet):
     wallet = build_wallet(available="0")
     open_pot = wallet.open_fund("Salary", FundKind.PERSONAL)
     wallet.open_fund("Vacation", FundKind.PERSONAL, maturity_date=date(2027, 1, 1))
-    wallet.deposit_into_fund(open_pot.fund_id, ngn("1000"))
-    wallet.deposit_into_fund(wallet.funds[1].fund_id, ngn("9000"))
+    wallet.deposit_into_fund(open_pot.fund_id, ngn("1000"), MOMENT)
+    wallet.deposit_into_fund(wallet.funds[1].fund_id, ngn("9000"), MOMENT)
 
     with pytest.raises(InsufficientFundsError):
         wallet.payout_from_locked(ngn("2000"), MOMENT)
@@ -188,17 +188,24 @@ def test_only_the_matured_pots_count_towards_the_amount(build_wallet):
 
 
 def test_a_payout_draws_from_pots_oldest_first(build_wallet):
-    """Decision 38's placeholder rule: no pot is named, so the oldest pays.
+    """Decision 38's placeholder rule, which is now the *legacy* rule.
 
-    Pinned because it is a decision rather than an accident - the next phase
-    replaces it with "the payout names its pot", and this test is what will have
-    to change when it does.
+    Pinned because it is a decision rather than an accident, and it survived the
+    phase that promised to replace it - so the promise needs correcting rather
+    than deleting. A payout *can* name its pot now (``payout_from_fund``), and
+    every plan created since does; what remains true is that when no pot is
+    named, the oldest pays. That is the rule a plan saved before pots could be
+    named still runs under, which is the only reason this path exists at all.
+
+    So this file tests the fallback, and ``test_payout_from_fund.py`` tests the
+    named case. Neither is dead code, and the ordering here is the thing the
+    fallback has to get right.
     """
     wallet = build_wallet(available="0")
     older = wallet.open_fund("Rent", FundKind.PERSONAL)
     newer = wallet.open_fund("Car", FundKind.PERSONAL)
-    wallet.deposit_into_fund(older.fund_id, ngn("3000"))
-    wallet.deposit_into_fund(newer.fund_id, ngn("3000"))
+    wallet.deposit_into_fund(older.fund_id, ngn("3000"), MOMENT)
+    wallet.deposit_into_fund(newer.fund_id, ngn("3000"), MOMENT)
 
     wallet.payout_from_locked(ngn("4000"), MOMENT)
 
@@ -212,8 +219,8 @@ def test_the_draw_stops_once_the_amount_is_covered(build_wallet):
     wallet = build_wallet(available="0")
     first = wallet.open_fund("Rent", FundKind.PERSONAL)
     second = wallet.open_fund("Car", FundKind.PERSONAL)
-    wallet.deposit_into_fund(first.fund_id, ngn("3000"))
-    wallet.deposit_into_fund(second.fund_id, ngn("3000"))
+    wallet.deposit_into_fund(first.fund_id, ngn("3000"), MOMENT)
+    wallet.deposit_into_fund(second.fund_id, ngn("3000"), MOMENT)
 
     wallet.payout_from_locked(ngn("1000"), MOMENT)
 
@@ -232,7 +239,7 @@ def test_an_empty_pot_does_not_break_the_draw(build_wallet):
     wallet = build_wallet(available="0")
     wallet.open_fund("Empty", FundKind.PERSONAL)
     funded = wallet.open_fund("Funded", FundKind.PERSONAL)
-    wallet.deposit_into_fund(funded.fund_id, ngn("2000"))
+    wallet.deposit_into_fund(funded.fund_id, ngn("2000"), MOMENT)
 
     wallet.payout_from_locked(ngn("2000"), MOMENT)
 

@@ -60,6 +60,13 @@ CREATE TABLE IF NOT EXISTS funds (
     balance       TEXT NOT NULL,    -- decimal as text, e.g. "50000.00"
     maturity_date TEXT,             -- ISO date; NULL means no maturity at all
     created_at    TEXT NOT NULL,    -- ISO moment; fixes the payout draw order
+    -- The two moments a business pot's early-payment exemption is judged on. See
+    -- ``Fund.authorises_early_payout`` for the rule; what matters for the schema
+    -- is that ``sealed_at`` is always set and ``first_funded_at`` is NULL exactly
+    -- while the pot is empty. Together they say whether any commitment predates
+    -- the money, which is the one question the pot cannot answer from its balance.
+    sealed_at      TEXT NOT NULL,   -- ISO moment; re-stamped on every extend
+    first_funded_at TEXT,           -- ISO moment; NULL until money first arrives
     -- There is deliberately no ``currency`` column. A fund is in its wallet's
     -- currency by construction - ``Wallet.__post_init__`` refuses one that is
     -- not - so a stored copy would be a second place for the same fact to live,
@@ -102,7 +109,13 @@ CREATE TABLE IF NOT EXISTS savings_plans (
     status         TEXT NOT NULL,
     completed_runs INTEGER NOT NULL, -- drift guard: next due = anchor + n, never anchor + 1
     ends_on        TEXT,             -- ISO date; NULL means open-ended
-    created_at     TEXT NOT NULL
+    created_at     TEXT NOT NULL,
+    -- Which pot this plan draws on, for a LOCKED-source plan. NULL is not "no
+    -- pot wanted" - it is the *legacy pooled draw*: a plan saved before pots
+    -- could be named, which spends the oldest matured pot first and records
+    -- nothing. Every plan created now names its pot, and a plan that spends the
+    -- available balance never has one. See ``Wallet.payout_from_locked``.
+    fund_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS plan_runs (
@@ -353,6 +366,93 @@ def _migrate_add_fund_id_column(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE transactions ADD COLUMN fund_id TEXT")
 
 
+def _migrate_add_plan_fund_id_column(connection: sqlite3.Connection) -> None:
+    """Add savings_plans.fund_id to a database written before pots could be named.
+
+    Nullable with **no backfill**, and the absence of a backfill is the whole
+    decision. A plan saved earlier has no pot, and there is no honest value to
+    invent: the wallet's locked money may be spread across several pots, and
+    picking one would silently commit money the user never committed. ``NULL``
+    instead means exactly what is true - "this plan predates naming, draw on the
+    pool as it always did" - and ``Wallet.payout_from_locked`` still implements
+    that draw. See the column comment in SCHEMA.
+
+    Contrast ``_migrate_add_plan_name_column``, which *had* to choose a default
+    because the column it added was not nullable. A default is only a design
+    decision when the constraint forces one; here nothing forces it, so the
+    truthful value wins over a convenient one.
+
+    Structurally this is ``_migrate_add_destination_column`` again: the PRAGMA
+    guard is what makes re-running on every connection safe.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(savings_plans)")
+    }
+    if "fund_id" not in columns:
+        connection.execute("ALTER TABLE savings_plans ADD COLUMN fund_id TEXT")
+
+
+def _migrate_add_fund_commitment_columns(connection: sqlite3.Connection) -> None:
+    """Add funds.sealed_at and funds.first_funded_at, and backfill both.
+
+    The two moments ``Fund.authorises_early_payout`` is judged on, added to a
+    database whose pots predate the rule. Backfilling them from ``created_at`` is
+    the **conservative** direction, and it is worth being explicit about why,
+    because the other direction is the tempting one.
+
+    ``first_funded_at`` is the moment a commitment must predate to authorise an
+    early payout. Backfilling it from ``created_at`` makes the recorded funding
+    moment *earlier* than the money can have arrived - and an earlier anchor
+    makes the exemption harder to obtain, because fewer commitments will be found
+    to predate it. So no existing pot gains an exemption it did not already have.
+    The alternative - leaving it NULL - would say "this pot has never been
+    funded", which is false and would be a different bug.
+
+    ``sealed_at`` is always set, so its backfill is unconditional: every existing
+    pot's date is as old as the pot.
+
+    **The empty pot is the one exception**, and it is the reason this cannot be a
+    single unconditional UPDATE: a pot with nothing in it has never been funded,
+    and ``NULL`` is the true answer for it. The test is a cast rather than a
+    string comparison on purpose - ``balance`` is text, and "0", "0.00" and
+    "0.000" are three different strings that all mean nothing. This is the one
+    place in the codebase where SQL arithmetic on a money column is defensible,
+    because the question is "is this zero?" and the answer is thrown away.
+
+    ``NOT NULL DEFAULT ''`` for ``sealed_at`` follows ``_migrate_add_plan_name_column``:
+    SQLite refuses to add a NOT NULL column to a table that already has rows
+    without a default, so the default is the value the existing rows briefly
+    hold before the UPDATE below replaces it. A brand-new database never sees it,
+    because SCHEMA already carries the column.
+    """
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(funds)")
+    }
+    if "sealed_at" not in columns:
+        connection.execute(
+            "ALTER TABLE funds ADD COLUMN sealed_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "first_funded_at" not in columns:
+        connection.execute("ALTER TABLE funds ADD COLUMN first_funded_at TEXT")
+
+    connection.execute(
+        """
+        UPDATE funds
+        SET sealed_at = created_at
+        WHERE sealed_at = ''
+        """
+    )
+    connection.execute(
+        """
+        UPDATE funds
+        SET first_funded_at = created_at
+        WHERE first_funded_at IS NULL
+          AND CAST(balance AS NUMERIC) <> 0
+        """
+    )
+
+
 #: The first SQLite release with ``ALTER TABLE ... DROP COLUMN`` (2021-03-12).
 #: Checked rather than assumed: the linked SQLite is a property of the machine
 #: and the Python build, not of this code, so it is not something to be right
@@ -426,6 +526,11 @@ def _migrate_locked_balance_into_funds(connection: sqlite3.Connection) -> None:
         """
     ).fetchall()
 
+    # One reading of the clock for the whole migration, not one per pot: every
+    # pot it creates is created at the same moment by the same run, and letting
+    # the clock tick between them would invent an ordering that means nothing.
+    moment = datetime.now()
+
     for row in rows:
         locked = text_to_money(
             row["locked_balance"], text_to_enum(Currency, row["currency"])
@@ -437,8 +542,9 @@ def _migrate_locked_balance_into_funds(connection: sqlite3.Connection) -> None:
         connection.execute(
             """
             INSERT INTO funds
-                (fund_id, wallet_id, name, kind, balance, maturity_date, created_at)
-            VALUES (?, ?, ?, ?, ?, NULL, ?)
+                (fund_id, wallet_id, name, kind, balance, maturity_date,
+                 sealed_at, first_funded_at, created_at)
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
             """,
             (
                 uuid_to_text(uuid.uuid4()),
@@ -446,7 +552,17 @@ def _migrate_locked_balance_into_funds(connection: sqlite3.Connection) -> None:
                 "Locked",
                 enum_to_text(FundKind.PERSONAL),
                 money_to_text(locked),
-                datetime_to_text(datetime.now()),
+                # One moment for all three timestamps on purpose. The pot is
+                # born already holding this money, so it was created, sealed and
+                # funded at the same instant - writing ``datetime.now()`` three
+                # times would record a pot that was funded a few microseconds
+                # after it was sealed, which is a distinction this row does not
+                # contain. The balance check above guarantees it is non-empty, so
+                # ``first_funded_at`` is a moment and not ``None``: an empty pot
+                # never reaches this INSERT.
+                datetime_to_text(moment),
+                datetime_to_text(moment),
+                datetime_to_text(moment),
             ),
         )
 
@@ -479,6 +595,13 @@ def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     # inside it there is no migration for its creation, only for filling it from
     # the column it replaces.
     _migrate_add_fund_id_column(connection)
+    _migrate_add_plan_fund_id_column(connection)
+    # Before the migration below, and that ordering is load-bearing: the pot it
+    # creates carries a NOT NULL ``sealed_at``, so the column has to exist on an
+    # older database before the INSERT names it. Both of these are no-ops on a
+    # fresh database, where SCHEMA already has the columns - which is why the
+    # ``funds`` table gets its columns two ways and neither is redundant.
+    _migrate_add_fund_commitment_columns(connection)
     _migrate_locked_balance_into_funds(connection)
     return connection
 

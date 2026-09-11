@@ -119,6 +119,12 @@ class Wallet:
             kind=kind,
             _balance=Money(Decimal("0"), self.currency),
             maturity_date=maturity_date,
+            # The moment this pot's terms come into force. It is the *open*
+            # moment even when no date is given, which costs nothing: an open pot
+            # is always matured, so ``authorises_early_payout`` is never asked
+            # about it. Keeping the field always set is what saves every reader
+            # from handling a second kind of None.
+            sealed_at=as_of or datetime.now(),
             created_at=as_of or datetime.now(),
         )
         self._funds = self._funds + (fund,)
@@ -138,7 +144,7 @@ class Wallet:
                 return fund
         raise FundNotFoundError(f"no fund {fund_id} on this wallet")
 
-    def deposit_into_fund(self, fund_id: uuid.UUID, amount: Money) -> None:
+    def deposit_into_fund(self, fund_id: uuid.UUID, amount: Money, as_of: datetime) -> None:
         """Bring money in from outside straight into a pot.
 
         Note this does not pass through the available balance, so it is a single
@@ -149,18 +155,31 @@ class Wallet:
 
         A frozen wallet still accepts this: freezing stops value *leaving*, and
         this is value arriving.
+
+        ``as_of`` is the moment the money arrives, and the pot records it as its
+        first funding if it has none. It is required rather than read from the
+        clock here for the reason every other moment in this domain is: a use
+        case that reads its own clock cannot be asked what it would do at a given
+        moment, and this one now answers a question - "was the commitment made
+        before the money?" - that a test has to be able to place in time.
         """
         if self.status is WalletStatus.CLOSED:
             raise WalletClosedError("this wallet is closed")
-        self.fund_by_id(fund_id).deposit(amount)
+        self.fund_by_id(fund_id).deposit(amount, as_of)
 
-    def lock_into_fund(self, fund_id: uuid.UUID, amount: Money) -> None:
+    def lock_into_fund(self, fund_id: uuid.UUID, amount: Money, as_of: datetime) -> None:
         """Move money from the available balance into a pot.
 
         The pot-scoped successor to the old ``lock_funds``. The pot is looked up
         before the balance is checked, so an unknown pot is reported as an unknown
         pot rather than as insufficient funds - the caller got the name wrong, and
         that is the more useful thing to say.
+
+        Locking counts as funding for ``first_funded_at``'s purposes, exactly as a
+        deposit from outside does. The two differ in where the money came from,
+        which is the ledger's business, not the pot's: either way money arrived in
+        it, and a pot funded by a lock is no more entitled to pay early than one
+        funded by a deposit.
         """
         if self.status is WalletStatus.CLOSED:
             raise WalletClosedError("this wallet is closed")
@@ -173,7 +192,7 @@ class Wallet:
         if self._available_balance < amount:
             raise InsufficientFundsError("insufficient available balance")
 
-        fund.deposit(amount)
+        fund.deposit(amount, as_of)
         self._available_balance = self._available_balance - amount
 
     def release_from_fund(
@@ -234,18 +253,59 @@ class Wallet:
 
         self._available_balance = self._available_balance - amount
 
-    def payout_from_locked(self, amount: Money, as_of: datetime) -> None:
-        """Send money out of the wallet, spending the locked pots.
+    def payout_from_fund(
+        self,
+        fund_id: uuid.UUID,
+        amount: Money,
+        as_of: datetime,
+        committed_at: datetime | None = None,
+    ) -> None:
+        """Send money out of one named pot, to an external account.
 
-        This is the counterpart of withdraw() for reserved funds. The
-        distinction that matters: releasing and locking only *move* money between
-        balances, so the wallet still holds it all. A payout reduces what the
-        wallet holds - value actually leaves - which is why it refuses a frozen
-        wallet exactly as withdraw() does. Freezing stops value from leaving; it
-        does not stop internal reshuffling.
+        The honest form of what ``payout_from_locked`` approximates: "which pot
+        did this come from?" has an answer, so the ledger can record it and the
+        pot that answers for the money is the pot that was named.
+
+        Every rule about whether the money may leave is the pot's, reached
+        through ``Fund.pay`` - which is where the maturity date and the
+        business-pot exemption live, and where ``committed_at`` is judged. This
+        method exists only to be the wallet's door to it, and to hold the two
+        status refusals that are the wallet's own.
+
+        A payout reduces what the wallet holds - value actually leaves - so it
+        refuses a frozen wallet exactly as ``withdraw`` does. Freezing stops
+        value from leaving; it does not stop internal reshuffling.
+        """
+        if self.status == WalletStatus.CLOSED:
+            raise WalletClosedError("this wallet is closed")
+
+        if self.status == WalletStatus.FROZEN:
+            raise WalletFrozenError("this wallet is frozen")
+
+        self.fund_by_id(fund_id).pay(amount, as_of, committed_at)
+
+    def payout_from_locked(self, amount: Money, as_of: datetime) -> None:
+        """Send money out of the wallet, spending the locked pots oldest first.
+
+        **This is the legacy pooled draw, and it is reached only by a plan saved
+        before pots could be named.** ``savings_plans.fund_id`` is nullable, and
+        ``NULL`` means exactly this: the plan has no pot, so there is no honest
+        single answer to "which pot did this come from?" and this spends the
+        oldest matured pot first and records nothing. Every plan created now
+        names its pot and goes through ``payout_from_fund`` instead.
+
+        It is kept rather than deleted because a plan that exists on disk has to
+        keep working. It is invisible in practice: the only pots that can
+        predate it are the single open ``"Locked"`` pot the migration created for
+        each wallet, which has no maturity date and so is always spendable.
+
+        The distinction that matters against ``withdraw``: releasing and locking
+        only *move* money between balances, so the wallet still holds it all. A
+        payout reduces what the wallet holds - value actually leaves - which is
+        why it refuses a frozen wallet exactly as ``withdraw()`` does.
 
         Which pot pays is ``_draw_from_matured``'s answer, not this method's -
-        see there for the rule and for why it is temporary.
+        see there for the rule.
         """
         if self.status == WalletStatus.CLOSED:
             raise WalletClosedError("this wallet is closed")
@@ -259,9 +319,17 @@ class Wallet:
         """Move money out of the locked pots, back into the available balance.
 
         The pooled counterpart of ``release_from_fund``, and the one a *plan's*
-        RELEASE instruction reaches: a plan in this phase names no pot, exactly as
-        its payouts do not, so the same placeholder draw applies. Naming a pot on
-        a plan is the next phase's work.
+        RELEASE instruction reaches **when the plan is old enough not to name a
+        pot**: a plan saved before pots could be named has no ``fund_id``, so the
+        same placeholder draw applies to it. A plan created now names its pot and
+        is released through ``release_from_fund`` instead, exactly as its payouts
+        go through ``payout_from_fund``.
+
+        Kept rather than deleted for the reason ``payout_from_locked`` is: a plan
+        that exists on disk has to keep working. Unlike the payout, though, there
+        is no behavioural difference to preserve - a release is refused by a
+        sealed pot whether or not a pot was named - so what survives here is only
+        the bookkeeping for plans that cannot name one.
 
         No frozen check, deliberately. The wallet still holds every unit
         afterwards - only which balance holds it has changed - so this stays
@@ -300,13 +368,14 @@ class Wallet:
         never the whole locked balance. That is the rule the product is built on:
         money you reserved does not leave early because something else wanted it.
 
-        **The draw order and the missing ledger attribution are placeholders**,
-        and both are deliberate. "Which pot did this come from?" has no honest
-        single answer while several pots may fund one payment, so this spends the
-        oldest opened first and records no pot on the ledger row at all, rather
-        than recording a split nobody asked for. The real answer is for the
-        payment to name its pot, which the next phase brings; until then this is
-        the least-wrong rule available and it is written down as such.
+        **The draw order is still oldest-first, and it now has exactly one
+        caller.** When pots are the locked balance and a payment names its pot,
+        the interesting question - "which pot did this come from?" - has a real
+        answer, so this loop is reached only by the two pooled moves that
+        deliberately have none: the legacy payout for a pre-pots plan
+        (``payout_from_locked``), and ``release_from_locked``, which was always a
+        pool. For those, spending the oldest opened first is the least-wrong rule
+        available and is written down as such.
         """
         if amount.currency != self.currency:
             raise CurrencyMismatchError("currency must be the same")

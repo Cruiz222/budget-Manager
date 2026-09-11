@@ -60,7 +60,7 @@ def a_wallet_with_a_pot(
     wallet = build_wallet(**kwargs)
     pot = wallet.open_fund("Vacation", FundKind.PERSONAL, maturity_date=maturity_date)
     if Decimal(balance) != 0:
-        wallet.deposit_into_fund(pot.fund_id, Money(Decimal(balance), NGN))
+        wallet.deposit_into_fund(pot.fund_id, Money(Decimal(balance), NGN), MOMENT)
     wallet.status = status
     return wallet
 
@@ -288,8 +288,8 @@ def test_a_release_drains_the_named_pot_and_not_another(build_wallet):
     wallet = build_wallet(available="0")
     vacation = wallet.open_fund("Vacation", FundKind.PERSONAL)
     salary = wallet.open_fund("Salary", FundKind.PERSONAL)
-    wallet.deposit_into_fund(vacation.fund_id, ngn("3000"))
-    wallet.deposit_into_fund(salary.fund_id, ngn("3000"))
+    wallet.deposit_into_fund(vacation.fund_id, ngn("3000"), MOMENT)
+    wallet.deposit_into_fund(salary.fund_id, ngn("3000"), MOMENT)
 
     ReleaseFromFund(wallet, InMemoryTransactionRepository(), "Salary", MOMENT).execute(
         ngn("3000"), internal_reference=str(uuid4())

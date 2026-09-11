@@ -144,6 +144,26 @@ class SavingsPlanNotFoundError(PlanError):
     pass
 
 
+class InvalidPlanFundIDError(PlanError):
+    pass
+
+
+class FundRequiresLockedSourceError(PlanError):
+    pass
+
+
+class CommittedPayoutRemovalError(PlanError):
+    pass
+
+
+class MissingPlanFundError(PlanError):
+    pass
+
+
+class UnexpectedPlanFundError(PlanError):
+    pass
+
+
 # --- PlanRun ----------------------------------------------------------------
 
 

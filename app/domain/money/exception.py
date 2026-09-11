@@ -115,6 +115,10 @@ class InvalidFundBalanceError(MoneyError):
     pass
 class InvalidFundCreatedAtError(MoneyError):
     pass
+class InvalidFundSealedAtError(MoneyError):
+    pass
+class InvalidFundFirstFundedAtError(MoneyError):
+    pass
 class DuplicateFundNameError(MoneyError):
     pass
 class FundNotFoundError(MoneyError):

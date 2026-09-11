@@ -89,6 +89,25 @@ def opened_wallet_id(db_path, capsys, currency="NGN"):
     return match.group(1)
 
 
+def opened_wallet_with_pot(db_path, capsys, name="Savings", kind="personal"):
+    """A wallet with one *empty* pot - the least a locked plan can name.
+
+    Split out of ``funded_locked_wallet`` because two of the plan tests want the
+    pot without the money: a locked-source plan must name a pot, but nothing says
+    the pot has to hold anything, and "the plan exists before it is affordable"
+    is one of the product's rules. Building it from the funded fixture would
+    quietly fund those tests too and turn a test about planning into a test about
+    paying.
+    """
+    wallet_id = opened_wallet_id(db_path, capsys)
+    assert run(
+        db_path, "fund", "open", "--wallet", wallet_id,
+        "--name", name, "--kind", kind,
+    ) == 0
+    capsys.readouterr()
+    return wallet_id
+
+
 def funded_locked_wallet(db_path, capsys, amount="100000"):
     """A wallet with ``amount`` sitting in an open pot called "Savings".
 
@@ -98,12 +117,8 @@ def funded_locked_wallet(db_path, capsys, amount="100000"):
     plan tests below are about plans, and a sealed pot here would make every one
     of them a test about maturity instead.
     """
-    wallet_id = opened_wallet_id(db_path, capsys)
+    wallet_id = opened_wallet_with_pot(db_path, capsys)
     assert run(db_path, "deposit", wallet_id, amount) == 0
-    assert run(
-        db_path, "fund", "open", "--wallet", wallet_id,
-        "--name", "Savings", "--kind", "personal",
-    ) == 0
     assert run(db_path, "fund", "lock", wallet_id, "Savings", amount) == 0
     capsys.readouterr()
     return wallet_id
@@ -123,8 +138,13 @@ PLAN_ID_LINE = re.compile(
 )
 
 
-def create_salary_plan(db_path, wallet_id, start="2026-01-01", *extra):
+def create_salary_plan(db_path, wallet_id, start="2026-01-01", *extra, pot="Savings"):
     """Create the headline plan and return the exit code.
+
+    ``--from-fund`` is not optional in spirit: a locked-source plan must name the
+    pot it draws from, so a helper that left it out would be testing a refusal
+    rather than a plan. ``Savings`` is the pot ``funded_locked_wallet`` opens, so
+    the default pairs this helper with that fixture.
 
     Deliberately does *not* touch ``capsys``. It used to clear the capture on
     the way out, which made the two tests that assert on a *failed* create see
@@ -141,6 +161,8 @@ def create_salary_plan(db_path, wallet_id, start="2026-01-01", *extra):
         "Salary 2026",
         "--source",
         "locked",
+        "--from-fund",
+        pot,
         "--every",
         "monthly",
         "--from",
@@ -186,6 +208,8 @@ class TestCreating:
             "split",
             "--source",
             "locked",
+            "--from-fund",
+            "Savings",
             "--every",
             "monthly",
             "--from",
@@ -215,7 +239,7 @@ class TestCreating:
         takes when planning to save up.
         """
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys)
+        wallet_id = opened_wallet_with_pot(db, capsys)
 
         assert create_salary_plan(db, wallet_id) == 0
         # Discard the create's own output. Without this the assertion below
@@ -241,6 +265,120 @@ class TestCreating:
 
         assert run(db, "plan", "list", wallet_id) == 0
         assert "20000.00 USD" in capsys.readouterr().out
+
+
+class TestNamingThePot:
+    """``--from-fund``, and the two combinations the service refuses.
+
+    The flag is ordinary argparse, but *when* it is required is not: it is
+    required exactly when the source is ``locked``. That makes it the one
+    argument on this command whose validity depends on another argument's value,
+    so it is worth pinning from the outside rather than trusting the service
+    tests to describe what a user sees.
+    """
+
+    def test_a_locked_plan_names_its_pot_and_show_says_so(self, tmp_path, capsys):
+        """The round trip a user actually makes: create it, then look at it.
+
+        ``plan show`` printing ``pot:`` is the entire payoff of Phase B for
+        somebody at a terminal. The plan holds a ``fund_id`` - correct for the
+        aggregate, useless to a human - so the command resolves it to the name,
+        and that translation has no other way to be observed.
+        """
+        db = str(tmp_path / "cli.db")
+        wallet_id = funded_locked_wallet(db, capsys)
+
+        assert create_salary_plan(db, wallet_id) == 0
+        capsys.readouterr()
+        plan_id = plan_id_from(db, wallet_id, capsys)
+        capsys.readouterr()
+
+        assert run(db, "plan", "show", plan_id) == 0
+        assert "pot: Savings" in capsys.readouterr().out
+
+    def test_a_locked_plan_must_name_a_pot(self, tmp_path, capsys):
+        """Omitting the flag is refused, and the refusal says what to do.
+
+        Not an argparse error - the wallet has to be read before it can be known
+        that a locked plan needs a pot at all, and argparse cannot see that. So
+        this is a domain refusal: exit 1 with a message, not exit 2 with a usage
+        block.
+        """
+        db = str(tmp_path / "cli.db")
+        wallet_id = funded_locked_wallet(db, capsys)
+
+        assert run(db, "plan", "create", "--wallet", wallet_id,
+                   "--name", "Salary 2026", "--source", "locked",
+                   "--every", "monthly", "--from", "2026-01-01",
+                   *salary_lines()) == 1
+        assert "must name the pot" in capsys.readouterr().err
+
+    def test_an_available_plan_may_not_name_a_pot(self, tmp_path, capsys):
+        """The other direction, and it is not merely redundant - it is wrong.
+
+        An available-balance plan spends the wallet's spendable money, which is
+        not in any pot. Accepting the flag would record a commitment the run
+        could never honour, and the user would find that out when the payout
+        quietly came from somewhere else.
+        """
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_with_pot(db, capsys)
+
+        assert run(db, "plan", "create", "--wallet", wallet_id,
+                   "--name", "Salary 2026", "--source", "available",
+                   "--from-fund", "Savings",
+                   "--every", "monthly", "--from", "2026-01-01",
+                   *salary_lines()) == 1
+        assert "only a plan that spends the locked balance" in capsys.readouterr().err
+
+    def test_an_unknown_pot_is_refused_at_creation(self, tmp_path, capsys):
+        """Named rather than discovered later, which is the point of naming it.
+
+        The check happens while the wallet is in hand at creation time. The
+        alternative - accepting any string and failing on the first tick - would
+        turn a typo into a payment that silently does not go out.
+        """
+        db = str(tmp_path / "cli.db")
+        wallet_id = funded_locked_wallet(db, capsys)
+
+        assert create_salary_plan(db, wallet_id, pot="No Such Pot") == 1
+        assert "error:" in capsys.readouterr().err
+
+    def test_an_available_plan_shows_the_pooled_draw(self, tmp_path, capsys):
+        """``(pooled)`` rather than a blank line, for a plan that names no pot.
+
+        A plan with no pot is not a plan with a missing value. An available plan
+        never had one, and holds none permanently - so the line has to say
+        something true and legible rather than render as an empty field.
+        """
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_id(db, capsys)
+
+        assert run(db, "plan", "create", "--wallet", wallet_id, "--name", "Spends",
+                   "--source", "available", "--every", "monthly",
+                   "--from", "2026-01-01", *salary_lines()) == 0
+        capsys.readouterr()
+        plan_id = plan_id_from(db, wallet_id, capsys)
+        capsys.readouterr()
+
+        assert run(db, "plan", "show", plan_id) == 0
+        assert "pot: (pooled)" in capsys.readouterr().out
+
+    def test_plan_edit_cannot_change_the_pot(self, tmp_path, capsys):
+        """The flag is absent, so argparse refuses it before anything runs.
+
+        Deliberate, and the reason is the rule itself: pointing an existing
+        commitment at a different pot is the redirect the whole commitment test
+        exists to stop, arriving through the one door that test cannot see -
+        the new pot would be judged against the plan's *old* creation moment.
+        Getting it wrong is recoverable, since cancelling frees nothing, but it
+        is not something to offer a user.
+        """
+        db = str(tmp_path / "cli.db")
+
+        with pytest.raises(SystemExit) as excinfo:
+            run(db, "plan", "edit", str(uuid4()), "--from-fund", "Savings")
+        assert excinfo.value.code == 2
 
 
 class TestTheTerm:
@@ -366,7 +504,10 @@ class TestTicking:
 
     def test_an_unfunded_plan_is_blocked_and_reports_why(self, tmp_path, capsys):
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys)
+        # A pot, but nothing in it: the plan is legal and unaffordable, which is
+        # the case this test is about. A wallet with no pot at all could not
+        # carry the plan in the first place.
+        wallet_id = opened_wallet_with_pot(db, capsys)
         create_salary_plan(db, wallet_id)
 
         assert run(db, "plan", "tick", "--as-of", "2026-01-01") == 0
@@ -383,7 +524,7 @@ class TestTicking:
         would simply have gone quiet with nothing anywhere to explain it.
         """
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys)
+        wallet_id = opened_wallet_with_pot(db, capsys)
         create_salary_plan(db, wallet_id)
         run(db, "plan", "tick", "--as-of", "2026-01-01")
         capsys.readouterr()
@@ -553,9 +694,12 @@ class TestTheWarningBeforeAPayout:
         Nothing is locked here, so noon will block - and 11:30 still warns. If
         the warning consulted the balance it would go quiet exactly when the user
         most needs to hear that a payment is about to fail.
+
+        "Nothing is locked" means an *empty* pot, not no pot: the plan has to
+        name one to exist at all, and the wallet is where that pot lives.
         """
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys)
+        wallet_id = opened_wallet_with_pot(db, capsys)
         create_salary_plan(db, wallet_id, self.NOON)
         capsys.readouterr()
 
@@ -914,7 +1058,8 @@ class TestTheReceiptAfterThePayout:
         wallet_id = funded_locked_wallet(db, capsys, "500000")
         run(
             db, "plan", "create", "--wallet", wallet_id, "--name", "split",
-            "--source", "locked", "--every", "monthly", "--from", "2026-01-01",
+            "--source", "locked", "--from-fund", "Savings",
+            "--every", "monthly", "--from", "2026-01-01",
             "--pay", "20000", "0123456789", "058", "Chinedu Okafor", "salary",
             "--pay", "15000", "0987654321", "058", "Ada Nwosu", "rent",
         )
@@ -943,7 +1088,7 @@ class TestTheReceiptAfterThePayout:
         monkeypatch.setenv("SMTP_USER", "me@example.com")
         monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys)
+        wallet_id = opened_wallet_with_pot(db, capsys)
         create_salary_plan(db, wallet_id)
         receipts = build_channel()
         install_notification_deliverer(monkeypatch, receipts)
@@ -1109,7 +1254,8 @@ class TestSteering:
         db = str(tmp_path / "cli.db")
         wallet_id = funded_locked_wallet(db, capsys)
         run(db, "plan", "create", "--wallet", wallet_id, "--name", "Unlock",
-            "--source", "locked", "--every", "monthly", "--from", "2026-01-01",
+            "--source", "locked", "--from-fund", "Savings",
+            "--every", "monthly", "--from", "2026-01-01",
             "--for", "6", "months", "--release", "5000", "emergency")
         capsys.readouterr()
         plan_id = plan_id_from(db, wallet_id, capsys)
@@ -1122,7 +1268,8 @@ class TestSteering:
         db = str(tmp_path / "cli.db")
         wallet_id = funded_locked_wallet(db, capsys)
         run(db, "plan", "create", "--wallet", wallet_id, "--name", "Unlock",
-            "--source", "locked", "--every", "monthly", "--from", "2026-01-01",
+            "--source", "locked", "--from-fund", "Savings",
+            "--every", "monthly", "--from", "2026-01-01",
             "--for", "6", "months", "--release", "5000", "emergency")
         capsys.readouterr()
 
@@ -1139,7 +1286,8 @@ class TestSteering:
         wallet_id = funded_locked_wallet(db, capsys)
 
         assert run(db, "plan", "create", "--wallet", wallet_id, "--name", "Unlock",
-                   "--source", "locked", "--every", "monthly", "--from",
+                   "--source", "locked", "--from-fund", "Savings",
+                   "--every", "monthly", "--from",
                    "2026-01-01", "--release", "5000", "emergency") == 1
         assert "error:" in capsys.readouterr().err
 
@@ -1209,7 +1357,8 @@ class TestUsage:
         wallet_id = funded_locked_wallet(db, capsys)
 
         assert run(db, "plan", "create", "--wallet", wallet_id, "--name", "empty",
-                   "--source", "locked", "--every", "monthly",
+                   "--source", "locked", "--from-fund", "Savings",
+                   "--every", "monthly",
                    "--from", "2026-01-01") == 1
         assert "error:" in capsys.readouterr().err
 

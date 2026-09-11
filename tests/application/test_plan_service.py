@@ -8,16 +8,23 @@ from app.application.plan_service import PlanService
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
-from app.domain.money.exception import CurrencyMismatchError, WalletNotFoundError
+from app.domain.money.exception import (
+    CurrencyMismatchError,
+    FundNotFoundError,
+    WalletNotFoundError,
+)
+from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.planning.cadence import Cadence
 from app.domain.planning.exception import (
     EmptyPlanInstructionsError,
     IrreversibleReleasePlanError,
+    MissingPlanFundError,
     PlanAlreadyFinishedError,
     PlanNotActiveError,
     PlanNotPausedError,
     SavingsPlanNotFoundError,
+    UnexpectedPlanFundError,
 )
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.plannedAction import PlannedAction
@@ -56,6 +63,22 @@ def save_wallet(factory, wallet):
     return wallet
 
 
+def stored_wallet(factory, wallet_id):
+    """Read a wallet back from the store, as the service would.
+
+    Needed because a service call is its own unit of work: it loads its own copy
+    of the aggregate, changes it, and commits. The object a test was handed is a
+    snapshot from before that, so a change the service made - opening a pot, most
+    of all - is invisible on it. Asking the database is the only way to see what
+    actually landed.
+    """
+    uow = factory.start()
+    try:
+        return uow.wallets.get_by_id(wallet_id)
+    finally:
+        uow.rollback()
+
+
 def payout(amount: str, currency: Currency = NGN, label: str = "salary") -> Instruction:
     return Instruction(
         action=PlannedAction.PAYOUT,
@@ -73,13 +96,59 @@ def release(amount: str, currency: Currency = NGN, label: str = "unlock") -> Ins
     )
 
 
-def create(service, wallet_id, instructions=None, **overrides):
+def open_pot(factory, wallet_id, name="Savings"):
+    """Give a wallet an empty pot, the way ``fund open`` does.
+
+    Needed because a locked-source plan must now name the pot it draws from, and
+    most of this file is not about pots at all - it is about creating, reading and
+    steering plans. Opening one here keeps those tests describing what they always
+    described: a plan in the ordinary shape, which now includes a pot.
+
+    Idempotent on purpose. ``test_a_wallets_plans_all_come_back`` creates two
+    plans against one wallet, and a second ``open`` of the same name is a
+    duplicate the wallet would rightly refuse.
+    """
+    uow = factory.start()
+    try:
+        wallet = uow.wallets.get_by_id(wallet_id)
+        if not any(fund.name == name for fund in wallet.funds):
+            wallet.open_fund(name, FundKind.PERSONAL, as_of=ANCHOR)
+        uow.wallets.save(wallet)
+        uow.commit()
+    except BaseException:
+        uow.rollback()
+        raise
+
+
+def create(service, factory, wallet_id, instructions=None, **overrides):
+    """Create a plan through the service, with a pot opened for it if it needs one.
+
+    ``fund_name`` is not an ``override`` the way ``source`` is: when the source is
+    locked the pot is opened first and named on the way through, because that is
+    what the CLI does and what the rule now requires. A test that wants the two
+    bad pairings - a locked plan with no pot, an available plan naming one -
+    says so explicitly and bypasses this helper, which is the point of it being a
+    convenience rather than the only door.
+
+    Note the ``is not None`` on the ``open_pot`` call, which is not defensive
+    padding. A test that passes ``fund_name=None`` is asking for the *refusal*,
+    and opening a pot called ``None`` first would raise ``InvalidFundNameError``
+    from the pot before the rule under test was ever reached - the test would
+    still go red, but for a reason that has nothing to do with what it claims.
+    """
+    source = overrides.pop("source", PlanSource.LOCKED)
+    fund_name = overrides.pop(
+        "fund_name", "Savings" if source is PlanSource.LOCKED else None
+    )
+    if source is PlanSource.LOCKED and fund_name is not None:
+        open_pot(factory, wallet_id, fund_name)
     return service.create_plan(
         wallet_id=wallet_id,
         name=overrides.pop("name", "Salary 2026"),
-        source=overrides.pop("source", PlanSource.LOCKED),
+        source=source,
         schedule=overrides.pop("schedule", Schedule(Cadence.MONTHLY, ANCHOR)),
         instructions=instructions if instructions is not None else (payout("2000"),),
+        fund_name=fund_name,
         **overrides,
     )
 
@@ -89,7 +158,7 @@ class TestCreatingAPlan:
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
 
-        plan = create(service, wallet.wallet_id, name="Salary 2026")
+        plan = create(service, factory, wallet.wallet_id, name="Salary 2026")
 
         assert service.get_plan(plan.plan_id).name == "Salary 2026"
 
@@ -105,7 +174,7 @@ class TestCreatingAPlan:
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet(available="0", locked="0"))
 
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
 
         assert plan.total_to_move == Money(Decimal("2000"), NGN)
         assert service.get_plan(plan.plan_id).status is PlanStatus.ACTIVE
@@ -116,6 +185,7 @@ class TestCreatingAPlan:
 
         plan = create(
             service,
+            factory,
             wallet.wallet_id,
             instructions=(release("1000"),),
             ends_on=date(2027, 1, 1),
@@ -137,7 +207,7 @@ class TestTheCurrencyRule:
         wallet = save_wallet(factory, build_wallet(currency=USD))
 
         with pytest.raises(CurrencyMismatchError):
-            create(service, wallet.wallet_id, instructions=(payout("2000", NGN),))
+            create(service, factory, wallet.wallet_id, instructions=(payout("2000", NGN),))
 
     def test_a_refused_plan_leaves_nothing_behind(self, tmp_path, build_wallet):
         """The check runs *before* the save, so a refusal writes nothing.
@@ -150,7 +220,7 @@ class TestTheCurrencyRule:
         wallet = save_wallet(factory, build_wallet(currency=USD))
 
         with pytest.raises(CurrencyMismatchError):
-            create(service, wallet.wallet_id, instructions=(payout("2000", NGN),))
+            create(service, factory, wallet.wallet_id, instructions=(payout("2000", NGN),))
 
         assert service.plans_for_wallet(wallet.wallet_id) == []
 
@@ -158,9 +228,131 @@ class TestTheCurrencyRule:
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet(currency=USD))
 
-        plan = create(service, wallet.wallet_id, instructions=(payout("2000", USD),))
+        plan = create(service, factory, wallet.wallet_id, instructions=(payout("2000", USD),))
 
         assert plan.total_to_move.currency is USD
+
+
+class TestThePotRule:
+    """Which source may name a pot, and what happens if you get it the wrong way round.
+
+    Four rows, and they are a *pairing* rather than two independent choices:
+
+        source      fund_name   outcome
+        locked      given       accepted - the plan draws on that pot
+        locked      omitted     refused  - a locked plan must name its pot
+        available   omitted     accepted
+        available   given       refused  - an available plan spends no pot
+
+    The two refusals are deliberately not symmetric. "A locked plan must name a
+    pot" is a rule the *use case* holds, not the aggregate, because a plan saved
+    before pots could be named has no pot and must keep working; "an available
+    plan may not name one" is held by both, at different doors.
+    """
+
+    def test_a_locked_plan_naming_a_pot_is_accepted(self, tmp_path, build_wallet):
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+
+        plan = create(
+            service,
+            factory,
+            wallet.wallet_id,
+            fund_name="Vacation",
+        )
+
+        assert plan.fund_id is not None
+        # Resolved from the name to the wallet's own pot, not invented: the plan
+        # has to point at a real row, or the first run fails looking it up.
+        #
+        # Read back rather than asked of the local ``wallet``, because ``create``
+        # opens the pot in its own unit of work - the object above is a snapshot
+        # from before the pot existed.
+        assert plan.fund_id == stored_wallet(
+            factory, wallet.wallet_id
+        ).fund_by_name("Vacation").fund_id
+
+    def test_a_locked_plan_naming_no_pot_is_refused(self, tmp_path, build_wallet):
+        """The rule that makes the whole commitment meaningful.
+
+        A plan that draws on the locked balance without saying which pot has no
+        commitment for ``authorises_early_payout`` to judge - it would be a plan
+        that spends whatever is there, which is the pooled behaviour this phase
+        removed.
+        """
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+
+        with pytest.raises(MissingPlanFundError):
+            create(service, factory, wallet.wallet_id, fund_name=None)
+
+    def test_an_available_plan_naming_a_pot_is_refused(self, tmp_path, build_wallet):
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+
+        with pytest.raises(UnexpectedPlanFundError):
+            create(
+                service,
+                factory,
+                wallet.wallet_id,
+                source=PlanSource.AVAILABLE,
+                fund_name="Vacation",
+            )
+
+    def test_the_pairing_is_judged_before_the_pot_is_looked_up(
+        self, tmp_path, build_wallet
+    ):
+        """A nonsense name on the wrong source is refused for the pairing.
+
+        The order of the two checks is observable, and this test exists to make
+        it so. Refusing ``--source available --from-fund Nonsense`` for an
+        unknown pot would send the user off to check a pot that was never going
+        to be used; the pairing is the thing they got wrong.
+        """
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+
+        with pytest.raises(UnexpectedPlanFundError):
+            create(
+                service,
+                factory,
+                wallet.wallet_id,
+                source=PlanSource.AVAILABLE,
+                fund_name="No Such Pot",
+            )
+
+    def test_an_available_plan_naming_no_pot_is_accepted(self, tmp_path, build_wallet):
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+
+        plan = create(
+            service,
+            factory,
+            wallet.wallet_id,
+            source=PlanSource.AVAILABLE,
+        )
+
+        assert plan.fund_id is None
+
+    def test_an_unknown_pot_is_refused_at_creation(self, tmp_path, build_wallet):
+        """Refused when a human typed the name, not weeks later at the first run.
+
+        The pot is *loaded* rather than merely recorded, which is what turns a
+        typo from a scheduler surprise into a refusal at the terminal - and it
+        costs nothing, because the wallet is already open for the currency rule.
+        """
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+
+        with pytest.raises(FundNotFoundError):
+            service.create_plan(
+                wallet_id=wallet.wallet_id,
+                name="Salary 2026",
+                source=PlanSource.LOCKED,
+                schedule=Schedule(Cadence.MONTHLY, ANCHOR),
+                instructions=(payout("2000"),),
+                fund_name="No Such Pot",
+            )
 
 
 class TestReading:
@@ -188,8 +380,8 @@ class TestReading:
     def test_a_wallets_plans_all_come_back(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        first = create(service, wallet.wallet_id, name="rent")
-        second = create(service, wallet.wallet_id, name="salary")
+        first = create(service, factory, wallet.wallet_id, name="rent")
+        second = create(service, factory, wallet.wallet_id, name="salary")
 
         plans = service.plans_for_wallet(wallet.wallet_id)
 
@@ -202,7 +394,7 @@ class TestReading:
     def test_a_plan_with_no_runs_has_empty_history(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
 
         assert service.runs_for_plan(plan.plan_id) == []
 
@@ -217,7 +409,7 @@ class TestSteering:
     def test_pause_then_resume_round_trip(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
 
         assert service.pause_plan(plan.plan_id).status is PlanStatus.PAUSED
         assert service.resume_plan(plan.plan_id).status is PlanStatus.ACTIVE
@@ -225,7 +417,7 @@ class TestSteering:
     def test_pausing_twice_is_refused(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
         service.pause_plan(plan.plan_id)
 
         with pytest.raises(PlanNotActiveError):
@@ -234,7 +426,7 @@ class TestSteering:
     def test_resuming_an_active_plan_is_refused(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
 
         with pytest.raises(PlanNotPausedError):
             service.resume_plan(plan.plan_id)
@@ -242,14 +434,14 @@ class TestSteering:
     def test_cancel_ends_the_plan(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
 
         assert service.cancel_plan(plan.plan_id).status is PlanStatus.CANCELLED
 
     def test_cancelling_a_cancelled_plan_is_refused(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
         service.cancel_plan(plan.plan_id)
 
         with pytest.raises(PlanAlreadyFinishedError):
@@ -266,6 +458,7 @@ class TestSteering:
         wallet = save_wallet(factory, build_wallet())
         plan = create(
             service,
+            factory,
             wallet.wallet_id,
             instructions=(release("1000"),),
             ends_on=date(2027, 1, 1),
@@ -281,7 +474,7 @@ class TestEditing:
     def test_editing_replaces_the_lines(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id, name="salary")
+        plan = create(service, factory, wallet.wallet_id, name="salary")
 
         updated = service.edit_instructions(plan.plan_id, (payout("3000", label="raise"),))
 
@@ -293,6 +486,7 @@ class TestEditing:
         wallet = save_wallet(factory, build_wallet())
         plan = create(
             service,
+            factory,
             wallet.wallet_id,
             instructions=(release("1000"),),
             ends_on=date(2027, 1, 1),
@@ -309,10 +503,17 @@ class TestEditing:
         The aggregate checks the candidate before it assigns, so a refused edit
         is not a half-applied one. This is the observable consequence of that
         ordering, which is why it is worth a test rather than a comment.
+
+        The empty list is refused here by ``EmptyPlanInstructionsError`` because
+        this plan names no pot. On a pot-named plan the committed-payout rule
+        refuses it first - a different refusal, with its own test
+        (``test_a_committed_plan_may_not_drop_its_payout``). This test is about
+        the ordering of *validation against assignment*, so it takes the plain
+        plan and leaves the pot rule to where it belongs.
         """
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id, source=PlanSource.AVAILABLE)
 
         with pytest.raises(EmptyPlanInstructionsError):
             service.edit_instructions(plan.plan_id, ())
@@ -324,7 +525,7 @@ class TestEditing:
     def test_editing_a_cancelled_plan_is_refused(self, tmp_path, build_wallet):
         service, factory = build_service(tmp_path)
         wallet = save_wallet(factory, build_wallet())
-        plan = create(service, wallet.wallet_id)
+        plan = create(service, factory, wallet.wallet_id)
         service.cancel_plan(plan.plan_id)
 
         with pytest.raises(PlanNotActiveError):
@@ -341,7 +542,7 @@ def test_the_services_own_reads_see_committed_writes(tmp_path, build_wallet):
     service, factory = build_service(tmp_path)
     wallet = save_wallet(factory, build_wallet())
 
-    plan = create(service, wallet.wallet_id, name="salary")
+    plan = create(service, factory, wallet.wallet_id, name="salary")
 
     assert [one.name for one in service.plans_for_wallet(wallet.wallet_id)] == ["salary"]
     assert service.get_plan(plan.plan_id).wallet_id == wallet.wallet_id

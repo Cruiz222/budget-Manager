@@ -9,7 +9,11 @@ from datetime import date
 
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.domain.money.exception import CurrencyMismatchError
-from app.domain.planning.exception import SavingsPlanNotFoundError
+from app.domain.planning.exception import (
+    MissingPlanFundError,
+    SavingsPlanNotFoundError,
+    UnexpectedPlanFundError,
+)
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.planRun import PlanRun
 from app.domain.planning.planSource import PlanSource
@@ -46,32 +50,90 @@ class PlanService:
         schedule: Schedule,
         instructions: tuple[Instruction, ...],
         ends_on: date | None = None,
+        fund_name: str | None = None,
     ) -> SavingsPlan:
-        """Create a plan, refusing one whose currency the wallet cannot fund.
+        """Create a plan, refusing one the wallet cannot back or that names no pot.
 
-        That refusal is the reason this method exists rather than the CLI
-        constructing a ``SavingsPlan`` and saving it. The rule is:
+        Two cross-aggregate rules live here rather than in either aggregate,
+        because each needs both objects in hand at once and neither aggregate can
+        see the other. The currency rule is the original one; the pot rule
+        arrived with pots that can be named.
 
-            a plan's instructions must be denominated in the wallet's currency
+        **The pot rule, in four rows**, and the shape of it is a pairing rather
+        than two independent choices:
 
-        and it is a *cross-aggregate* rule - so neither aggregate can enforce it.
-        The plan cannot see the wallet, the wallet has never heard of a plan, and
-        giving either one a reference to the other to check it would dissolve the
-        boundary that makes them separately loadable in the first place. The use
-        case is the only place both are in hand at once, so the use case holds
-        the rule. This is the same reasoning as the plan's own docstring, seen
-        from the other side.
+            source       ``fund_name``  outcome
+            locked       given          accepted - the plan draws on that pot
+            locked       omitted        refused  - a locked plan must name its pot
+            available    omitted        accepted
+            available    given          refused  - an available plan spends no pot
 
-        Note what is deliberately *not* checked: whether the wallet's locked
-        balance covers the plan. Per the product rule, the scheduler does not
-        concern itself with whether the money is there - it discovers that when
-        a run fires, and records a blocked run if it is not. Checking here would
-        mean a plan could not exist before it was affordable, which is backwards
-        for a savings plan whose whole purpose is to become affordable.
+        The two refusals are *not* symmetric, and the asymmetry is the product
+        decision. A locked-source payout has to know which pot it takes the money
+        from, now that "the locked balance" is a sum over several pots and not a
+        number. An available-source plan spends the wallet's spendable balance,
+        which has no pots in it at all.
+
+        **The pot arrives as a name, and is resolved to an id here.** That is the
+        same arrangement every pot-scoped operation uses (see
+        ``WalletService.deposit_into_fund``): a name is what a human types, an id
+        is what a row stores, and only the loaded wallet can turn one into the
+        other. It matters for more than tidiness on this method, because it is
+        also what makes the *order* of the two refusals right - the pairing is
+        judged before the name is looked up, so ``--source available --from-fund
+        Nonsense`` is refused for the pairing rather than for a name that was
+        never going to be used. Resolving in the CLI instead would have meant the
+        CLI knew the pairing rule, which is the duplication this method exists to
+        avoid.
+
+        **A named pot is loaded, not merely recorded.** ``wallet.fund_by_name``
+        is called for exactly that reason: a plan naming a pot the wallet does
+        not have should be refused here, at the moment a human typed the name,
+        rather than at the first run - possibly weeks later, by a scheduler
+        nobody is watching. Loading it is what turns "unknown pot" from a runtime
+        surprise into a creation-time refusal, and it costs nothing, because the
+        wallet is already loaded for the currency rule.
+
+        **Why the pairing is checked here and the aggregate checks its own half.**
+        ``SavingsPlan._validate_instructions`` independently refuses a ``fund_id``
+        on anything but a locked-source plan, so on the creation path the
+        available-with-a-pot row below is refused before the aggregate ever sees
+        it and the aggregate's check is unreachable *from here*. That is not
+        duplication to be tidied away: the aggregate's rule is what keeps the
+        state from existing at all - through hydration, through a direct
+        construction, through ``edit_instructions`` - and this one exists so the
+        refusal names the two arguments the caller actually passed. Findings
+        differ by door; the invariant does not.
+
+        Note what is *still* deliberately not checked: whether the pot holds
+        enough, or whether it has matured. Per the product rule, the scheduler
+        does not concern itself with whether the money is there or ripe - it
+        discovers that when a run fires, and records a blocked run if it is not.
+        Checking here would mean a plan could not exist before it was
+        affordable, which is backwards for a savings plan whose whole purpose is
+        to become affordable.
         """
+        # Before the unit of work opens, because these two need nothing from
+        # storage and there is no transaction worth starting just to refuse one.
+        if source is PlanSource.LOCKED and fund_name is None:
+            raise MissingPlanFundError(
+                "a plan that spends the locked balance must name the pot it "
+                "draws from; pass the pot's name"
+            )
+        if source is not PlanSource.LOCKED and fund_name is not None:
+            raise UnexpectedPlanFundError(
+                "only a plan that spends the locked balance can name a pot; "
+                "an available-balance plan has none to draw from"
+            )
+
         uow = self._unit_of_work_factory.start()
         try:
             wallet = uow.wallets.get_by_id(wallet_id)
+
+            # Raises FundNotFoundError for a pot this wallet does not have.
+            fund_id = None
+            if fund_name is not None:
+                fund_id = wallet.fund_by_name(fund_name).fund_id
 
             plan = SavingsPlan(
                 wallet_id=wallet_id,
@@ -80,6 +142,7 @@ class PlanService:
                 schedule=schedule,
                 _instructions=instructions,
                 ends_on=ends_on,
+                fund_id=fund_id,
             )
 
             # The aggregate has already guaranteed the instructions share one

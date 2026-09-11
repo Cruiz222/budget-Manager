@@ -251,6 +251,112 @@ def test_payout_without_a_destination_is_a_usage_error(tmp_path):
     assert excinfo.value.code == 2
 
 
+# --- payout --fund: naming the pot by hand -------------------------------
+
+#: A destination for the payout tests below, as the flat arguments the CLI takes.
+TO_BANK = ("--account", "0123456789", "--bank-code", "058", "--name", "Chinedu Okafor")
+
+
+def funded_pot(db_path, capsys, wallet_id, name, amount, kind="personal", matures=None):
+    """Open a pot and lock ``amount`` into it, in one call.
+
+    ``deposit`` then ``fund lock``, because a lock moves money that is already in
+    the wallet - it is the available balance being set aside, not money arriving
+    from outside. Returns the pot's name, which is the handle the commands take.
+    """
+    argv = ["fund", "open", "--wallet", wallet_id, "--name", name, "--kind", kind]
+    if matures is not None:
+        argv += ["--matures", matures]
+    assert run(db_path, *argv) == 0, capsys.readouterr().err
+    assert run(db_path, "fund", "lock", wallet_id, name, amount) == 0, (
+        capsys.readouterr().err
+    )
+    capsys.readouterr()
+    return name
+
+
+def test_payout_can_name_the_pot_it_draws_on(tmp_path, capsys):
+    """``--fund``, and the pot it names is the pot that goes down.
+
+    The manual counterpart to a scheduled payout, and the reason it is worth
+    having: the pooled draw has to be told which pot to spend, and ``--fund`` is
+    how a human tells it.
+    """
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+    funded_pot(db, capsys, wallet_id, "Rent", "6000")
+
+    assert run(db, "payout", wallet_id, "2000", "--fund", "Rent", *TO_BANK) == 0
+    out = capsys.readouterr().out
+    assert "paid 2000.00 NGN to Chinedu Okafor" in out
+    assert "locked 4000.00 NGN" in out
+
+
+def test_a_named_payout_may_not_reach_into_another_pot(tmp_path, capsys):
+    """Naming a pot is a commitment, not a preference.
+
+    The wallet holds 6000 across two pots and the payment is 2000, so the wallet
+    as a whole could easily afford it - which is exactly why this is the test.
+    Reaching into a second pot would make "this payout draws on Travel" mean
+    "whichever pot happens to cover it", and the user would learn the difference
+    when the wrong pot was empty.
+    """
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+    funded_pot(db, capsys, wallet_id, "Travel", "1000")
+    funded_pot(db, capsys, wallet_id, "Rent", "5000")
+
+    assert run(db, "payout", wallet_id, "2000", "--fund", "Travel", *TO_BANK) == 1
+    assert "error:" in capsys.readouterr().err
+
+    assert run(db, "balance", wallet_id) == 0
+    assert "locked: 6000.00 NGN" in capsys.readouterr().out
+
+
+def test_a_payout_naming_an_unknown_pot_is_an_error(tmp_path, capsys):
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+    funded_pot(db, capsys, wallet_id, "Rent", "6000")
+
+    assert run(db, "payout", wallet_id, "2000", "--fund", "Travel", *TO_BANK) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_an_adhoc_payout_will_not_spend_a_business_pot_early(tmp_path, capsys):
+    """The temptation route, closed at the command line as well as in the domain.
+
+    A business pot may fund a *scheduled* payment before its date. A hand-typed
+    payout is precisely not one - there is no plan behind it and so no commitment
+    that could have predated the money - so the pot refuses, and the refusal
+    reaches the user as an ordinary error rather than a payment that goes out.
+
+    Asserted through the CLI rather than the domain because that is where the
+    product rule is actually encountered: this is the command a tempted person
+    types.
+    """
+    db = str(tmp_path / "cli.db")
+    wallet_id = opened_wallet_id(db, capsys)
+    run(db, "deposit", wallet_id, "10000")
+    capsys.readouterr()
+    funded_pot(
+        db, capsys, wallet_id, "Supplier", "6000",
+        kind="business", matures="2030-01-01",
+    )
+
+    assert run(db, "payout", wallet_id, "2000", "--fund", "Supplier", *TO_BANK) == 1
+    assert "error:" in capsys.readouterr().err
+
+    # And the money is still where it was, which is the part that matters.
+    assert run(db, "balance", wallet_id) == 0
+    assert "locked: 6000.00 NGN" in capsys.readouterr().out
+
+
 def test_unknown_command_is_a_usage_error(tmp_path):
     db = str(tmp_path / "cli.db")
 

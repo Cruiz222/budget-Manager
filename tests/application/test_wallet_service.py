@@ -138,6 +138,7 @@ def test_lock_into_fund_moves_both_balances(tmp_path, build_wallet):
         "Vacation",
         Money(Decimal("3000"), NGN),
         internal_reference=str(uuid4()),
+        as_of=MOMENT,
     )
 
     stored = get_wallet(factory, wallet.wallet_id)
@@ -163,6 +164,7 @@ def test_deposit_into_fund_round_trips_through_sqlite(tmp_path, build_wallet):
         "Vacation",
         Money(Decimal("5000"), NGN),
         internal_reference=str(uuid4()),
+        as_of=MOMENT,
     )
 
     assert transaction.fund_id == fund.fund_id
@@ -544,7 +546,11 @@ class TestTheReceiptForAWalletCommand:
         seed(factory, wallet)
 
         service.lock_into_fund(
-            wallet.wallet_id, "Vacation", Money(Decimal("3000"), NGN), str(uuid4())
+            wallet.wallet_id,
+            "Vacation",
+            Money(Decimal("3000"), NGN),
+            str(uuid4()),
+            MOMENT,
         )
 
         assert notifications_of(factory) == []
@@ -580,7 +586,11 @@ class TestTheReceiptForAWalletCommand:
         seed(factory, wallet)
 
         service.deposit_into_fund(
-            wallet.wallet_id, "Vacation", Money(Decimal("5000"), NGN), str(uuid4())
+            wallet.wallet_id,
+            "Vacation",
+            Money(Decimal("5000"), NGN),
+            str(uuid4()),
+            MOMENT,
         )
 
         queued = notifications_of(factory)

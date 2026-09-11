@@ -1,5 +1,6 @@
+from datetime import datetime
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import sqlite3
@@ -13,6 +14,13 @@ from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.infrastructure.persistence.serialization import (
+    datetime_to_text,
+    enum_to_text,
+    instructions_to_text,
+    schedule_to_text,
+    uuid_to_text,
+)
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
     open_sqlite_connection,
@@ -497,5 +505,391 @@ def test_a_transaction_with_no_pot_round_trips_as_none(tmp_path, build_wallet):
     try:
         stored = fresh.transactions.get_by_id(transaction.transaction_id)
         assert stored.fund_id is None
+    finally:
+        fresh.rollback()
+
+
+# --- the migration that lets a commitment be judged against the money -----
+
+
+#: The ``wallets`` table after pots existed but before a commitment could be
+#: judged against one. Deliberately *without* ``locked_balance``, so the pot
+#: rows below are the only thing the migration under test has to look at and the
+#: older locked-balance migration stays out of the way.
+LEGACY_WALLETS_AFTER_POTS_SCHEMA = """
+CREATE TABLE wallets (
+    wallet_id         TEXT PRIMARY KEY,
+    user_id           TEXT NOT NULL,
+    currency          TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    available_balance TEXT NOT NULL
+);
+"""
+
+
+#: The ``funds`` and ``savings_plans`` tables exactly as they looked before
+#: Phase B. Two differences, and they are the whole subject: a pot carried no
+#: ``sealed_at`` and no ``first_funded_at``, and a plan carried no ``fund_id``.
+#: Written out rather than derived, for the reason the other legacy schemas are:
+#: these tests exist to simulate a database a real earlier release left behind.
+LEGACY_POTS_SCHEMA = """
+CREATE TABLE funds (
+    fund_id       TEXT PRIMARY KEY,
+    wallet_id     TEXT NOT NULL REFERENCES wallets(wallet_id),
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    balance       TEXT NOT NULL,
+    maturity_date TEXT,
+    created_at    TEXT NOT NULL,
+    UNIQUE (wallet_id, name)
+);
+
+CREATE TABLE savings_plans (
+    plan_id        TEXT PRIMARY KEY,
+    wallet_id      TEXT NOT NULL REFERENCES wallets(wallet_id),
+    name           TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    schedule       TEXT NOT NULL,
+    instructions   TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    completed_runs INTEGER NOT NULL,
+    ends_on        TEXT,
+    created_at     TEXT NOT NULL
+);
+"""
+
+#: One moment for every legacy row, so "which timestamp did the backfill use?"
+#: has an answer that a swapped column cannot also produce.
+LEGACY_MOMENT = datetime(2025, 6, 1, 12, 0)
+
+
+def legacy_pot_row(fund_id, wallet_id, name, balance, kind="PERSONAL"):
+    return (
+        fund_id,
+        wallet_id,
+        name,
+        kind,
+        balance,
+        None,
+        datetime_to_text(LEGACY_MOMENT),
+    )
+
+
+def build_pre_phase_b_database(db_path, pots, plans=()):
+    """A database written by the release before a plan could name a pot.
+
+    Already pot-shaped - the wallets table has no ``locked_balance``, so the
+    migration that moves one into a pot is a no-op and stays out of the way -
+    but written before a pot recorded when it was sealed or first funded.
+
+    Returns the raw connection, not a unit of work, because the caller is
+    usually about to write rows the *current* repository could not: a plan with
+    no ``fund_id`` column to write to.
+    """
+    legacy = sqlite3.connect(db_path, isolation_level=None)
+    legacy.executescript(LEGACY_WALLETS_AFTER_POTS_SCHEMA)
+    legacy.executescript(LEGACY_POTS_SCHEMA)
+    legacy.execute(
+        "INSERT INTO wallets VALUES (?, ?, ?, ?, ?)",
+        (WALLET_ID, USER_ID, "NGN", "ACTIVE", "10000.00"),
+    )
+    legacy.executemany(
+        "INSERT INTO funds VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [legacy_pot_row(*pot) for pot in pots],
+    )
+    legacy.executemany(
+        """
+        INSERT INTO savings_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        plans,
+    )
+    legacy.close()
+
+
+def raw_columns(connection, table):
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def test_a_pots_commitment_columns_arrive_on_an_old_database(tmp_path):
+    """Two columns on a table that already had rows, which is what needs a migration.
+
+    ``CREATE TABLE IF NOT EXISTS`` gives a new column to a new database only, so
+    every database that predates the rule is missing both - and the rule cannot
+    be judged at all until they exist. The plan's ``fund_id`` is asserted in the
+    same breath because it is the other half of the same phase and the same
+    failure: a plan that cannot record which pot it committed to cannot make a
+    commitment that means anything.
+    """
+    db_path = str(tmp_path / "pre_phase_b.db")
+    build_pre_phase_b_database(db_path, [])
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        funds = raw_columns(connection, "funds")
+        plans = raw_columns(connection, "savings_plans")
+    finally:
+        connection.close()
+
+    assert {"sealed_at", "first_funded_at"} <= funds
+    assert "fund_id" in plans
+
+
+def test_the_backfill_keeps_an_empty_pot_unfunded(tmp_path):
+    """The distinction the backfill exists to preserve, in one table.
+
+    Two pots, one holding money and one holding none, and they must come out of
+    the migration telling different stories. Both are sealed when they were
+    created - a pot's date is as old as the pot - but only the funded one has a
+    ``first_funded_at``, because only it has ever received money. Giving the
+    empty pot one would be a lie with a consequence: it would date a funding that
+    never happened.
+    """
+    db_path = str(tmp_path / "backfill.db")
+    build_pre_phase_b_database(
+        db_path,
+        [
+            ("aaaaaaaa-0000-0000-0000-000000000001", WALLET_ID, "Supplier", "4000.00", "BUSINESS"),
+            ("aaaaaaaa-0000-0000-0000-000000000002", WALLET_ID, "Holiday", "0.00"),
+        ],
+    )
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        rows = {
+            row["name"]: row
+            for row in connection.execute(
+                "SELECT name, sealed_at, first_funded_at, created_at FROM funds"
+            )
+        }
+    finally:
+        connection.close()
+
+    assert rows["Supplier"]["sealed_at"] == datetime_to_text(LEGACY_MOMENT)
+    assert rows["Supplier"]["first_funded_at"] == datetime_to_text(LEGACY_MOMENT)
+    # And the empty pot, which is the whole point of the test.
+    assert rows["Holiday"]["sealed_at"] == datetime_to_text(LEGACY_MOMENT)
+    assert rows["Holiday"]["first_funded_at"] is None
+
+
+@pytest.mark.parametrize("zero", ["0", "0.00", "0.000"])
+def test_an_empty_pot_is_recognised_however_its_zero_was_written(tmp_path, zero):
+    """``balance`` is text, and three different strings all mean nothing.
+
+    A string comparison against "0.00" would migrate two of these three pots into
+    a funding moment they never had, and the pot that got through would be the
+    one whose balance happened to be formatted the other way. The migration casts
+    instead, which is the one place in this codebase that touching a money column
+    with SQL arithmetic is defensible: the question is "is this zero?", and the
+    answer is thrown away.
+    """
+    db_path = str(tmp_path / f"zero_{zero.replace('.', '_')}.db")
+    build_pre_phase_b_database(
+        db_path,
+        [("aaaaaaaa-0000-0000-0000-000000000002", WALLET_ID, "Holiday", zero)],
+    )
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        row = connection.execute(
+            "SELECT first_funded_at FROM funds WHERE name = 'Holiday'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row["first_funded_at"] is None
+
+
+def test_the_backfill_runs_once(tmp_path):
+    """Opening an old database three times leaves it exactly as the first open did.
+
+    Migrations run in autocommit before the unit of work's transaction, so they
+    are re-run on every connection for the life of the database. An UPDATE
+    guarded on ``IS NULL`` and on a non-zero balance is stable: the funded pot's
+    anchor is set and no longer NULL, and the empty pot's is NULL *and* its
+    balance is still zero, so neither is touched again.
+    """
+    db_path = str(tmp_path / "backfill_twice.db")
+    build_pre_phase_b_database(
+        db_path,
+        [
+            ("aaaaaaaa-0000-0000-0000-000000000001", WALLET_ID, "Supplier", "4000.00", "BUSINESS"),
+            ("aaaaaaaa-0000-0000-0000-000000000002", WALLET_ID, "Holiday", "0.00"),
+        ],
+    )
+
+    first = open_sqlite_connection(db_path)
+    try:
+        before = [
+            tuple(row)
+            for row in first.execute(
+                "SELECT fund_id, sealed_at, first_funded_at, created_at FROM funds ORDER BY fund_id"
+            )
+        ]
+    finally:
+        first.close()
+
+    for _ in range(3):
+        again = open_sqlite_connection(db_path)
+        again.close()
+
+    final = open_sqlite_connection(db_path)
+    try:
+        after = [
+            tuple(row)
+            for row in final.execute(
+                "SELECT fund_id, sealed_at, first_funded_at, created_at FROM funds ORDER BY fund_id"
+            )
+        ]
+    finally:
+        final.close()
+
+    assert after == before
+
+
+def test_a_plan_saved_before_pots_could_be_named_still_hydrates(
+    tmp_path, build_plan
+):
+    """The legacy plan, read back through the real repository.
+
+    A column added to a table reads back as ``None`` on an old row, and ``None``
+    is precisely "this plan predates naming, draw on the pool as it always did" -
+    so the migration is invisible: the plan hydrates, its instructions survive,
+    and ``ExecutePlanRun`` will hand it the pooled draw it has always had.
+
+    The row is written with the real serializers rather than hand-typed JSON,
+    because a hand-typed string would test the migration against a shape no
+    release ever produced. The wallet id is ``WALLET_ID`` rather than a fresh
+    uuid because the row below is supposed to belong to the wallet the legacy
+    database already holds - a plan pointing at a wallet that does not exist
+    would be a database no release could have written.
+    """
+    db_path = str(tmp_path / "legacy_plan.db")
+    plan = build_plan(wallet_id=UUID(WALLET_ID))
+    build_pre_phase_b_database(
+        db_path,
+        [],
+        plans=[
+            (
+                uuid_to_text(plan.plan_id),
+                uuid_to_text(plan.wallet_id),
+                plan.name,
+                enum_to_text(plan.source),
+                schedule_to_text(plan.schedule),
+                instructions_to_text(plan.instructions),
+                enum_to_text(plan.status),
+                plan.completed_runs,
+                None,
+                datetime_to_text(plan.created_at),
+            )
+        ],
+    )
+
+    fresh = SqliteUnitOfWorkFactory(db_path).start()
+    try:
+        stored = fresh.plans.get_by_id(plan.plan_id)
+        assert stored.fund_id is None
+        assert stored.instructions == plan.instructions
+        assert stored.source is plan.source
+    finally:
+        fresh.rollback()
+
+
+def test_a_pot_round_trips_its_two_moments(tmp_path, build_wallet):
+    """The columns are written and read back, not merely created by a migration.
+
+    Asserted against the pot that was saved rather than against a fixed moment,
+    which is the stronger form here: it pins "what went in comes out" without the
+    test having to know what the fixture chose - and a test that knew would still
+    pass if both ends were wrong in the same way.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "pot_moments.db"))
+    wallet = build_wallet(locked="4000")
+    pot = wallet.fund_by_name("Locked")
+
+    uow = factory.start()
+    uow.wallets.save(wallet)
+    uow.commit()
+
+    fresh = factory.start()
+    try:
+        stored = fresh.wallets.get_by_id(wallet.wallet_id).fund_by_name("Locked")
+        assert stored.sealed_at == pot.sealed_at
+        assert stored.first_funded_at == pot.first_funded_at
+        assert stored.first_funded_at is not None
+    finally:
+        fresh.rollback()
+
+
+def test_an_empty_pot_round_trips_as_never_funded(tmp_path, build_wallet):
+    """``first_funded_at`` is nullable on the way out as well as in.
+
+    The direction that would be easy to get wrong silently: a repository reading
+    a NULL moment as ``datetime.min`` would make every empty pot look as though it
+    had been funded since the beginning of time - which is the *permissive*
+    direction, and would hand the exemption to a pot that has never held a naira.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "empty_pot.db"))
+    wallet = build_wallet()
+    wallet.open_fund("Supplier", FundKind.BUSINESS, as_of=datetime(2026, 1, 1))
+
+    uow = factory.start()
+    uow.wallets.save(wallet)
+    uow.commit()
+
+    fresh = factory.start()
+    try:
+        stored = fresh.wallets.get_by_id(wallet.wallet_id).fund_by_name("Supplier")
+        assert stored.first_funded_at is None
+        assert stored.balance == Money(Decimal("0"), NGN)
+    finally:
+        fresh.rollback()
+
+
+def test_a_plans_pot_round_trips(tmp_path, build_wallet, build_plan):
+    """Which pot a plan committed to is a fact the database keeps.
+
+    The half of the phase a plan's own tests cannot see. ``SavingsPlan`` holds a
+    ``fund_id`` and refuses the wrong source, but whether it survives a save and
+    a reload is a property of the repository - and a plan whose pot vanished on
+    the way through would silently fall back to the pooled draw, which is exactly
+    the behaviour this phase removes.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "plan_pot.db"))
+    wallet = build_wallet(locked="4000")
+    pot_id = wallet.fund_by_name("Locked").fund_id
+    plan = build_plan(wallet_id=wallet.wallet_id, fund_id=pot_id)
+
+    uow = factory.start()
+    uow.wallets.save(wallet)
+    uow.plans.save(plan)
+    uow.commit()
+
+    fresh = factory.start()
+    try:
+        stored = fresh.plans.get_by_id(plan.plan_id)
+        assert stored.fund_id == pot_id
+    finally:
+        fresh.rollback()
+
+
+def test_a_legacy_plans_pot_round_trips_as_none(tmp_path, build_wallet, build_plan):
+    """And the other direction, which is what keeps every existing plan working.
+
+    ``None`` is not missing data here - it is the legacy pooled draw, and an
+    available-source plan's permanent answer. A repository that invented a pot for
+    it would commit money the user never committed.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "legacy_plan_none.db"))
+    wallet = build_wallet(locked="4000")
+    plan = build_plan(wallet_id=wallet.wallet_id, fund_id=None)
+
+    uow = factory.start()
+    uow.wallets.save(wallet)
+    uow.plans.save(plan)
+    uow.commit()
+
+    fresh = factory.start()
+    try:
+        assert fresh.plans.get_by_id(plan.plan_id).fund_id is None
     finally:
         fresh.rollback()

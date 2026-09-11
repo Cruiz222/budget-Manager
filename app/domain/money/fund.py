@@ -8,10 +8,12 @@ from .exception import (
     InvalidAmountError,
     InvalidFundBalanceError,
     InvalidFundCreatedAtError,
+    InvalidFundFirstFundedAtError,
     InvalidFundIDError,
     InvalidFundKindError,
     InvalidFundMaturityError,
     InvalidFundNameError,
+    InvalidFundSealedAtError,
     InsufficientFundsError,
     MaturityNotExtendedError,
 )
@@ -43,10 +45,28 @@ class Fund:
 
     The two kinds differ on one question only, and it is asked in ``pay``:
 
-        may this pot fund a scheduled payout before its date?
+        may this pot fund a *scheduled* payout before its date?
 
-    A ``BUSINESS`` pot may - that is what it is for. A ``PERSONAL`` pot may not,
-    by any route.
+    A ``BUSINESS`` pot may - that is what it is for: a scheduled obligation does
+    not wait for the float to mature. A ``PERSONAL`` pot may not, by any route.
+
+    **But the exemption is not free, and that is what ``first_funded_at`` and
+    ``sealed_at`` are for.** Answering "yes" to the question above is what a
+    person in charge of paying people would be tempted to do with their own
+    money - lock it, change their mind, and redirect the payment to a secondary
+    account. So the pot asks a second question first (``authorises_early_payout``):
+
+        was this commitment made *before* the money was?
+
+    Only money that arrived after the commitment did may leave early. The
+    ordering that falls out of it is one sentence, and it is the whole feature:
+
+        **seal the pot -> commit money to it -> fund it**
+
+    Money that is already in the pot has no commitment that predates it, so it
+    waits for its date like any other. ``sealed_at`` is in that ordering because
+    moving a date later with ``extend_to`` is a *re-sealing*: it pushes the pot's
+    terms past the commitment, and the exemption lapses with them.
     """
 
     fund_id: uuid.UUID
@@ -54,6 +74,21 @@ class Fund:
     kind: FundKind
     _balance: Money
     maturity_date: date | None = None
+    #: When this pot's *current* maturity date came into force: the moment it was
+    #: opened, and again every moment ``extend_to`` moves the date. It is one
+    #: half of what ``authorises_early_payout`` compares, and the half that makes
+    #: an extension re-seal the pot against a commitment already made.
+    sealed_at: datetime = field(default_factory=datetime.now)
+    #: The moment money first arrived, or ``None`` while the pot is empty. It is
+    #: stamped once, by the first ``deposit``, and never again - a pot funded
+    #: continuously has one funding moment, not one per deposit.
+    #:
+    #: It is deliberately the *first* funding and not the most recent, and the
+    #: difference is the whole anti-temptation guarantee. "Funded at" would let
+    #: anyone unlock a sealed pot by creating the plan and then depositing a
+    #: token amount to reset the clock. The first funding can never move later,
+    #: so that door does not exist.
+    first_funded_at: datetime | None = None
     #: Fixes the order in which pots are drawn on when a payout has no pot named
     #: - see ``Wallet.payout_from_locked``. A moment, not a date: two pots opened
     #: on the same day still have a stable order, so the draw is deterministic
@@ -93,14 +128,21 @@ class Fund:
 
     # --- moving money -------------------------------------------------------
 
-    def deposit(self, amount: Money) -> None:
+    def deposit(self, amount: Money, as_of: datetime) -> None:
         """Add money to the pot, at any time, before or after its date.
 
         No maturity check and no wallet-status check: both of those guard money
         *leaving*, and this is money arriving. A closed wallet is refused by the
         wallet, which is the only place that knows it is closed.
+
+        ``as_of`` is here for one reason, and it is not a check: this is where
+        ``first_funded_at`` is stamped. Only the first call does it, so a pot fed
+        forever still has exactly one funding moment - see the field for why that
+        has to be the first and not the latest.
         """
         self._check_amount(amount)
+        if self.first_funded_at is None:
+            self.first_funded_at = as_of
         self._balance = self._balance + amount
 
     def release(self, amount: Money, as_of: datetime) -> None:
@@ -114,7 +156,7 @@ class Fund:
         self._check_withdrawable(amount)
         self._balance = self._balance - amount
 
-    def pay(self, amount: Money, as_of: datetime) -> None:
+    def pay(self, amount: Money, as_of: datetime, committed_at: datetime | None = None) -> None:
         """Spend money out of the pot, to an external account.
 
         A ``BUSINESS`` pot may do this before its date - a scheduled obligation
@@ -126,11 +168,60 @@ class Fund:
         counts as "scheduled" is the plan's business, not the pot's; by the time
         a caller reaches here it has already decided this pot is the right one to
         spend from, and the pot only answers for itself.
+
+        ``committed_at`` is the moment the caller's commitment was made - for a
+        plan, its creation. It is passed rather than derived because the pot
+        cannot see a plan; what the pot *can* do is judge whether a commitment
+        made then is old enough to authorise this. A hand-typed payout has no
+        commitment at all and passes ``None``, which is why one can never spend a
+        sealed business pot early: an ad-hoc payout is not a scheduled payment.
+
+        **The date is asked before the amount, and that order is the decision
+        rather than the layout.** A pot that may not be spent at all cannot be
+        helped by a well-formed amount, so "locked until 1 June" is the useful
+        answer to ``pay(-500)`` and "amount must be positive" is not - the second
+        sends someone off to fix a typo that would not have freed the money. Both
+        statements are true; only one of them tells the caller what to do next.
+        Reversing these two lines would be a silent change to what a user is
+        told, which is why it is written down here (see decision 44).
         """
-        if self.kind is FundKind.PERSONAL:
+        if not self.is_matured(as_of) and not self.authorises_early_payout(
+            committed_at
+        ):
             self._refuse_if_sealed(as_of)
         self._check_withdrawable(amount)
         self._balance = self._balance - amount
+
+    def authorises_early_payout(self, committed_at: datetime | None) -> bool:
+        """Whether a commitment made at ``committed_at`` may spend this pot early.
+
+        The anti-temptation rule, in one place, so that the pre-flight and the
+        operation that actually moves the money cannot answer it differently -
+        see ``ExecutePlanRun._blocking_reason``, which asks this exact method.
+
+        It is false unless all three hold, and each one is a different refusal:
+
+          - the pot is a ``BUSINESS`` one. A personal pot pays early by no route.
+          - there *is* a commitment. ``None`` means the caller has none, which is
+            every hand-typed payment.
+          - the ordering is ``sealed_at <= committed_at <= first_funded_at``: the
+            pot's terms were in force, the commitment was made, and only then did
+            the money arrive.
+
+        That middle comparison is what an ``extend_to`` breaks. Pushing the date
+        out moves ``sealed_at`` past a commitment that was already made, the
+        ordering stops holding, and the pot waits for the new date - which is
+        what "extend" has always meant, now applied to a committed pot too.
+
+        The third comparison is what a pot funded before the plan breaks, and it
+        is the case the rule exists for: money already in the pot has no
+        commitment that predates it.
+        """
+        if self.kind is not FundKind.BUSINESS or committed_at is None:
+            return False
+        if self.first_funded_at is None:
+            return False
+        return self.sealed_at <= committed_at <= self.first_funded_at
 
     def extend_to(self, new_date: date, as_of: datetime) -> None:
         """Move the maturity date later. Never earlier.
@@ -149,6 +240,16 @@ class Fund:
         Setting a date on a pot that has none *is* allowed: that is how an open
         pot - including the migrated one holding every pre-existing locked
         balance - is turned into a real commitment.
+
+        **It also re-stamps ``sealed_at``**, and that is not bookkeeping. Moving
+        the date later re-seals the pot against *everything*, including a
+        commitment already made to a scheduled payout: the ordering
+        ``authorises_early_payout`` checks no longer holds, so a business pot
+        that was paying early on schedule stops and waits for the new date. That
+        is the ruling - an extension is the owner saying "not yet" and being held
+        to it - and it is deliberately loud rather than silent: a plan that runs
+        into it is *blocked*, recording a reason and queueing a receipt, not
+        quietly skipped.
         """
         if not isinstance(new_date, date) or isinstance(new_date, datetime):
             raise InvalidFundMaturityError(
@@ -166,6 +267,7 @@ class Fund:
                 f"{self.maturity_date.isoformat()}"
             )
         self.maturity_date = new_date
+        self.sealed_at = as_of
 
     # --- guards -------------------------------------------------------------
 
@@ -234,6 +336,25 @@ class Fund:
         if not isinstance(self.created_at, datetime):
             raise InvalidFundCreatedAtError(
                 f"created_at must be a datetime, got {type(self.created_at).__name__}"
+            )
+
+        # Both of these are moments, and neither is checked *against* the other.
+        # It is tempting to require ``sealed_at <= first_funded_at`` - a pot is
+        # sealed and then funded - and it would be wrong, because ``extend_to``
+        # makes that ordering go backwards on purpose. The relationship between
+        # the two is a question ``authorises_early_payout`` answers, not an
+        # invariant construction can enforce.
+        if not isinstance(self.sealed_at, datetime):
+            raise InvalidFundSealedAtError(
+                f"sealed_at must be a datetime, got {type(self.sealed_at).__name__}"
+            )
+
+        if self.first_funded_at is not None and not isinstance(
+            self.first_funded_at, datetime
+        ):
+            raise InvalidFundFirstFundedAtError(
+                f"first_funded_at must be a datetime or None, "
+                f"got {type(self.first_funded_at).__name__}"
             )
 
     def __str__(self) -> str:

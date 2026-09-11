@@ -38,9 +38,10 @@ class WalletOperation(ABC):
     has no opinion about when that must be set: the ledger's rules about it are
     the Transaction's, and there is currently only one - that a fund id, if
     present, is a UUID. Note the asymmetry with ``destination``, which *does*
-    have a rule tying it to the transaction type. A payout in this phase has no
-    single pot (see ``Wallet.payout_from_locked``), so "PAYOUT implies a fund"
-    would be a rule the code cannot keep.
+    have a rule tying it to the transaction type: a payout has no single pot in
+    its *shape*, only in its facts. One plan's payout names a pot and another's
+    does not, and both are PAYOUTs - so "PAYOUT implies a fund" would be a rule
+    the code cannot keep.
     """
 
     #: Transaction type recorded for this operation (set by each subclass).

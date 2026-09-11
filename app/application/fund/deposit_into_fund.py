@@ -27,13 +27,21 @@ class DepositIntoFund(WalletOperation):
     its own terms, while the pot depends on wallet state that has to be consulted
     either way, and doing it once up front is what leaves ``self.fund_id``
     settled for every later step.
+
+    **``as_of`` is required, and it is the moment money arrives.** This is the
+    operation that stamps a pot's ``first_funded_at`` - the anchor the
+    business-pot exemption is judged against - so the moment cannot be read from
+    the clock inside the wallet. A deposit that stamped "now" would make the
+    anti-temptation rule untestable, and worse, would make it depend on which
+    layer happened to read the clock. See ``Fund.authorises_early_payout``.
     """
 
     transaction_type = TransactionType.DEPOSIT
 
-    def __init__(self, wallet, transaction_repository, fund_name):
+    def __init__(self, wallet, transaction_repository, fund_name, as_of):
         fund = wallet.fund_by_name(fund_name)
         super().__init__(wallet, transaction_repository, fund_id=fund.fund_id)
+        self._as_of = as_of
 
     def _apply(self, amount):
-        self.wallet.deposit_into_fund(self.fund_id, amount)
+        self.wallet.deposit_into_fund(self.fund_id, amount, self._as_of)

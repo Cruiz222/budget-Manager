@@ -44,6 +44,20 @@ BANK_DESTINATION = Destination(
     details={"bank_code": "058"},
 )
 
+#: The moment the ``build_wallet`` fixture opens and funds its pot at.
+#:
+#: Fixed rather than ``datetime.now()``, and the reason is now a domain one: a
+#: pot records ``sealed_at`` and ``first_funded_at``, and a fixture that read the
+#: clock would give every test a pot whose timeline moved with it. A test that
+#: wanted to place a commitment relative to the pot's funding would then have to
+#: know *when the suite ran* to write its expectation - which is the kind of
+#: hidden dependency the rest of this suite avoids by passing moments in.
+#:
+#: One moment for the pot's opening, its sealing and its funding, which is
+#: exactly the shape the pre-pots migration produces: a pot born already holding
+#: money (see ``_migrate_locked_balance_into_funds``).
+POT_MOMENT = datetime(2026, 1, 1)
+
 #: Every variable ``email_settings`` reads. Cleared for every test in the suite.
 #:
 #: ``os.environ`` is a global that exactly one module reads, and leaving it
@@ -137,8 +151,12 @@ def build_wallet():
             # ``locked=0`` build a wallet differing in *shape* from
             # ``build_wallet()``, and shape is exactly what the payout draw order
             # depends on.
-            fund = wallet.open_fund("Locked", FundKind.PERSONAL)
-            wallet.deposit_into_fund(fund.fund_id, Money(Decimal(locked), currency))
+            fund = wallet.open_fund(
+                "Locked", FundKind.PERSONAL, as_of=POT_MOMENT
+            )
+            wallet.deposit_into_fund(
+                fund.fund_id, Money(Decimal(locked), currency), POT_MOMENT
+            )
         wallet.status = status
         return wallet
 
@@ -172,7 +190,22 @@ def build_plan():
         ends_on: date | None = None,
         wallet_id: UUID | None = None,
         name: str = "salary",
+        fund_id: UUID | None = None,
+        created_at: datetime = datetime(2026, 1, 1),
     ) -> SavingsPlan:
+        """Build a plan, defaulting to one that names no pot.
+
+        ``fund_id`` defaults to ``None``, and that default is the honest one
+        rather than a convenience: ``None`` is what a plan saved before pots
+        could be named looks like, which is the shape most of this suite is
+        about. A test that wants the commitment rule exercised names a pot - and
+        it has to want that deliberately, which is the point.
+
+        ``created_at`` is fixed for the mirror-image reason ``POT_MOMENT`` is:
+        it is one half of the ``sealed_at <= committed_at <= first_funded_at``
+        comparison, so a plan built with ``datetime.now()`` would make that
+        ordering depend on when the suite ran.
+        """
         if instructions is None:
             instructions = (
                 Instruction(
@@ -191,6 +224,8 @@ def build_plan():
             status=status,
             completed_runs=completed_runs,
             ends_on=ends_on,
+            fund_id=fund_id,
+            created_at=created_at,
         )
 
     return _build
