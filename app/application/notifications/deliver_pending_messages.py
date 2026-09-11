@@ -1,206 +1,34 @@
-"""Drain the outbox: send what is owed, expire what is stale.
+"""The warning queue: send what is owed, expire what is stale.
 
-The second half of the transactional outbox. ``NotifyUpcomingRuns`` queues a
-message in the same transaction as the notice it belongs to, so the decision to
-warn is durable before anything is sent; this use case runs afterwards and does
-the part that touches the network.
+A warning has a **deadline** - the occurrence it warns about - and that single
+fact is the whole of what distinguishes this drain from the receipt one. It is
+why messages are expired before delivery is even attempted, and why the window
+doubles as a natural bound on retries: once the occurrence passes, the message
+stops being retried at all, so no arbitrary retry cap is needed (decision 25).
 
-Splitting the two is what keeps a mail server out of a money-moving transaction.
-The warning is composed and committed in one short unit, and delivered in
-another pass that can fail as loudly as it likes without taking a payout with it.
+The algorithm itself lives in ``DeliverQueue``, shared with the receipt drain.
+This module names the store and says what makes a warning's queue different; it
+does not restate the two delivery rules, which are written once where they are
+implemented.
 """
 
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Generic, TypeVar
-
-from app.application.unit_of_work import UnitOfWorkFactory
-from app.domain.notifications.notificationChannel import NotificationChannel
+from app.application.notifications.deliver_queue import DeliverQueue, DeliveryReport
 from app.domain.notifications.outboundMessage import OutboundMessage
 
-#: The message type a report describes - an ``OutboundMessage`` for the warning
-#: drain, a ``Notification`` for the receipt one.
-T = TypeVar("T")
+#: Re-exported so that ``DeliveryReport`` keeps a stable home for callers that
+#: have always imported it from here. It is *defined* in ``deliver_queue``, beside
+#: the drain that produces it - this is an alias, not a second copy.
+__all__ = ["DeliverPendingMessages", "DeliveryReport"]
 
 
-@dataclass(frozen=True)
-class DeliveryReport(Generic[T]):
-    """What one delivery pass did, described for whoever has to report it.
+class DeliverPendingMessages(DeliverQueue[OutboundMessage]):
+    """Send every queued warning that is still worth sending.
 
-    Lists rather than counts, because the caller's job is to say *which* messages
-    went out and which are stuck - a bare "2 sent" is not actionable, while a
-    plan id and an error message are. A view, not a record: nothing here is
-    stored, and nothing reads it to make a decision.
-
-    **Generic over the message type**, which buys less than it looks like and is
-    still worth it. There are two drains - the warning queue and the receipt
-    queue - and they keep identical accounts of different aggregates. Without
-    this parameter there would be a second, identical dataclass, kept in step by
-    hand for no benefit: the *reporting* rule (say which, not how many; stay
-    silent when there is nothing) is a property of delivery, not of what is being
-    delivered.
-
-    What it deliberately does **not** do is let the two drains share their code.
-    Only the vocabulary is shared; the two passes remain separate. That is a
-    decision, not an oversight, and it is listed under *Still open* in the
-    README.
-
-    ``expired`` is always empty for a receipt drain, by design - nothing expires
-    a notification (see ``Notification``). The field stays because a report is
-    the same four things whichever queue it describes, and a slot that means
-    "nothing was dropped" is more honest than a report with no way to say it.
+    What is distinctive is stated on ``OutboundMessage.is_stale``: a warning
+    expires at its occurrence, strictly, so a warning about a payout that is
+    happening right now is already too late to send. The queue is read oldest
+    occurrence first, so the most urgent warning goes first.
     """
 
-    sent: tuple[T, ...] = ()
-    expired: tuple[T, ...] = ()
-    failed: tuple[T, ...] = ()
-    deferred: tuple[T, ...] = ()
-
-    @property
-    def is_quiet(self) -> bool:
-        """Whether there is nothing worth printing.
-
-        The ordinary case by a wide margin: most ticks find an empty queue, and
-        a tick that finds nothing to do should say nothing rather than report
-        that it did nothing.
-        """
-        return not (self.sent or self.expired or self.failed or self.deferred)
-
-
-class DeliverPendingMessages:
-    """Send every queued message that is still worth sending.
-
-    Two rules shape this, and both are about not making things worse:
-
-    1. **A failure is recorded, never raised.** A mail server being down is not
-       an incident - it is a message that goes out on the next tick. So a failed
-       attempt leaves the message ``PENDING`` with the error on ``last_error``,
-       and this method returns normally. What that buys is the property the whole
-       feature rests on: **a broken SMTP server can never make ``plan tick``
-       fail.** The money still moved, and the warning is still owed.
-
-    2. **A stale warning is never sent.** A message whose occurrence has passed
-       is *expired* rather than delivered. Telling someone a payout is thirty
-       minutes away after it already happened is worse than silence - it is
-       actively wrong, and it invites them to act on something that is over. This
-       also removes any need for an arbitrary retry cap: the window bounds the
-       attempts naturally, because once the occurrence passes, the message stops
-       being retried at all.
-
-    Expiry is checked before delivery and regardless of whether a channel is
-    configured, because staleness is a fact about the clock rather than about
-    delivery. A queue that only expired messages when a mail server was reachable
-    would hold stale warnings forever on an install with no email at all.
-    """
-
-    def __init__(
-        self,
-        unit_of_work_factory: UnitOfWorkFactory,
-        channel: NotificationChannel | None = None,
-    ):
-        self._unit_of_work_factory = unit_of_work_factory
-        # ``None`` means this installation cannot send: no email is configured.
-        # That is a normal state, not an error - messages are still expired on
-        # time, and anything queued from a previous configuration simply stays
-        # owed until one exists again.
-        self._channel = channel
-
-    def execute(self, as_of: datetime) -> DeliveryReport[OutboundMessage]:
-        """Settle or send everything currently queued, and report what happened.
-
-        ``as_of`` is taken rather than read from the clock for the same reason it
-        is everywhere else - testability, and so one pass has one idea of what
-        "now" is. It is also the moment recorded as ``settled_at``, so replaying
-        a pass settles messages with the same timestamp rather than a slightly
-        different one.
-        """
-        sent = []
-        expired = []
-        failed = []
-        deferred = []
-
-        for message in self._outstanding():
-            if message.due_at <= as_of:
-                self._expire(message, as_of)
-                expired.append(message)
-            elif self._channel is None:
-                deferred.append(message)
-            elif self._attempt(message, as_of):
-                sent.append(message)
-            else:
-                failed.append(message)
-
-        return DeliveryReport(
-            sent=tuple(sent),
-            expired=tuple(expired),
-            failed=tuple(failed),
-            deferred=tuple(deferred),
-        )
-
-    def _outstanding(self) -> list[OutboundMessage]:
-        """Every message still owed, read in a unit of its own.
-
-        A read-only unit, rolled back in a ``finally`` exactly as the notifier's
-        ``_upcoming`` does. The messages that come back are plain in-memory
-        objects, so they stay usable after the rollback - it releases the
-        connection, not the values.
-        """
-        uow = self._unit_of_work_factory.start()
-        try:
-            return list(uow.outbound_messages.pending())
-        finally:
-            uow.rollback()
-
-    def _expire(self, message: OutboundMessage, as_of: datetime) -> None:
-        """Settle a message that is no longer worth sending."""
-        uow = self._unit_of_work_factory.start()
-        try:
-            message.mark_expired(as_of)
-            uow.outbound_messages.save(message)
-            uow.commit()
-        except BaseException:
-            uow.rollback()
-            raise
-
-    def _attempt(self, message: OutboundMessage, as_of: datetime) -> bool:
-        """Try to send one message. Returns whether it went.
-
-        Note the shape: the send happens *before* the unit opens, and the write
-        happens after it closes. That ordering is deliberate - no database
-        transaction is held open across a network call to a mail server, which
-        would otherwise be a transaction that can hang for as long as the socket
-        timeout allows.
-
-        The cost of that ordering is worth stating rather than hiding: if the
-        send succeeds and the write then fails, the next tick will send the
-        message a second time. **This is an at-least-once channel**, and there is
-        no alternative - the message leaves the process and lands somewhere no
-        transaction of ours can reach. Given the choice between a duplicate
-        warning and a lost one, a duplicate is obviously the cheaper mistake, and
-        a warning that arrives twice is a far smaller sin than a payout the user
-        was never told about.
-
-        The failure is caught narrowly - ``Exception``, around the send alone -
-        and that narrowness is load-bearing. If the ``save`` below were inside
-        that clause, a database error would be recorded as a *delivery* failure,
-        and the message would be retried forever against a mail server that was
-        working perfectly.
-        """
-        failure = None
-        try:
-            self._channel.send(message)
-        except Exception as exc:
-            failure = f"{type(exc).__name__}: {exc}"
-
-        uow = self._unit_of_work_factory.start()
-        try:
-            if failure is None:
-                message.mark_sent(as_of)
-            else:
-                message.record_failure(failure)
-            uow.outbound_messages.save(message)
-            uow.commit()
-        except BaseException:
-            uow.rollback()
-            raise
-        return failure is None
+    def _queue(self, uow):
+        return uow.outbound_messages

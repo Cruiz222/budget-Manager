@@ -959,6 +959,152 @@ column standing - which is why the inset is guarded by `WHERE NOT EXISTS` and no
 by a PRAGMA check on the column: rerunning it must be a no-op, and the second run
 is the one that has to cope.
 
+### One drain for two queues
+
+Phase 6 ended with the two delivery passes deliberately duplicated, and the
+reason written down rather than left implied: the risky half of that phase was a
+receipt landing inside a payout transaction, and moving the well-tested warning
+path at the same time would have meant debugging two things at once. The *Still
+open* entry said the merge wanted the moment when "both shapes are known rather
+than predicted". They are both known now, so this is that moment.
+
+It is worth saying why a working duplication was worth removing at all. The cost
+was never the thirty duplicated lines of `_attempt` - it was that the *reasons*
+were duplicated too. Two docstrings stated the same two delivery rules in
+slightly different words, and the next person to change a rule would have had two
+places to change it and no way to know there were two. A second copy of a rule is
+where a rule starts to drift.
+
+**45. The two drains are one pass, and the only difference is which queue they
+read.** `DeliverQueue` holds the algorithm once: send what is owed, record a
+failure rather than raising it, hold no transaction across the send. What were
+two classes are now subclasses of it whose entire body is `_queue` - returning
+`uow.outbound_messages` or `uow.notifications`. Everything else the messages
+answer for themselves.
+
+The merge is deliberately **invisible from outside the package**. Both class
+names, both module paths and both builders survive unchanged, so the CLI, the
+composition root and all 95 existing tests were untouched. That is the evidence
+the seam was drawn in the right place, rather than being a rewrite wearing a
+refactor's clothes: the diff that mattered is inside three files, and no caller
+can tell it happened. What did change shape is `DeliveryReport.expired` - it was
+populated by one drain and defaulted by the other, and is now structurally
+present for both. For a receipt it is always empty, because nothing expires one,
+and a slot that means "nothing was dropped" is more honest than a report with no
+way to say it.
+
+**46. Staleness is the message's answer, not the drain's flag.** This is what
+made the merge safe rather than merely tidy, and it is decision 30 taken
+seriously. That decision refused to share a pass because a receipt fed through
+the warning's `due_at <= as_of` rule would be expired on the very tick it was
+written - and the leak would be **silent**. The obvious way to share is a flag on
+the drain ("this queue expires things"), and that flag is exactly the trap: a
+switch that can be set the wrong way, failing without a word.
+
+So the rule went on the message instead. `is_stale(as_of)` is asked of every
+message the drain holds, and each aggregate answers for itself: a warning returns
+`due_at <= as_of`, strictly, and a receipt returns a flat `False`. A receipt
+therefore **cannot** be expired, however the drain is built or configured, for
+the same reason a double enqueue cannot become a second warning - its own class
+says it cannot go stale. The failure is unrepresentable rather than avoided,
+which is the trade decision 8 makes with a primary key and decision 31 makes with
+a derived event key.
+
+It is a domain rule by the test decision 1 gives - it still makes sense with the
+database thrown away - and it stores nothing, so decision 5 is satisfied too. It
+is *not* a spanning rule, which is why decision 3 does not apply: this is one
+aggregate and a clock, not two aggregates. `Notification.is_stale` takes `as_of`
+and never reads it, and that is deliberate rather than sloppy - both messages must
+answer the same question in the same shape, or the drain would have to know which
+queue it was holding in order to ask. It is the same shape of choice as
+`Notification.mark_expired`, which exists with no caller so that the lifecycle is
+not half-built.
+
+**47. The queue port is a `Protocol`, not an `ABC`.** Every other port in
+`domain/repositories` is an ABC, and this one deliberately is not.
+`OutboundMessageRepository` and `NotificationRepository` already have `pending()`
+and `save()` in exactly the shapes a drain needs; an ABC would mean editing both
+of them *and* both SQLite implementations to declare a relationship that already
+holds, buying explicitness and nothing else. A `Protocol` says *look like this*
+rather than *inherit from me*, so nothing in infrastructure moves at all, and the
+conformance is checked by the type checker rather than at import.
+
+The cost is real and accepted: a reader of `NotificationRepository` learns it is
+a queue from the port and from the drain, not from an inheritance list. `enqueue`
+is deliberately **outside** the port - a drain never queues anything, and a port
+describing the whole repository would be two ports in one coat. If a third queue
+ever appears and inheriting starts to carry its weight, promoting this to an ABC
+is a line per store.
+
+### The road to a product
+
+Everything so far has been domain and application work reached through a CLI. The
+system does what it was designed to do and has no way for anyone but its author to
+touch it: no HTTP layer, no `User`, no authentication, no deployment. This is the
+first phase whose subject is turning it into a product rather than making it
+correct - and it is recorded as decisions because the *order* is one, and so is
+everything being deliberately **not** built.
+
+**48. An HTTP API comes before authentication.** Not a preference - a
+dependency, and one worth checking before planning anything else.
+`requirements.txt` contains exactly one line, `pytest`; there is no web framework
+at all, and the whole presentation layer is 1,300 lines of argparse.
+Authentication, session tokens, rate limiting and Google signup are all
+properties of an API, and there is no API for them to be properties of.
+
+There is a second gap underneath that one. `wallets.user_id` is a `NOT NULL`
+column with **no table behind it** - every wallet already knows who owns it, and
+nothing in the system knows what a user is, because there is no `User` aggregate
+and no `users` table. So the system has an ownership field it never checks
+against a caller, which is not authentication's problem but authorization's.
+Identity and the API are one phase, and they come first because every other item
+on this list stands on them.
+
+**49. Sessions are opaque and server-side, not JWT.** JWT is the popular default
+and it is the wrong one here, for a reason specific to moving money: **a JWT is
+valid until it expires and cannot be withdrawn.** A stolen laptop or a
+compromised account cannot be cut off - the only fixes are a blocklist, which
+reintroduces the server-side state JWT was adopted to avoid, or waiting out the
+expiry while the attacker keeps the token. For a product that pays people, "this
+session is revoked, now" is a requirement rather than a nicety.
+
+An opaque random token, whose hash is stored server-side, makes revocation a
+delete, gives an audit trail of live sessions for free, and is harder to get
+subtly wrong - which matters more than it sounds, because a broken JWT
+implementation looks exactly like a working one right up until it is exploited.
+JWT keeps its real use case, short-lived access tokens in a distributed system
+and service-to-service calls; this product is one server.
+
+**50. Redis is not a cache, and money reads are never cached.** The instinct to
+put Redis in front of the database is the instinct to break this system's central
+property. Decisions 23, 28 and 30 are all guarantees about *when a fact becomes
+true*, and a cache in front of a balance is a machine for serving facts that are
+no longer true - precisely the class of bug six phases were spent designing out.
+There is also nothing to win: the reads are local SQLite, sub-millisecond, on a
+single node.
+
+Redis does earn its place later, for two things that are **not** caching:
+rate-limit counters and session storage, both of which are state that wants to
+expire and is not a duplicate of the ledger. It gets bought for those or not at
+all.
+
+**51. No Kafka.** The outbox already *is* the coordination mechanism. Decisions
+23 and 28 write a message in the same transaction as the fact it describes, which
+is what makes "we decided to warn" imply "the warning will be delivered" and "the
+money moved" imply "the user was told" - and that guarantee comes from a
+`COMMIT`, not from a broker. Kafka solves coordination across many services at
+high throughput; this is one process on one node. Adopting it would add a broker,
+topics, consumer groups and offset debugging, in exchange for a guarantee already
+held. If asynchronous job processing is ever genuinely needed, the answer is a
+Postgres-backed queue or Redis/RQ, not a log.
+
+**52. Docker and a VPS, not Kubernetes.** Kubernetes solves orchestration across
+many services with independent scaling needs and a team to run them. There is one
+service, one deploy target and one author. `docker compose` on a VPS behind a
+reverse proxy with TLS is the whole of what this needs - a deployment that can be
+understood in an afternoon, rather than an operational surface that would have to
+be learned before it could be used.
+
 ### Still open
 
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
@@ -972,14 +1118,6 @@ is the one that has to cope.
   `dedupe_key`), and a `notify status` / `notify retry` command. A second kind of
   message now exists, so the question is live rather than hypothetical - and it
   was still *not* taken in Phase 6. See the next bullet for why.
-- **The two drains behind one port.** `DeliverPendingMessages` and
-  `DeliverNotifications` are now the same class in every respect but two: what
-  they read, and the expiry rule only one of them has. They would both be
-  concrete, so extracting a shared seam is not premature in the usual sense. It
-  was deferred because the risky half of Phase 6 was a receipt landing inside the
-  payout transaction, and moving the well-tested warning path at the same time
-  would have meant debugging two things at once. Next phase, when both shapes are
-  known rather than predicted.
 - **A long SMTP outage delivers a backlog of true-but-late receipts.** This is a
   consequence of decision 30 and is accepted, not overlooked: a receipt never
   expires, so an install that loses its mail account accumulates them and sends
@@ -993,3 +1131,93 @@ is the one that has to cope.
   what each one carries. Worth resolving once, when nothing else is in flight.
 - Any channel other than SMTP. `NotificationChannel` is the port that makes one a
   drop-in; building it now would be guessing at the second case.
+
+## Roadmap
+
+Where the project goes next, and in what order. The **order** is the part worth
+arguing about - each phase is listed with what it makes possible, so a phase that
+stops earning its place can be dropped rather than finished out of momentum.
+
+The platform decisions above shape the sequencing, and it is worth reading them
+together: an API before auth (48), opaque sessions over JWT (49), no broker (51),
+no orchestrator (52), and no cache in front of money (50). Three of those are
+decisions *not* to build something, which is the half of a roadmap that is
+usually missing and the half that decides whether the other half ships.
+
+### Phase 1 - Identity and the HTTP API
+
+The foundation, and nothing else on this list works before it.
+
+- A `User` aggregate and a `users` table, so `wallets.user_id` finally points at
+  something. Email, a Google subject id, a created-at moment.
+- **Authorization, not just authentication**: every wallet read and write checked
+  against the calling user. Today the field exists and is never consulted, which
+  is the largest actual hole in the system.
+- A FastAPI application exposing what the CLI already exposes. This is a *new
+  presentation layer*, not a rewrite: `WalletService` and `PlanService` are the
+  seam, and the API calls the same use cases the CLI does.
+- A health endpoint, because a VPS deploy without one cannot be checked.
+
+### Phase 2 - Authentication
+
+Everything here is a property of the API built in Phase 1.
+
+- Opaque session tokens, hashed at rest, revocable by deletion (decision 49).
+- Password hashing with argon2, if email and password signup is wanted at all.
+- Google OIDC signup, matching on the Google subject id rather than the email.
+- Rate limiting on the auth endpoints first - login and signup are the ones worth
+  brute-forcing - then on the API generally.
+- TLS. Non-negotiable, and the reason a reverse proxy sits in Phase 4.
+
+### Phase 3 - Paystack
+
+The phase that makes this a product rather than an exercise. It is also the phase
+where the existing domain work pays off, because the hard parts are already built.
+
+- Payment initiation, writing a `PENDING` transaction with an
+  `internal_reference` - the idempotency key decision 7 derives rather than
+  generates.
+- A webhook endpoint with **signature verification**. This is the highest-risk
+  item in the whole roadmap: without HMAC verification of Paystack's signature,
+  anyone who learns the endpoint URL can POST themselves a deposit. It is the
+  first thing to build here and the first thing to test.
+- The callback wired to the existing `provider_reference` path, so a webhook that
+  arrives twice is already a solved problem.
+- A reconciliation job comparing the ledger against Paystack's records. Webhooks
+  get lost and payments get reversed; drift has to be detected, not assumed away.
+
+### Phase 4 - Production
+
+- Migrations through a tool (Alembic), replacing the hand-rolled PRAGMA-guarded
+  `ALTER`s that `sqlite_unit_of_work.py` already flags as the manual version.
+- `docker compose`, a reverse proxy with TLS, and a VPS.
+- **Backups with a tested restore.** A backup nobody has restored is a belief,
+  not a backup, and this is the one item whose absence is unrecoverable.
+- Structured logging and error tracking.
+- CI running the suite on every push. 1,191 tests that nobody runs automatically
+  are a liability that feels like an asset.
+
+### Phase 5 - Scale, when a real constraint asks for it
+
+Deliberately last, and each item waits for the thing that justifies it.
+
+- **Postgres**, when concurrent writers make SQLite's single-writer lock bite.
+  The `UnitOfWork` abstraction is what makes this contained - the swap happens in
+  the composition root and the repository implementations, and the domain does not
+  move at all. That abstraction is about to pay for itself.
+- **Redis**, for session storage and rate-limit counters (decision 50).
+
+Kafka and Kubernetes are not on this list and probably never will be (decisions
+51 and 52). They are answers to problems this product does not have.
+
+### What "MVP" means here
+
+> A person signs up with Google, gets a wallet, deposits real money through
+> Paystack, creates a savings plan, and receives an email receipt - over HTTPS,
+> on a VPS, with backups that have been restored once.
+
+That is Phases 1 through 4, and it is a genuine product rather than a demo. It is
+also, honestly, **months** of part-time work for someone learning as they go, not
+weeks. The order is arranged so that this sentence becomes true as early as it
+can: Phase 3 is what a user would call the product, and Phases 1 and 2 are what
+make it safe to let anyone near it.

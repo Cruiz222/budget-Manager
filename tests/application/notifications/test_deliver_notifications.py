@@ -433,3 +433,79 @@ class TestTheReport:
         )
 
         assert WarningReport is DeliveryReport
+
+
+class TestOneDrainServesBothQueues:
+    def test_both_drains_are_the_same_pass_configured_differently(self):
+        """Decision 45, pinned so it cannot quietly revert.
+
+        ``DeliverNotifications`` and ``DeliverPendingMessages`` are now siblings
+        by *configuration*, not by a second copy of the pass: both subclass one
+        ``DeliverQueue``. Before this, the algorithm existed twice and the
+        prose explaining it existed twice with it, which is the drift the merge
+        was taken to end.
+        """
+        from app.application.notifications.deliver_pending_messages import (
+            DeliverPendingMessages,
+        )
+        from app.application.notifications.deliver_queue import DeliverQueue
+
+        assert issubclass(DeliverNotifications, DeliverQueue)
+        assert issubclass(DeliverPendingMessages, DeliverQueue)
+
+    def test_neither_subclass_writes_its_own_pass(self):
+        """Checked by identity, not by ``issubclass``.
+
+        A subclass that overrode ``execute`` to copy it would still satisfy the
+        assertion above, and that copy is precisely the outcome the merge exists
+        to prevent. Identity is the only check that catches it.
+        """
+        from app.application.notifications.deliver_pending_messages import (
+            DeliverPendingMessages,
+        )
+        from app.application.notifications.deliver_queue import DeliverQueue
+
+        assert DeliverNotifications.execute is DeliverQueue.execute
+        assert DeliverPendingMessages.execute is DeliverQueue.execute
+
+    def test_the_only_thing_a_subclass_says_is_which_store_to_read(self):
+        """The seam, stated as a test.
+
+        A subclass that grows a second public responsibility has stopped being a
+        configuration of the base and become a second drain - the state decision
+        45 was taken to leave behind. ``_queue`` is the whole of the difference.
+        """
+        # ``_abc_impl`` is injected by ``ABCMeta`` into the ``__dict__`` of every
+        # class it creates, this concrete subclass included. It is machinery
+        # rather than something a person wrote here, so it is excluded by name -
+        # filtering on ``__`` alone would let it through, which is exactly how
+        # this assertion failed the first time it was run.
+        own_names = {
+            name
+            for name in vars(DeliverNotifications)
+            if not name.startswith("__") and name != "_abc_impl"
+        }
+
+        assert own_names == {"_queue"}
+
+    def test_an_ancient_receipt_is_delivered_rather_than_expired(
+        self, tmp_path, build_channel
+    ):
+        """Decision 46 seen from the drain's side, and the merge's real proof.
+
+        The message was composed a year before the pass runs. The warning drain
+        would expire that on sight - which is exactly what decision 30 refused to
+        let happen to a receipt, and the reason the old code kept two separate
+        passes. Nothing here can expire it, because nothing here decides
+        staleness at all: the message does, and this message says never.
+        """
+        channel = build_channel()
+        deliverer, factory, db = build_deliverer(tmp_path, channel)
+        notification = build_notification(created_at=datetime(2025, 3, 2, 12, 0))
+        seed(factory, [notification])
+
+        report = deliverer.execute(NEXT_WEEK)
+
+        assert len(report.sent) == 1
+        assert report.expired == ()
+        assert only_row(db)["status"] == "SENT"

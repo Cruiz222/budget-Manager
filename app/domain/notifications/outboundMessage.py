@@ -102,6 +102,21 @@ class OutboundMessage:
         """Whether this message is done - sent or expired, and no longer owed."""
         return self.status.is_settled
 
+    def is_stale(self, as_of: datetime) -> bool:
+        """Whether the occurrence this warns about has already arrived.
+
+        Strict at the lower bound, exactly as the notice window is (decision 20):
+        at ``due_at`` the payout is happening and a warning about it is no longer
+        news (decision 25).
+
+        The rule lives here rather than as a branch in the delivery pass, and
+        that placement is decision 46. The drain asks every message it holds the
+        same question; a warning answers it from its own occurrence, and a
+        receipt answers it with a flat ``False``. Nothing about the drain then
+        depends on which queue it is draining.
+        """
+        return self.due_at <= as_of
+
     def mark_sent(self, at: datetime) -> None:
         """Record that the message was delivered."""
         self._refuse_if_settled()

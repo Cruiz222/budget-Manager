@@ -335,3 +335,44 @@ class TestItsLifecycle:
         assert notification.status is DeliveryStatus.SENT
         assert notification.attempts == 1
         assert notification.last_error == "connection refused"
+
+
+class TestWhenItStopsBeingWorthSending:
+    def test_never_it_is_always_worth_sending(self):
+        """Decision 30, in the one place it is now executed.
+
+        A receipt reports something that already happened, and that never stops
+        being true. There is no ``as_of`` that makes "your payout went out" a
+        message better dropped than delivered, so the answer is a flat ``False``
+        at every moment - here at the event, and ten minutes later.
+        """
+        notification = build_notification(created_at=NOON)
+
+        assert notification.is_stale(NOON) is False
+        assert notification.is_stale(TEN_PAST_NOON) is False
+
+    def test_a_century_later_it_is_still_worth_sending(self):
+        """No horizon, not merely a distant one.
+
+        Worth pinning precisely because it looks absurd: there is no large
+        ``as_of`` at which this flips. A rule that held "for long enough" would
+        be a deadline wearing a disguise, and the receipt would be dropped by
+        whichever drain ran after it.
+        """
+        notification = build_notification(created_at=NOON)
+
+        assert notification.is_stale(datetime(2126, 3, 2, 12, 0)) is False
+
+    def test_a_wedged_retry_never_becomes_stale(self):
+        """The backlog consequence, pinned as behaviour rather than as prose.
+
+        A receipt that has failed a hundred times is still owed, and still true.
+        If accumulated failures could make it stale, the one receipt that
+        matters would be the one dropped - which is exactly what this drain
+        exists to prevent. The cost is real and accepted: the retry has no cap.
+        """
+        notification = build_notification()
+        for _ in range(100):
+            notification.record_failure("connection refused")
+
+        assert notification.is_stale(TEN_PAST_NOON) is False

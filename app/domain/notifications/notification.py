@@ -103,6 +103,26 @@ class Notification:
         """Whether this message is done - sent or expired, and no longer owed."""
         return self.status.is_settled
 
+    def is_stale(self, as_of: datetime) -> bool:
+        """Never. A receipt is about the past, and the past does not go stale.
+
+        Always ``False`` - see decision 30. Nothing about "your payout went out"
+        becomes untrue with age, so there is no moment after which this message
+        is better dropped than sent. It is retried until it lands, however long
+        that takes, and the backlog that produces is accepted deliberately.
+
+        It is here, rather than the drain carrying a flag for it, so that the
+        drain never has to know which queue it is draining - see decision 46. A
+        boolean on the drain would be decision 30's failure exactly: a switch
+        that can be set the wrong way, failing silently, with the receipt
+        expired on the tick it was written.
+
+        ``as_of`` is unused, and that is the point rather than an oversight. The
+        parameter is taken so that both messages answer the same question in the
+        same shape; the answer simply does not depend on it.
+        """
+        return False
+
     def mark_sent(self, at: datetime) -> None:
         """Record that the message was delivered."""
         self._refuse_if_settled()

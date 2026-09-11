@@ -255,6 +255,59 @@ class TestItsLifecycle:
         assert message.last_error == "connection refused"
 
 
+class TestWhenItStopsBeingWorthSending:
+    def test_before_its_occurrence_it_is_still_worth_sending(self):
+        message = build_message(due_at=NOON)
+
+        assert message.is_stale(HALF_PAST_ELEVEN) is False
+
+    def test_at_its_occurrence_it_is_already_too_late(self):
+        """Strict at the lower bound, exactly as the notice window is.
+
+        Decision 20's comparison, in the place where it is finally acted on: at
+        ``due_at`` the payout is happening, and a warning about a payout that is
+        happening is no longer news. This is the assertion the drain's expiry
+        branch rests on - if the bound went slack here, a warning would be sent
+        for a payout already in flight.
+        """
+        message = build_message(due_at=NOON)
+
+        assert message.is_stale(NOON) is True
+
+    def test_after_its_occurrence_it_is_stale(self):
+        message = build_message(due_at=HALF_PAST_ELEVEN)
+
+        assert message.is_stale(NOON) is True
+
+    def test_it_is_about_the_moment_asked_and_not_the_moment_composed(self):
+        """``created_at`` plays no part in the answer.
+
+        A message composed long before its occurrence is not stale merely for
+        being old, and one composed moments before is not spared for being
+        fresh. The question is entirely about ``due_at`` against ``as_of`` -
+        which is what lets the drain ask it of a message it has just read,
+        without knowing when that message was written.
+        """
+        composed_early = build_message(due_at=NOON, created_at=HALF_PAST_ELEVEN)
+        composed_late = build_message(due_at=HALF_PAST_ELEVEN, created_at=NOON)
+
+        assert composed_early.is_stale(HALF_PAST_ELEVEN) is False
+        assert composed_late.is_stale(NOON) is True
+
+    def test_a_settled_message_answers_the_same_question_the_same_way(self):
+        """Staleness is a fact about the clock, not about delivery state.
+
+        The answer must not depend on status. If it did, "already sent" would be
+        indistinguishable from "too late", and a report would describe a message
+        that went out as one that expired.
+        """
+        message = build_message(due_at=NOON)
+        message.mark_sent(HALF_PAST_ELEVEN)
+
+        assert message.is_stale(HALF_PAST_ELEVEN) is False
+        assert message.is_stale(NOON) is True
+
+
 class TestTheStatusEnum:
     def test_only_pending_is_unsettled(self):
         assert DeliveryStatus.PENDING.is_settled is False
