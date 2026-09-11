@@ -66,3 +66,56 @@ class InvalidOutboundMessageSettledAtError(NotificationError):
 
 class MessageAlreadySettledError(NotificationError):
     pass
+
+
+# --- Notification -----------------------------------------------------------
+# The receipt half, with its own classes rather than reusing the ones above.
+# The two aggregates reject different things - an ``OutboundMessage`` without a
+# plan id is a bug, and so is a ``Notification`` *with* one - so a shared error
+# would have to describe neither. ``MessageAlreadySettledError`` is the one
+# exception both raise, because "this message is already finished" means exactly
+# the same thing on either side.
+
+
+class InvalidNotificationEventKeyError(NotificationError):
+    pass
+
+
+class InvalidNotificationKindError(NotificationError):
+    pass
+
+
+class InvalidNotificationSubjectIDError(NotificationError):
+    pass
+
+
+class InvalidNotificationRecipientError(NotificationError):
+    pass
+
+
+class InvalidNotificationSubjectError(NotificationError):
+    pass
+
+
+class InvalidNotificationBodyError(NotificationError):
+    pass
+
+
+class InvalidNotificationCreatedAtError(NotificationError):
+    pass
+
+
+class InvalidNotificationStatusError(NotificationError):
+    pass
+
+
+class InvalidNotificationAttemptsError(NotificationError):
+    pass
+
+
+class InvalidNotificationLastErrorError(NotificationError):
+    pass
+
+
+class InvalidNotificationSettledAtError(NotificationError):
+    pass

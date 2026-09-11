@@ -1,7 +1,7 @@
 import sqlite3
 
 from app.domain.notifications.outboundMessage import OutboundMessage
-from app.domain.notifications.outboundMessageStatus import OutboundMessageStatus
+from app.domain.notifications.deliveryStatus import DeliveryStatus
 from app.domain.repositories.outbound_message_repository import (
     OutboundMessageRepository,
 )
@@ -74,7 +74,7 @@ class SqliteOutboundMessageRepository(OutboundMessageRepository):
             WHERE status = ?
             ORDER BY due_at
             """,
-            (enum_to_text(OutboundMessageStatus.PENDING),),
+            (enum_to_text(DeliveryStatus.PENDING),),
         ).fetchall()
         return [self._row_to_message(row) for row in rows]
 
@@ -125,7 +125,7 @@ class SqliteOutboundMessageRepository(OutboundMessageRepository):
             recipient=row["recipient"],
             subject=row["subject"],
             body=row["body"],
-            status=text_to_enum(OutboundMessageStatus, row["status"]),
+            status=text_to_enum(DeliveryStatus, row["status"]),
             attempts=row["attempts"],
             last_error=row["last_error"],
             created_at=text_to_datetime(row["created_at"]),

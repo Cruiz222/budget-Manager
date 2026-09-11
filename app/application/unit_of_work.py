@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+from app.domain.repositories.notification_repository import NotificationRepository
 from app.domain.repositories.outbound_message_repository import (
     OutboundMessageRepository,
 )
@@ -25,13 +26,24 @@ class UnitOfWork(ABC):
     they could commit separately, a crash between them would leave a ledger
     entry with no explanation, or an explanation with no ledger entry.
 
-    ``outbound_messages`` is on the unit for that same reason, and it is the
-    only other repository that is. A warning becomes two rows - the claim in
-    ``notices`` and the queued message here - and they must land together. If
-    they could commit separately, a crash between them would leave the notice
-    claimed and no message queued, and since a claimed notice is never raised
-    again, that warning would be lost *permanently*. The pairing is what makes
-    "we decided to warn" imply "the warning will be delivered".
+    ``outbound_messages`` is on the unit for that same reason, and it is no
+    longer the only other repository that is. A warning becomes two rows - the
+    claim in ``notices`` and the queued message here - and they must land
+    together. If they could commit separately, a crash between them would leave
+    the notice claimed and no message queued, and since a claimed notice is never
+    raised again, that warning would be lost *permanently*. The pairing is what
+    makes "we decided to warn" imply "the warning will be delivered".
+
+    ``notifications`` is here for that same class of reason applied to a second
+    pair. A run writes its ledger rows, its ``plan_runs`` row and its receipt in
+    one unit, because the run row is the *only* record that money left - a payout
+    that committed without its receipt queued would be money the user is never
+    told about, with nothing left to notice the omission later. The pairing is
+    what makes "the money moved" imply "the user was told".
+
+    Two repositories carrying that weight is worth marking, because the pressure
+    is always to treat a message as a side effect. It is not: a message that can
+    be lost while the fact it describes survives is a message that will be.
 
     ``notices``, by contrast, sits here for convenience rather than for that
     reason, and the difference is worth noticing: on its own a warning shares no
@@ -48,6 +60,7 @@ class UnitOfWork(ABC):
     plan_runs: PlanRunRepository
     notices: PlanNoticeRepository
     outbound_messages: OutboundMessageRepository
+    notifications: NotificationRepository
 
     @abstractmethod
     def commit(self) -> None:

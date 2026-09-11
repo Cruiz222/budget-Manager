@@ -1,3 +1,4 @@
+from app.application.notifications.deliver_notifications import DeliverNotifications
 from app.application.notifications.deliver_pending_messages import (
     DeliverPendingMessages,
 )
@@ -16,8 +17,36 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 )
 
 
+def _channel_for(settings: EmailSettings | None, channel=None):
+    """The channel to deliver through: the injected one, SMTP, or none at all.
+
+    Shared by both deliverers, and sharing it is the point. A second copy of
+    this construction would be a second place to get the adapter's arguments
+    wrong - to forget ``starttls``, or to swap the username and the sender - and
+    the two queues would then deliver identically-composed messages over
+    differently-configured connections, which is the kind of difference nobody
+    thinks to look for.
+
+    ``None`` is a value here, not a failure: it is how "this installation has no
+    email" reaches a drain as a state it can report. See ``build_deliverer``.
+    """
+    if channel is not None:
+        return channel
+    if settings is None:
+        return None
+    return SmtpNotificationChannel(
+        host=settings.host,
+        port=settings.port,
+        sender=settings.sender,
+        username=settings.username,
+        password=settings.password,
+        starttls=settings.starttls,
+    )
+
+
 def build_wallet_service(
     unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
 ) -> WalletService:
     """Composition root: the one place concrete persistence is chosen.
 
@@ -25,9 +54,18 @@ def build_wallet_service(
     factory is where the SQLite-backed implementation is wired in, writing to
     "budget.db" in the working directory. Tests inject a factory pointed at a
     temp file. Swapping storage happens here and nowhere else.
+
+    ``settings`` is the recipient a receipt is addressed to, and passing it here
+    rather than into each operation is deliberate: an operation takes an amount
+    and a reference, and adding "and where to send the mail" to ``deposit`` would
+    put a delivery concern in the signature of a money move. The address is a
+    property of the *installation*, so it is fixed when the service is built.
+    ``None`` means no email is configured, which is a normal state and not an
+    error - see ``WalletService.ANNOUNCED``.
     """
     return WalletService(
-        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory()
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        recipient=settings.recipient if settings is not None else None,
     )
 
 
@@ -54,6 +92,7 @@ def build_plan_service(
 
 def build_scheduler(
     unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
 ) -> RunDuePlans:
     """Wire up one scheduler tick over the same storage as the wallet service.
 
@@ -64,11 +103,20 @@ def build_scheduler(
     it a different factory and it would be writing to a different database
     entirely - the money would move in one place while the plan advanced in
     another.
+
+    It is also the same factory the run's *receipt* is queued through, and that
+    matters for the same reason: the receipt is written in the run's own
+    transaction, so a factory that did not see the run could not see the receipt
+    either. The recipient is the only thing this builder adds to what the
+    executor already needed - it changes what the run *says*, never what it does.
     """
     factory = unit_of_work_factory or SqliteUnitOfWorkFactory()
     return RunDuePlans(
         unit_of_work_factory=factory,
-        execute_plan_run=ExecutePlanRun(unit_of_work_factory=factory),
+        execute_plan_run=ExecutePlanRun(
+            unit_of_work_factory=factory,
+            recipient=settings.recipient if settings is not None else None,
+        ),
     )
 
 
@@ -115,16 +163,36 @@ def build_deliverer(
     ``channel`` lets a test inject a fake and is why no test in this suite opens
     a socket. It takes precedence when given.
     """
-    if channel is None and settings is not None:
-        channel = SmtpNotificationChannel(
-            host=settings.host,
-            port=settings.port,
-            sender=settings.sender,
-            username=settings.username,
-            password=settings.password,
-            starttls=settings.starttls,
-        )
     return DeliverPendingMessages(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
-        channel=channel,
+        channel=_channel_for(settings, channel),
+    )
+
+
+def build_notification_deliverer(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
+    channel=None,
+) -> DeliverNotifications:
+    """Wire up receipt delivery, choosing SMTP when email is configured.
+
+    The mirror of ``build_deliverer`` one queue over, and it is a separate
+    function rather than a parameter on that one because the two drains are
+    separate classes with separate rules - a receipt has no deadline, so this
+    drain never expires anything. Sharing a builder would mean sharing a
+    signature that could not describe the difference.
+
+    What *is* shared is the channel, deliberately: both queues hand their
+    messages to the same adapter through the same three fields, so an install has
+    one SMTP configuration and not two. A user who can receive warnings can
+    receive receipts, and a user who cannot receive either has one thing to fix.
+
+    No shared factory is required here either. A receipt is written in its run's
+    transaction by whoever caused the run, and this drain only reads and updates
+    rows that already exist - so it can safely be built on its own factory
+    pointing at the same database, exactly as ``build_notifier`` is.
+    """
+    return DeliverNotifications(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        channel=_channel_for(settings, channel),
     )

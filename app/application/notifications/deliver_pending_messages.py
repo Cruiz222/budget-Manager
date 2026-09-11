@@ -12,26 +12,49 @@ another pass that can fail as loudly as it likes without taking a payout with it
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Generic, TypeVar
 
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.domain.notifications.notificationChannel import NotificationChannel
 from app.domain.notifications.outboundMessage import OutboundMessage
 
+#: The message type a report describes - an ``OutboundMessage`` for the warning
+#: drain, a ``Notification`` for the receipt one.
+T = TypeVar("T")
+
 
 @dataclass(frozen=True)
-class DeliveryReport:
+class DeliveryReport(Generic[T]):
     """What one delivery pass did, described for whoever has to report it.
 
     Lists rather than counts, because the caller's job is to say *which* messages
     went out and which are stuck - a bare "2 sent" is not actionable, while a
     plan id and an error message are. A view, not a record: nothing here is
     stored, and nothing reads it to make a decision.
+
+    **Generic over the message type**, which buys less than it looks like and is
+    still worth it. There are two drains - the warning queue and the receipt
+    queue - and they keep identical accounts of different aggregates. Without
+    this parameter there would be a second, identical dataclass, kept in step by
+    hand for no benefit: the *reporting* rule (say which, not how many; stay
+    silent when there is nothing) is a property of delivery, not of what is being
+    delivered.
+
+    What it deliberately does **not** do is let the two drains share their code.
+    Only the vocabulary is shared; the two passes remain separate. That is a
+    decision, not an oversight, and it is listed under *Still open* in the
+    README.
+
+    ``expired`` is always empty for a receipt drain, by design - nothing expires
+    a notification (see ``Notification``). The field stays because a report is
+    the same four things whichever queue it describes, and a slot that means
+    "nothing was dropped" is more honest than a report with no way to say it.
     """
 
-    sent: tuple[OutboundMessage, ...] = ()
-    expired: tuple[OutboundMessage, ...] = ()
-    failed: tuple[OutboundMessage, ...] = ()
-    deferred: tuple[OutboundMessage, ...] = ()
+    sent: tuple[T, ...] = ()
+    expired: tuple[T, ...] = ()
+    failed: tuple[T, ...] = ()
+    deferred: tuple[T, ...] = ()
 
     @property
     def is_quiet(self) -> bool:
@@ -82,7 +105,7 @@ class DeliverPendingMessages:
         # owed until one exists again.
         self._channel = channel
 
-    def execute(self, as_of: datetime) -> DeliveryReport:
+    def execute(self, as_of: datetime) -> DeliveryReport[OutboundMessage]:
         """Settle or send everything currently queued, and report what happened.
 
         ``as_of`` is taken rather than read from the clock for the same reason it

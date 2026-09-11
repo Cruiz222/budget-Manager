@@ -15,7 +15,7 @@ from .exception import (
     InvalidOutboundMessageSubjectError,
     MessageAlreadySettledError,
 )
-from .outboundMessageStatus import OutboundMessageStatus
+from .deliveryStatus import DeliveryStatus
 
 
 @dataclass(init=False)
@@ -62,7 +62,7 @@ class OutboundMessage:
     subject: str
     body: str
     created_at: datetime
-    status: OutboundMessageStatus
+    status: DeliveryStatus
     attempts: int
     last_error: str | None
     settled_at: datetime | None
@@ -75,7 +75,7 @@ class OutboundMessage:
         subject: str,
         body: str,
         created_at: datetime,
-        status: OutboundMessageStatus = OutboundMessageStatus.PENDING,
+        status: DeliveryStatus = DeliveryStatus.PENDING,
         attempts: int = 0,
         last_error: str | None = None,
         settled_at: datetime | None = None,
@@ -105,7 +105,7 @@ class OutboundMessage:
     def mark_sent(self, at: datetime) -> None:
         """Record that the message was delivered."""
         self._refuse_if_settled()
-        self.status = OutboundMessageStatus.SENT
+        self.status = DeliveryStatus.SENT
         self.settled_at = at
 
     def mark_expired(self, at: datetime) -> None:
@@ -116,14 +116,14 @@ class OutboundMessage:
         this leaves ``last_error`` alone and settles the row for good.
         """
         self._refuse_if_settled()
-        self.status = OutboundMessageStatus.EXPIRED
+        self.status = DeliveryStatus.EXPIRED
         self.settled_at = at
 
     def record_failure(self, error: str) -> None:
         """Record that a delivery attempt failed, leaving the message queued.
 
         Deliberately *not* terminal, and the return to ``PENDING`` is the whole
-        point - see ``OutboundMessageStatus``. The message is still owed, so the
+        point - see ``DeliveryStatus``. The message is still owed, so the
         next tick picks it up again, and ``attempts`` is the only trace of how
         many times it has been tried.
         """
@@ -174,9 +174,9 @@ class OutboundMessage:
                 f"created_at must be a datetime, got {type(self.created_at).__name__}"
             )
 
-        if not isinstance(self.status, OutboundMessageStatus):
+        if not isinstance(self.status, DeliveryStatus):
             raise InvalidOutboundMessageStatusError(
-                f"status must be an OutboundMessageStatus, "
+                f"status must be a DeliveryStatus, "
                 f"got {type(self.status).__name__}"
             )
 

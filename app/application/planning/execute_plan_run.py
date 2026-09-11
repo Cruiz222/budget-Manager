@@ -7,6 +7,7 @@ a description of what should happen; this is where it happens, atomically.
 import uuid
 from datetime import datetime
 
+from app.application.notifications import compose
 from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.release.release_funds import ReleaseFunds
@@ -14,6 +15,7 @@ from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.notifications.notification import Notification
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.plannedAction import PlannedAction
 from app.domain.planning.planRun import PlanRun
@@ -31,6 +33,29 @@ class ExecutePlanRun:
     - or none of those things are durable. There is no state in which the
     ledger says people were paid and the plan disagrees.
 
+    **The receipt is in that transaction too.** A run also queues the message
+    saying the money moved, and it does so before committing, for the same reason
+    the plan's own counter is written there: the run row is the *only* record
+    that money left. A payout that committed without its receipt queued would be
+    money the user is never told about, and nothing would be left to notice the
+    omission later - no pending row, no error, no trace. The pairing is what
+    makes "the money moved" imply "the user was told", which is a stronger claim
+    than "a message was composed" and the only one worth making.
+
+    The consequence is worth stating, because it is the opposite of the usual
+    instinct about side effects. If composing the message raises, the *payout*
+    rolls back - a mail-formatting bug stops a payment. That is deliberate, and
+    it is survivable rather than dangerous: the plan's counter has not advanced,
+    so the next tick derives the same occurrence, runs it again, and pays then.
+    Failing loudly costs one tick and buys *no payout without a receipt*. The
+    alternative - commit the money and queue the message afterwards - trades that
+    one tick for a permanent, silent hole.
+
+    Nothing is *sent* here. Composing and queueing are writes; sending is a
+    network call, and no network call belongs inside a transaction that moves
+    money. ``DeliverNotifications`` does that part afterwards, and can fail as
+    loudly as it likes without touching a payment.
+
     Why one occurrence per call, rather than looping to catch up:
 
     A plan checked after a long outage is due for every occurrence it missed. If
@@ -42,8 +67,18 @@ class ExecutePlanRun:
     call advances the counter by exactly one.
     """
 
-    def __init__(self, unit_of_work_factory: UnitOfWorkFactory):
+    def __init__(
+        self,
+        unit_of_work_factory: UnitOfWorkFactory,
+        recipient: str | None = None,
+    ):
         self._unit_of_work_factory = unit_of_work_factory
+        # ``None`` means this installation has no notification address, which is
+        # the ordinary state of a fresh install rather than an error. The run
+        # happens exactly as it would otherwise and simply says nothing about it.
+        # Note this is a *delivery* address, not a reason to run: it is read only
+        # when composing words, long after every decision about the money.
+        self._recipient = recipient
 
     def execute(self, plan_id: uuid.UUID, as_of: datetime) -> PlanRun | None:
         """Run the plan's next due occurrence, as of ``as_of``.
@@ -242,6 +277,16 @@ class ExecutePlanRun:
         uow.plan_runs.save(run)
         plan.pause()
         uow.plans.save(plan)
+        # The receipt for a run that did *not* happen, queued in the same unit as
+        # the record that it did not. This is the one message the user most needs
+        # and least expects: nothing moved, so the wallet is unchanged, there is
+        # no ledger row, and without this the only trace is a ``plan_runs`` row
+        # nobody reads unless the plan is already known to be stuck.
+        #
+        # Note it is queued on the blocked path for the same reason as on the
+        # successful one - a plan that cannot be funded is not a non-event, it is
+        # a payment the user is expecting that is not going to arrive.
+        self._announce(uow, compose.payout_blocked(plan, run, self._recipient))
         uow.commit()
         return run
 
@@ -258,11 +303,38 @@ class ExecutePlanRun:
         writes land together or none does. The three things that must agree:
         the run row says 1 April succeeded, the plan's counter says it is now
         looking at 1 May, and the wallet holds what is left.
+
+        The fourth write - the receipt - is not one of those three agreeing
+        things; it is a consequence of them. It is composed *last* so that it
+        describes a run that has already been fully recorded, and committed with
+        them so that a message cannot exist for a run that rolled back, or fail to
+        exist for one that did not.
         """
         run = PlanRun(plan_id=plan.plan_id, due_at=due_at, status=RunStatus.SUCCEEDED)
         uow.plan_runs.save(run)
         plan.record_run()
         uow.plans.save(plan)
         uow.wallets.save(wallet)
+        self._announce(uow, compose.payout_succeeded(plan, run, self._recipient))
         uow.commit()
         return run
+
+    @staticmethod
+    def _announce(uow: UnitOfWork, notification: Notification | None) -> None:
+        """Queue the receipt, or nothing when there is nowhere to send it.
+
+        A one-line method, and it exists so that the ``None`` handling is written
+        once instead of at both call sites. ``compose`` returns ``None`` when no
+        recipient is configured - see there - and the two outcomes it stands for
+        are different in kind: no message, versus a message that will be sent.
+        Neither is an error.
+
+        ``enqueue`` rather than ``save``, and the difference is the claim. The
+        insert itself decides whether this event has already been announced, so a
+        receipt cannot be queued twice however many times the run is executed -
+        which matters because at-least-once delivery and repeated runs both make
+        a second call reachable. See ``eventKey`` for why the same event always
+        derives the same key.
+        """
+        if notification is not None:
+            uow.notifications.enqueue(notification)

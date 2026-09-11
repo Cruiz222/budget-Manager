@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from app.domain.notifications.outboundMessage import OutboundMessage
+from app.domain.notifications.deliverable import Deliverable
 
 
 class NotificationChannel(ABC):
@@ -15,6 +15,13 @@ class NotificationChannel(ABC):
     that asserts delivery behaviour uses another - which is why no test in this
     suite ever opens a socket.
 
+    **It sends ``Deliverable``, not ``OutboundMessage``.** That is not a
+    loosening of the contract - it is the contract stated correctly. The port has
+    only ever needed a recipient, a subject and a body, and it now says so: any
+    record with those three is deliverable, which is what lets one channel serve
+    warnings and receipts without either aggregate being named here. See
+    ``Deliverable`` for why that seam is a ``Protocol`` rather than a base class.
+
     **Raising is the interface, not an error path.** ``send`` is expected to raise
     when it cannot deliver, and the caller treats that as ordinary: the failure is
     recorded and the message is retried next tick. A channel that swallowed its
@@ -28,7 +35,7 @@ class NotificationChannel(ABC):
     """
 
     @abstractmethod
-    def send(self, message: OutboundMessage) -> None:
+    def send(self, message: Deliverable) -> None:
         """Deliver one message, or raise.
 
         Returning normally means the channel accepted responsibility for the

@@ -408,6 +408,14 @@ consequence is easy to miss: enums are stored in the database **by name**, so
 free, and widening a column is free only while the values already in it stay
 true.
 
+*Worked example, added in Phase 6.* `OutboundMessageStatus` was renamed to
+`DeliveryStatus` when a second kind of message arrived and the old name stopped
+describing what the enum held. **No migration was needed**, and it is worth
+having a concrete case for why: `enum_to_text` stores a member's *name*, the
+member names (`PENDING` / `SENT` / `EXPIRED`) did not change, and so not one byte
+already on disk was affected. Renaming the *class* is free; renaming a *member*
+is the migration. The two look identical in a diff.
+
 **7. Idempotency keys are derived, never generated.**
 A transaction's `internal_reference` is `plan:{plan_id}:{due_at}:{index}` - the
 same inputs always produce the same key. A generated key (a uuid, a timestamp)
@@ -593,6 +601,82 @@ The recipient is captured **on the row** at enqueue rather than resolved at send
 time, so changing `BUDGET_NOTIFY_TO` cannot retroactively redirect messages that
 were queued before the change.
 
+### Saying what happened
+
+The five decisions the receipts were built on. Phase 5 gave the *warning* a
+destination; it did not give the *payout* one. At noon on 2 March the tick printed
+`succeeded` and emailed nothing, because the warning had already gone out half an
+hour earlier and a warning is claimed once per occurrence - the message a user
+most wants, **"the money just moved"**, was never sent at all. This is that
+message, for every plan event and every wallet event, and for the wallet commands
+immediately rather than at the next tick.
+
+The mechanism is deliberately the warning's mechanism one queue over: the same
+`NotificationChannel` port, the same SMTP adapter, the same retry-and-record rule,
+the same drain shape. What could *not* be reused is the record, and the pair
+`OutboundMessage` / `Notification` is where this phase's thinking actually lives.
+
+**28. A receipt is a consequence of the payment, never a condition on it.**
+The receipt is enqueued inside the run's own transaction, before the commit that
+makes the money real, so **no payout can commit without its receipt**. The usual
+instinct about side effects says the opposite - a message must never be able to
+stop a payment - and here it can, deliberately. The failure is survivable rather
+than dangerous, because a blocked run does not advance the plan's counter: if
+composing the message raises, the run rolls back, the next tick derives the *same*
+occurrence, and it pays then. Fail-loud costs one tick and buys the stronger
+claim, which is **"the money moved" implies "the user was told"** - not the weaker
+"a message was composed, somewhere". For a wallet command there is no retry behind
+the rollback, but the outcome is still the safe one: nothing moved, and nothing
+claims it did.
+
+**29. One message per run, not per instruction.** A payroll to three accounts is
+one email, not three. The plan's instructions are listed in the body instead, in
+the order they were executed - the same information, arriving as one thing that
+happened rather than three that have to be reassembled by hand to answer "did the
+run happen?". `for_plan_event` is the enforcement: it is keyed on the plan and the
+occurrence, with no index in it.
+
+**30. A notification has no deadline.** A warning stops being worth sending when
+its occurrence arrives (decision 25); a receipt never does, because "your payout
+went out" does not become false. That one difference is the whole reason the two
+live in separate tables rather than in one with a type column: feeding a receipt
+through `DeliverPendingMessages`' `due_at <= as_of -> expire` rule would expire it
+on the very tick it was written, since a receipt is *created at* its moment. So
+`DeliverNotifications` has no expiry branch at all, and `notifications` has no
+`expires_at` column - a nullable column that no code writes would advertise expiry
+as a live concept. The migration is cheap when the first genuinely time-limited
+kind arrives, and *that* is when the rule's real shape will be knowable.
+
+**31. A notification is claimed by an insert on a derived key.** Decision 21
+again, for the same reason. The key is `<kind>:<scope>:<identity>` - the event's
+own facts, derived and never generated (decision 7) - and it is the table's
+primary key, so a second enqueue of the same event inserts nothing rather than
+being rejected by a check somewhere. Two parts of that key are load-bearing rather
+than decorative. The **kind** is first: a run blocked at noon and retried
+successfully in April shares one `plan_runs` row and one `due_at`, and those
+really are two things that happened to the user, so they must derive two keys -
+while the *same* outcome reached twice, such as a plan blocked, resumed unfunded
+and blocked again, collapses to one and is announced once. The **scope** keeps a
+plan event and a wallet event apart, since both subjects are UUIDs. Getting either
+wrong is not loud; it is a message that silently never sends.
+
+**32. The notice set is boundary-crossing events.** Deposit, withdrawal, payout,
+and plan run succeeded / blocked. Locking and releasing are **absent on purpose**:
+they move money between the wallet's own two balances, so nothing the owner holds
+changes, and they are typed at a terminal that has already printed the result.
+Freeze and unfreeze are absent for that reason plus one more - they change a
+status flag and no money at all. Which operations speak is `WalletService.ANNOUNCED`,
+a dict rather than four branches in the flow every operation shares, so adding one
+later is a line and "does a release send an email?" has one answer in one place.
+It is a reversible bet, not a gate.
+
+The wallet half adds one thing the plan half did not need: **"immediately" means
+the command delivers after itself.** `deposit`, `withdraw` and `payout` drain the
+receipt queue before they exit, where previously only `plan tick` drained
+anything. That puts a ten-second SMTP timeout in front of an interactive command,
+which is acceptable *only* because the money has already committed before any
+socket opens - a hang costs latency and can never cost correctness.
+
 ### Still open
 
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
@@ -603,7 +687,27 @@ were queued before the change.
   root. The rename touches every domain package and decision 6, so it wants a day
   when nothing else is in flight.
 - Generalising the outbox beyond plan warnings (a generated `message_id`, a
-  `dedupe_key`), and a `notify status` / `notify retry` command. Worth doing when
-  a second kind of message exists, not before.
+  `dedupe_key`), and a `notify status` / `notify retry` command. A second kind of
+  message now exists, so the question is live rather than hypothetical - and it
+  was still *not* taken in Phase 6. See the next bullet for why.
+- **The two drains behind one port.** `DeliverPendingMessages` and
+  `DeliverNotifications` are now the same class in every respect but two: what
+  they read, and the expiry rule only one of them has. They would both be
+  concrete, so extracting a shared seam is not premature in the usual sense. It
+  was deferred because the risky half of Phase 6 was a receipt landing inside the
+  payout transaction, and moving the well-tested warning path at the same time
+  would have meant debugging two things at once. Next phase, when both shapes are
+  known rather than predicted.
+- **A long SMTP outage delivers a backlog of true-but-late receipts.** This is a
+  consequence of decision 30 and is accepted, not overlooked: a receipt never
+  expires, so an install that loses its mail account accumulates them and sends
+  the whole pile the day email works again - a month of deposits arriving as one
+  burst of twenty emails. Every one is still true, which is why nothing is
+  dropped, but a digest ("12 receipts from the last week") is the shape the fix
+  would take. It wants a real outage to design against.
+- Renaming `OutboundMessage`, whose name is now narrower than its job - it is
+  specifically the *warning* queue, sitting beside `Notification`. The pairing is
+  itself the tension: two names that describe a lifetime difference rather than
+  what each one carries. Worth resolving once, when nothing else is in flight.
 - Any channel other than SMTP. `NotificationChannel` is the port that makes one a
   drop-in; building it now would be guessing at the second case.

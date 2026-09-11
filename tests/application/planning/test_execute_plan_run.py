@@ -1,6 +1,8 @@
 from datetime import date, datetime
 from decimal import Decimal
 
+import pytest
+
 from app.application.planning.execute_plan_run import ExecutePlanRun
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
@@ -8,6 +10,7 @@ from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.money import Money
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.notifications.notificationKind import NotificationKind
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.plannedAction import PlannedAction
 from app.domain.planning.planSource import PlanSource
@@ -17,6 +20,11 @@ from app.domain.planning.runStatus import RunStatus
 from app.infrastructure.persistence.sqlite_unit_of_work import SqliteUnitOfWorkFactory
 
 NGN = Currency.NGN
+
+#: Where a run's receipt is addressed. Passed in rather than read from the
+#: environment, because ``ExecutePlanRun`` takes its inputs as arguments -
+#: reading ``os.environ`` is the CLI's job, not the use case's.
+RECIPIENT = "chinedu@example.com"
 
 BANK = Destination(
     kind=DestinationKind.BANK_ACCOUNT,
@@ -46,9 +54,9 @@ def release(amount: str, label: str = "emergency") -> Instruction:
 # --- harness ---------------------------------------------------------------
 
 
-def build_executor(tmp_path, name="plans.db"):
+def build_executor(tmp_path, name="plans.db", recipient=None):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / name))
-    return ExecutePlanRun(factory), factory
+    return ExecutePlanRun(factory, recipient=recipient), factory
 
 
 def seed(factory, wallet, plan):
@@ -85,6 +93,44 @@ def runs_of(factory, plan_id):
 
 def ledger_of(factory, wallet_id):
     return read(factory, lambda uow: uow.transactions.get_by_wallet_id(wallet_id))
+
+
+def notifications_of(factory):
+    """Every receipt still owed - the queue, not the report.
+
+    ``pending`` rather than a direct row query, so a settled row is correctly
+    reported as "no longer owed" and the tests below can go on asking the same
+    question the drain asks.
+    """
+    return read(factory, lambda uow: uow.notifications.pending())
+
+
+class ExplodingCommit:
+    """A unit of work that writes normally and then fails to commit.
+
+    The way to ask "do these two writes really land together?" is to break the
+    commit and look at what is left. A unit that delegated everything but could
+    still commit could not answer it; this one forwards every repository and
+    refuses only the last step, which is exactly the failure a crash between two
+    separate transactions would produce.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def commit(self):
+        raise RuntimeError("commit failed")
+
+
+class ExplodingCommitFactory:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def start(self):
+        return ExplodingCommit(self._inner.start())
 
 
 def top_up_locked(factory, wallet_id, amount):
@@ -688,3 +734,322 @@ class TestInstructionIdempotencyKeys:
             f"plan:{plan.plan_id}:2026-01-01T00:00:00:0",
             f"plan:{plan.plan_id}:2026-02-01T00:00:00:0",
         }
+
+
+# --- the receipt -----------------------------------------------------------
+
+
+class TestTheRunQueuesItsReceipt:
+    """The run's fourth write: the message saying what happened.
+
+    A run moves money, records the run, advances the plan, and queues the receipt
+    - all inside one transaction, before a single ``commit()``. This class is
+    about that fourth write: that it happens on both outcomes, that it is silent
+    when there is nowhere to send, and that a run cannot land without it.
+    """
+
+    def test_a_successful_run_queues_a_receipt(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        queued = notifications_of(factory)
+        assert len(queued) == 1
+        assert queued[0].kind is NotificationKind.PAYOUT_SUCCEEDED
+        assert queued[0].subject_id == plan.plan_id
+        assert queued[0].recipient == RECIPIENT
+
+    def test_the_receipt_says_what_moved_and_where(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        body = notifications_of(factory)[0].body
+        assert "2000.00 NGN" in body
+        assert "Chinedu Okafor" in body
+
+    def test_the_receipt_names_the_occurrence_it_paid(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The body says *which* occurrence, which is not the same as *when* it was paid.
+
+        A backlog run in April pays January, and both facts are true and both
+        matter: the message is stamped with the moment the run was recorded, and
+        the body names the occurrence it settled. A receipt that only carried the
+        clock would let a user read a two-month-old payment as today's, with
+        nothing to tell it apart from February's.
+        """
+        wallet = build_wallet(locked="100000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, datetime(2026, 4, 15))
+
+        receipt = notifications_of(factory)[0]
+        assert "2026-01-01T00:00" in receipt.body
+        # Stamped by the run, so it is emphatically *not* the occurrence.
+        assert receipt.created_at != datetime(2026, 1, 1)
+
+    def test_its_key_names_the_plan_and_the_occurrence(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The primary key, checked as text on the row that was actually written.
+
+        The composer derives this key and ``event_key`` owns the format; what is
+        worth pinning *here* is that the key reaching the database is the one
+        derived from this run's plan and moment - a use case threading the wrong
+        id through would otherwise only show up as a duplicate suppressed
+        somewhere far away.
+        """
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        assert notifications_of(factory)[0].event_key == (
+            f"payout_succeeded:plan:{plan.plan_id}:2026-01-01T00:00:00"
+        )
+
+    def test_a_blocked_run_queues_a_receipt_too(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The message a user most needs and least expects.
+
+        A blocked run moves nothing, so the wallet is unchanged and no ledger row
+        exists. Without this the only trace is a ``plan_runs`` row nobody reads
+        unless the plan is already known to be stuck - and it is not, because
+        this is how they would find out.
+        """
+        wallet = build_wallet(locked="500")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        queued = notifications_of(factory)
+        assert len(queued) == 1
+        assert queued[0].kind is NotificationKind.PAYOUT_BLOCKED
+        assert "insufficient balance" in queued[0].body
+
+    def test_with_no_recipient_the_run_happens_and_says_nothing(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The ordinary state of a fresh install, and not an error.
+
+        Nothing is composed, so there is nothing to defer and no line to print -
+        and the money still moves. A missing mail address is a reason to be
+        silent, never a reason to refuse a payment.
+        """
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=None)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.SUCCEEDED
+        assert notifications_of(factory) == []
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("8000"), NGN
+        )
+
+    def test_a_blocked_run_with_no_recipient_is_also_silent(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        wallet = build_wallet(locked="500")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=None)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        assert notifications_of(factory) == []
+        assert runs_of(factory, plan.plan_id)[0].status is RunStatus.BLOCKED
+
+    def test_one_run_is_one_receipt_however_many_instructions(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Five payroll lines, one message - see decision 29.
+
+        A run is one thing that happened to the person reading the mail, and five
+        emails arriving together would have to be reassembled by hand to answer
+        the question they are actually asking.
+        """
+        wallet = build_wallet(locked="100000")
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=tuple(payout("20000", f"salary {n}") for n in range(5)),
+        )
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        queued = notifications_of(factory)
+        assert len(queued) == 1
+        # Five lines, each naming the account it pays - one for every instruction.
+        assert queued[0].body.count("  salary") == 5
+        assert "Total moved: 100000.00 NGN." in queued[0].body
+
+
+class TestOneOccurrenceCanBeTwoEvents:
+    """Blocked at noon, paid in April: two outcomes, one ``plan_runs`` row, two receipts.
+
+    The counterpart of ``test_a_topped_up_and_resumed_plan_rewrites_its_blocked_row``
+    above, which says the *row* is rewritten rather than appended. The receipt
+    table makes the opposite demand, and both are right: the run is one fact, and
+    the two things that happened to the user are two. The kind in the derived key
+    is what lets one table hold both.
+    """
+
+    def test_a_blocked_run_that_is_later_paid_queues_both_receipts(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        wallet = build_wallet(locked="500")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+        top_up_locked(factory, wallet.wallet_id, "5000")
+        resume(factory, plan.plan_id)
+        executor.execute(plan.plan_id, ANCHOR)
+
+        queued = notifications_of(factory)
+        assert len(queued) == 2
+        assert {one.kind for one in queued} == {
+            NotificationKind.PAYOUT_BLOCKED,
+            NotificationKind.PAYOUT_SUCCEEDED,
+        }
+        assert len(runs_of(factory, plan.plan_id)) == 1  # but one run row
+
+    def test_the_same_block_twice_is_one_receipt(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Resumed unfunded and blocked again: the user has already been told.
+
+        Announcing it on every resume would teach them to ignore the one message
+        that means their money did not arrive. Nothing here reads before it
+        writes - the second enqueue derives the key already in the table and
+        inserts nothing.
+        """
+        wallet = build_wallet(locked="500")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+        resume(factory, plan.plan_id)
+        executor.execute(plan.plan_id, ANCHOR)
+
+        assert len(notifications_of(factory)) == 1
+
+    def test_a_second_month_is_a_second_receipt(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The occurrence is in the key, so January does not suppress February."""
+        wallet = build_wallet(locked="100000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+        executor.execute(plan.plan_id, datetime(2026, 2, 1))
+
+        keys = {one.event_key for one in notifications_of(factory)}
+        assert keys == {
+            f"payout_succeeded:plan:{plan.plan_id}:2026-01-01T00:00:00",
+            f"payout_succeeded:plan:{plan.plan_id}:2026-02-01T00:00:00",
+        }
+
+
+class TestNoPayoutWithoutAReceipt:
+    """The atomicity claim, checked by breaking the commit and looking at what is left.
+
+    Decision 28 in one test: if the receipt cannot be written, the *payout* does
+    not happen. That is deliberate rather than alarming - the plan's counter
+    rolls back with it, so the next tick derives the same occurrence and pays
+    then. Fail-loud costs one tick and buys a run that can never commit without
+    the message that says so.
+    """
+
+    def test_a_failed_commit_leaves_neither_the_run_nor_its_receipt(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Four writes, one transaction - so all four are missing, not three."""
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        factory = SqliteUnitOfWorkFactory(str(tmp_path / "exploding.db"))
+        seed(factory, wallet, plan)
+        executor = ExecutePlanRun(ExplodingCommitFactory(factory), recipient=RECIPIENT)
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            executor.execute(plan.plan_id, ANCHOR)
+
+        after = read(factory, lambda uow: uow.wallets.get_by_id(wallet.wallet_id))
+        assert notifications_of(factory) == []
+        assert runs_of(factory, plan.plan_id) == []
+        assert ledger_of(factory, wallet.wallet_id) == []
+        assert plan_after(factory, plan.plan_id).completed_runs == 0
+        assert after.locked_balance == Money(Decimal("10000"), NGN)
+
+    def test_a_blocked_run_rolls_back_its_pause_and_its_receipt_together(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The blocked path commits in its own method, so it needs its own check.
+
+        The plan is *paused* by a block, which is a write like any other - and a
+        plan that came back paused from a rolled-back run would be a plan holding
+        a block that no longer exists in the record.
+        """
+        wallet = build_wallet(locked="500")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        factory = SqliteUnitOfWorkFactory(str(tmp_path / "exploding.db"))
+        seed(factory, wallet, plan)
+        executor = ExecutePlanRun(ExplodingCommitFactory(factory), recipient=RECIPIENT)
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            executor.execute(plan.plan_id, ANCHOR)
+
+        assert notifications_of(factory) == []
+        assert runs_of(factory, plan.plan_id) == []
+        assert plan_after(factory, plan.plan_id).status is PlanStatus.ACTIVE
+
+    def test_the_tick_after_a_failed_attempt_pays_the_same_occurrence(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Which is what makes the rollback survivable rather than merely safe.
+
+        The failed commit above cost one tick, not one payment: the counter never
+        advanced, so the next attempt derives the same occurrence and pays it.
+        """
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        factory = SqliteUnitOfWorkFactory(str(tmp_path / "recovered.db"))
+        seed(factory, wallet, plan)
+        broken = ExecutePlanRun(ExplodingCommitFactory(factory), recipient=RECIPIENT)
+
+        with pytest.raises(RuntimeError):
+            broken.execute(plan.plan_id, ANCHOR)
+
+        working = ExecutePlanRun(factory, recipient=RECIPIENT)
+        paid = working.execute(plan.plan_id, ANCHOR)
+
+        assert paid.status is RunStatus.SUCCEEDED
+        assert paid.due_at == ANCHOR
+        assert len(notifications_of(factory)) == 1
+

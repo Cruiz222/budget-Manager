@@ -39,6 +39,18 @@ password never has to live in ``budget.db``:
 
 An install with none of these set is not broken: the tick still warns, still
 records the warning, and still pays - the warnings simply have nowhere to go.
+
+Two kinds of message go out over that configuration, and they are *not* the same
+thing at the same time:
+
+    warning   an occurrence is coming, ~30 minutes before the run (``11:30``)
+    receipt   an event happened, at the moment it happens (``12:00``, and the
+              same second a deposit is typed at the terminal)
+
+Both are drained by ``plan tick``; a wallet command drains its own receipt before
+it exits, which is what "immediately" means here. Neither can stop a payment: the
+money is committed before any socket is opened, so a mail server that is down or
+slow costs latency and never correctness.
 """
 
 import argparse
@@ -51,6 +63,7 @@ from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
     build_deliverer,
+    build_notification_deliverer,
     build_notifier,
     build_plan_service,
     build_scheduler,
@@ -389,7 +402,38 @@ def _balance(service: WalletService, args) -> int:
     return 0
 
 
-def _operation(service: WalletService, args) -> int:
+def _deliver_after(factory, settings, deferred_reason=None) -> None:
+    """Send the receipts this command just queued, before it exits.
+
+    This is what "immediately" means, and it is the whole reason the wallet
+    commands build a deliverer at all. The alternative - leaving receipts for the
+    next ``plan tick`` to notice - would mean a deposit made at 14:03 is reported
+    when the scheduler next runs, and an install with no scheduler running is
+    reported never. An event that has happened is reported when it happens.
+
+    **The money has already committed by the time this runs**, and that is what
+    makes opening a socket here safe rather than reckless. A mail server that
+    hangs costs this command latency and never correctness: the balance printed
+    above this line is already durable, and a send that fails leaves the receipt
+    queued rather than losing it. The asymmetry with ``plan tick`` is worth
+    noticing - there, delivery is deferred to the end of an unattended job where
+    a few seconds of waiting is invisible; here it happens in front of a person
+    waiting for their prompt back. Ten seconds of that is an acceptable price for
+    a receipt that arrives by itself; a minute would not be.
+
+    Nothing at all is printed when there is nothing to send, which is the case on
+    every unconfigured install - ``compose`` queues nothing without a recipient,
+    so the queue is empty and ``_report_notifications`` stays silent.
+    """
+    deliverer = build_notification_deliverer(
+        unit_of_work_factory=factory, settings=settings
+    )
+    _report_notifications(deliverer.execute(datetime.now()), deferred_reason)
+
+
+def _operation(
+    service: WalletService, args, factory, settings, deferred_reason
+) -> int:
     # Resolve the wallet so the unitless amount is interpreted in its currency.
     wallet = service.get_wallet(args.wallet_id)
     amount = Money(args.amount, wallet.currency)
@@ -405,10 +449,14 @@ def _operation(service: WalletService, args) -> int:
         f"available {current.available_balance} | "
         f"locked {current.locked_balance}"
     )
+    # After the line above, and that order is deliberate: the result the user
+    # asked for is printed first, so a slow mail server delays the delivery
+    # report rather than the answer.
+    _deliver_after(factory, settings, deferred_reason)
     return 0
 
 
-def _payout(service: WalletService, args) -> int:
+def _payout(service: WalletService, args, factory, settings, deferred_reason) -> int:
     # Like every other amount on this CLI, the number carries no currency of its
     # own - it is read in the wallet's currency.
     wallet = service.get_wallet(args.wallet_id)
@@ -431,6 +479,7 @@ def _payout(service: WalletService, args) -> int:
         f"available {current.available_balance} | "
         f"locked {current.locked_balance}"
     )
+    _deliver_after(factory, settings, deferred_reason)
     return 0
 
 
@@ -558,7 +607,9 @@ def _run_outcome(run: PlanRun) -> str:
     return f"{run.status.value} ({run.reason.value})"
 
 
-def _plan_command(args, factory, wallet_service: WalletService) -> int:
+def _plan_command(
+    args, factory, wallet_service: WalletService, settings, deferred_reason
+) -> int:
     """Route a ``plan`` sub-command to its handler.
 
     The scheduler and the notifier are built only for ``tick``, and that is not
@@ -566,24 +617,26 @@ def _plan_command(args, factory, wallet_service: WalletService) -> int:
     factory (see ``build_scheduler``), and constructing that for a command that
     will never run a plan would hide the fact that the sharing matters only
     there.
+
+    ``settings`` and ``deferred_reason`` arrive from ``main`` rather than being
+    read here. They used to be read in this branch, and they moved up with the
+    receipts: a wallet command now delivers too, so there are two places that
+    need to know how this invocation is configured, and two readers would mean a
+    process could in principle act on two different configurations. It also keeps
+    the promise ``email_settings`` makes - that ``os.environ`` is read in one
+    module, by the CLI at one moment.
     """
     plan_service = build_plan_service(unit_of_work_factory=factory)
     if args.plan_command == "tick":
-        # Read once, for the whole tick, and handed to both use cases. The
-        # notifier needs the address to compose the message; the deliverer needs
-        # the credentials to send it. Reading it here rather than inside either
-        # one keeps ``os.environ`` out of the application layer, and reading it
-        # once means a tick cannot see two different configurations.
-        settings = from_environment()
         return _plan_tick(
             args,
-            build_scheduler(unit_of_work_factory=factory),
+            build_scheduler(unit_of_work_factory=factory, settings=settings),
             build_notifier(unit_of_work_factory=factory, settings=settings),
             build_deliverer(unit_of_work_factory=factory, settings=settings),
-            # Why there is no email, if there is none. Computed here because it
-            # is a fact about *this* installation's environment, and the
-            # deliverer - which only sees messages - has no way to know it.
-            deferred_reason=describe_configuration() if settings is None else None,
+            build_notification_deliverer(
+                unit_of_work_factory=factory, settings=settings
+            ),
+            deferred_reason=deferred_reason,
         )
     if args.plan_command == "create":
         return _plan_create(args, plan_service, wallet_service)
@@ -693,7 +746,9 @@ def _plan_steer(args, service: PlanService) -> int:
     return 0
 
 
-def _plan_tick(args, scheduler, notifier, deliverer, deferred_reason=None) -> int:
+def _plan_tick(
+    args, scheduler, notifier, deliverer, notification_deliverer, deferred_reason=None
+) -> int:
     """Warn about plans that are nearly due, run the ones that are, then deliver.
 
     This is the whole of "automated" at this layer: one command that does one
@@ -713,6 +768,13 @@ def _plan_tick(args, scheduler, notifier, deliverer, deferred_reason=None) -> in
     but network I/O should sit as far from a payment as it can be made to, and
     putting it at the end costs nothing at all. Saying so is cheap; relying on
     it not being true later is not.
+
+    **Last is also what makes the receipt immediate.** The runs happen above, and
+    each one queues its receipt inside its own transaction; draining at the end
+    therefore sends the receipt for a payout made seconds ago, in the same
+    invocation. Draining *before* the runs would defer every receipt to the next
+    tick, which for a tick that runs every five minutes is five minutes of a user
+    not knowing their money left.
     """
     raised = notifier.execute(args.as_of)
     for notice in raised:
@@ -748,11 +810,17 @@ def _plan_tick(args, scheduler, notifier, deliverer, deferred_reason=None) -> in
             # `plan show` to find out what happened.
             print(f"{run.plan_id}  {_moment(run.due_at)}  {_run_outcome(run)}")
 
-    # Deliberately not gated on anything above: the queue is drained whether or
-    # not this tick found a run, and whether or not the notifier raised anything
-    # new. A message queued by an earlier tick is owed regardless of what this
-    # one did.
+    # Deliberately not gated on anything above: the queues are drained whether
+    # or not this tick found a run, and whether or not the notifier raised
+    # anything new. A message queued by an earlier tick is owed regardless of
+    # what this one did.
+    #
+    # Two drains, warnings first, and they are separate calls to separate classes
+    # rather than one pass over both queues - see ``DeliverNotifications`` for
+    # why. What they share is the reporting rule: say what happened, and stay
+    # silent when nothing did.
     _report_delivery(deliverer.execute(args.as_of), deferred_reason)
+    _report_notifications(notification_deliverer.execute(args.as_of), deferred_reason)
     return 0
 
 
@@ -807,6 +875,49 @@ def _report_delivery(report, deferred_reason=None) -> None:
                 f"({reason})"
             )
 
+
+def _report_notifications(report, deferred_reason=None) -> None:
+    """Print one line per receipt this pass touched, and nothing when there is none.
+
+    The sibling of ``_report_delivery``, and a separate function because the two
+    messages have genuinely different shapes. A warning knows the plan and the
+    occurrence it announces; a receipt knows a *kind* and the plan or wallet it
+    is about. One function serving both would have to decide which fields exist
+    from the type of the message, which is exactly the kind of branch that grows
+    a wrong answer the next time a kind is added.
+
+    Note the line says the kind - ``payout_succeeded``, ``wallet_deposit`` -
+    rather than a sentence. It is a log, not the message: the words that went to
+    the user are in the row, and repeating them here would make a log nobody can
+    scan. The kind is also what the ``notifications`` table is queried by, so the
+    log and the diagnostic answer the same question.
+
+    **There is no ``expired`` branch, and that is not an omission.** Nothing
+    expires a notification - see ``DeliverNotifications`` - so the line could
+    never print. Leaving it out is what keeps that true: a dead branch in a
+    presenter is how a rule nobody implements acquires the appearance of one, and
+    the next reader would reasonably assume something was supposed to expire
+    these.
+    """
+    for notification in report.sent:
+        print(
+            f"emailed {notification.kind.value}  {notification.subject_id}  "
+            f"to {notification.recipient}"
+        )
+    for notification in report.failed:
+        print(
+            f"failed  {notification.kind.value}  {notification.subject_id}  "
+            f"{notification.last_error} (will retry)"
+        )
+    if report.deferred:
+        reason = deferred_reason or "email not configured"
+        for notification in report.deferred:
+            print(
+                f"queued  {notification.kind.value}  {notification.subject_id}  "
+                f"({reason})"
+            )
+
+
 def _describe(exc: MoneyError) -> str:
     return str(exc) if str(exc) else exc.__class__.__name__
 
@@ -818,10 +929,25 @@ def main(argv=None) -> int:
     # its own unit per business operation, which is the intended transaction
     # boundary - sharing the factory is not the same as sharing a transaction.
     factory = SqliteUnitOfWorkFactory(args.db)
-    service = build_wallet_service(unit_of_work_factory=factory)
+    # One read of the environment for the whole invocation, handed to whatever
+    # needs it. The notifier needs the address to compose with, the deliverers
+    # need the credentials to send with, and a wallet command needs both to
+    # deliver its own receipt - so this is read here once rather than in each of
+    # those places. Reading it per-use-case would let one invocation act on two
+    # configurations, which is a state nothing would report.
+    settings = from_environment()
+    # Why there is no email, if there is none. Computed here because it is a fact
+    # about *this* installation's environment, and the deliverers - which only
+    # see messages - have no way to know it.
+    deferred_reason = describe_configuration() if settings is None else None
+    service = build_wallet_service(
+        unit_of_work_factory=factory, settings=settings
+    )
     try:
         if args.command == "plan":
-            return _plan_command(args, factory, service)
+            return _plan_command(
+                args, factory, service, settings, deferred_reason
+            )
         if args.command == "open":
             return _open(service, args)
         if args.command == "balance":
@@ -833,8 +959,8 @@ def main(argv=None) -> int:
         if args.command == "history":
             return _history(service, args)
         if args.command == "payout":
-            return _payout(service, args)
-        return _operation(service, args)
+            return _payout(service, args, factory, settings, deferred_reason)
+        return _operation(service, args, factory, settings, deferred_reason)
     except MoneyError as exc:
         print(f"error: {_describe(exc)}", file=sys.stderr)
         return 1

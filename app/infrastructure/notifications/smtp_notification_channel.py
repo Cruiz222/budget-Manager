@@ -9,8 +9,8 @@ was the right first channel.
 import smtplib
 from email.message import EmailMessage
 
+from app.domain.notifications.deliverable import Deliverable
 from app.domain.notifications.notificationChannel import NotificationChannel
-from app.domain.notifications.outboundMessage import OutboundMessage
 
 #: How long any single socket operation may take, in seconds.
 #:
@@ -56,8 +56,14 @@ class SmtpNotificationChannel(NotificationChannel):
         self._starttls = starttls
         self._timeout = timeout
 
-    def send(self, message: OutboundMessage) -> None:
+    def send(self, message: Deliverable) -> None:
         """Hand one message to the mail server.
+
+        Takes any ``Deliverable`` - a warning or a receipt - because the three
+        fields it reads are the three a channel needs and the only three it has
+        ever read. Nothing here knows which kind it is sending, which is what
+        keeps delivery rules in one place: the retry-and-record behaviour lives
+        in the drains, and is identical for both, so it is written once.
 
         The connection is opened and closed per message, which is a little
         wasteful and entirely deliberate. A long-lived connection would have to

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.application.notifications.deliver_notifications import DeliverNotifications
 from app.application.notifications.deliver_pending_messages import (
     DeliverPendingMessages,
 )
@@ -28,9 +29,9 @@ def install_deliverer(monkeypatch, channel):
     """Wire a channel into the CLI in place of the one it builds from the environment.
 
     ``build_deliverer`` is the single place the CLI turns the environment into
-    something that can reach the outside world, which makes it the single place
-    worth replacing. Everything underneath - the drain, the expiry rule, the
-    failure handling - is the real thing; only the wire is fake.
+    something that can reach the outside world for *warnings*, which makes it the
+    single place worth replacing. Everything underneath - the drain, the expiry
+    rule, the failure handling - is the real thing; only the wire is fake.
 
     ``channel`` may be ``None``, which is not "a channel that fails" but the
     absence of one - the state an install is in with no email configured.
@@ -41,6 +42,43 @@ def install_deliverer(monkeypatch, channel):
         )
 
     monkeypatch.setattr(cli, "build_deliverer", build)
+
+
+def install_notification_deliverer(monkeypatch, channel):
+    """The same swap, for the *receipt* queue one drain over.
+
+    A second injection point because there is a second drain, and the two are
+    genuinely separate use cases rather than one with a flag - see
+    ``DeliverNotifications``. A test that is about receipts calls this to say
+    where they go; every other test in this file gets the default installed by
+    ``receipts_go_somewhere_else`` below.
+    """
+    def build(*args, **kwargs):
+        return DeliverNotifications(
+            kwargs["unit_of_work_factory"], channel=channel
+        )
+
+    monkeypatch.setattr(cli, "build_notification_deliverer", build)
+
+
+@pytest.fixture(autouse=True)
+def receipts_go_somewhere_else(monkeypatch, build_channel):
+    """Keep the receipt queue off the wire a warning test is counting on.
+
+    Every test in this file that configures email does so to test the *warning*,
+    and the two are not the same queue. The wallet helpers underneath them now
+    queue receipts of their own - ``funded_locked_wallet`` deposits, and a deposit
+    is an announced event - so leaving the receipt drain on the real builder would
+    mean an unconfigured-in-test SMTP adapter in every such test, and leaving it
+    on the *warning* channel would make ``len(channel.sent) == 1`` a number about
+    two features at once.
+
+    So receipts are delivered here, to a channel this fixture makes fresh for each
+    test. That is the same move conftest makes for the environment: the point is
+    that "the queue under test is the only one on the wire" is a property of the
+    file rather than something every test has to remember.
+    """
+    install_notification_deliverer(monkeypatch, build_channel())
 
 
 def opened_wallet_id(db_path, capsys, currency="NGN"):
@@ -803,6 +841,222 @@ class TestTheWarningIsDelivered:
         assert "expired" not in out
         # And no note either: there was no warning to explain the fate of.
         assert "note:" not in out
+
+
+class TestTheReceiptAfterThePayout:
+    """The other half of the pair, and the one the user actually waits for.
+
+    Everything above is about a message *before* the money moves. These are about
+    the message *after*, and the difference is not cosmetic: the warning is a
+    courtesy that a missed tick can forfeit entirely, while the receipt is the
+    record of something that happened. There is no window it can miss and no
+    tick that can be too late for it.
+    """
+
+    NOON = "2026-03-02T12:00"
+
+    def test_a_payout_emails_its_receipt_in_the_same_tick(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """The headline of this phase: at noon the run, and the mail, happen.
+
+        Note the two are one invocation but not one transaction. The run commits
+        its own receipt *inside* the transaction that moves the money (see
+        ``ExecutePlanRun``); this drain is what puts it on the wire afterwards, and
+        it runs last in ``_plan_tick`` for exactly this reason - a receipt drained
+        before the runs would describe nothing.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        db = str(tmp_path / "cli.db")
+        # Funded first, so that the deposit's own receipt goes to the default
+        # channel and what this test counts is the payout alone.
+        wallet_id = funded_locked_wallet(db, capsys)
+        create_salary_plan(db, wallet_id)
+        receipts = build_channel()
+        install_notification_deliverer(monkeypatch, receipts)
+        capsys.readouterr()
+
+        assert run(db, "plan", "tick", "--as-of", self.NOON) == 0
+        out = capsys.readouterr().out
+
+        # The line about the money is still there, and unchanged: the receipt is
+        # added to the tick's output, never instead of it.
+        assert "succeeded" in out
+        assert "emailed payout_succeeded" in out
+        assert "to chinedu@example.com" in out
+
+        assert len(receipts.sent) == 1
+        assert receipts.sent[0].kind.value == "payout_succeeded"
+        assert "20000.00 NGN" in receipts.sent[0].subject
+
+    def test_the_receipt_is_one_message_for_the_whole_run(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """A payroll to three accounts is one email, not three.
+
+        The decision is about the reader, not the mailbox: three messages arriving
+        together would have to be reassembled by hand to answer "did the run
+        happen?". The instructions are listed in the body instead, which is the
+        same information in the order it was executed.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        db = str(tmp_path / "cli.db")
+        wallet_id = funded_locked_wallet(db, capsys, "500000")
+        run(
+            db, "plan", "create", "--wallet", wallet_id, "--name", "split",
+            "--source", "locked", "--every", "monthly", "--from", "2026-01-01",
+            "--pay", "20000", "0123456789", "058", "Chinedu Okafor", "salary",
+            "--pay", "15000", "0987654321", "058", "Ada Nwosu", "rent",
+        )
+        receipts = build_channel()
+        install_notification_deliverer(monkeypatch, receipts)
+        capsys.readouterr()
+
+        assert run(db, "plan", "tick", "--as-of", "2026-01-01") == 0
+
+        assert len(receipts.sent) == 1
+        body = receipts.sent[0].body
+        assert "Chinedu Okafor" in body
+        assert "Ada Nwosu" in body
+
+    def test_a_blocked_run_emails_why_it_could_not_pay(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """The message a user most needs and least expects.
+
+        Nothing moved, so nothing else will tell them: the wallet is unchanged,
+        there is no ledger row, and the plan has simply gone quiet. Without this
+        the only trace is a ``plan_runs`` row nobody reads until the plan is
+        already known to be stuck.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_id(db, capsys)
+        create_salary_plan(db, wallet_id)
+        receipts = build_channel()
+        install_notification_deliverer(monkeypatch, receipts)
+        capsys.readouterr()
+
+        assert run(db, "plan", "tick", "--as-of", "2026-01-01") == 0
+        out = capsys.readouterr().out
+
+        assert "insufficient_balance" in out
+        assert "emailed payout_blocked" in out
+        assert len(receipts.sent) == 1
+        # The sentence that decides what the user does next: paused *and* still
+        # owing the occurrence, so topping the wallet up and resuming pays it.
+        assert "paused" in receipts.sent[0].body
+
+    def test_a_wallet_command_emails_its_own_receipt_before_it_exits(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """"Immediately" is a claim about which invocation does the sending.
+
+        Left to ``plan tick``, a deposit made at 14:03 would be reported whenever
+        the scheduler next ran - and an install with no scheduler running would
+        never report it at all. So the command that moved the money delivers it.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        receipts = build_channel()
+        install_notification_deliverer(monkeypatch, receipts)
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_id(db, capsys)
+        capsys.readouterr()
+
+        assert run(db, "deposit", wallet_id, "2500.50") == 0
+        out = capsys.readouterr().out
+
+        assert "deposited 2500.50 NGN" in out
+        assert "emailed wallet_deposit" in out
+        assert len(receipts.sent) == 1
+        assert "2500.50 NGN" in receipts.sent[0].subject
+
+    def test_a_repeated_deposit_is_emailed_once(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """The idempotent path, which is where the derived key earns its keep.
+
+        Repeating an operation with the same ``--ref`` returns the *existing*
+        ledger row rather than moving money twice - so the receipt is composed a
+        second time, from the same row, with the same event key. The insert is
+        what refuses it, not a check: the second enqueue inserts nothing, so there
+        is no second email to suppress.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        receipts = build_channel()
+        install_notification_deliverer(monkeypatch, receipts)
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_id(db, capsys)
+        run(db, "deposit", wallet_id, "500", "--ref", "one-off")
+        capsys.readouterr()
+
+        assert run(db, "deposit", wallet_id, "500", "--ref", "one-off") == 0
+        out = capsys.readouterr().out
+
+        assert "emailed" not in out
+        assert len(receipts.sent) == 1
+
+    def test_a_dead_mail_server_does_not_fail_a_wallet_command(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """The money is committed before the socket opens, and that is the point.
+
+        A deposit that *reported* failure because the mail server was unreachable
+        would be wrong twice over: the money moved, and the receipt is still owed.
+        The command exits zero, the balance it printed is durable, and the message
+        stays queued for the next drain.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        install_notification_deliverer(
+            monkeypatch, build_channel(failures=[OSError("refused")])
+        )
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_id(db, capsys)
+        capsys.readouterr()
+
+        assert run(db, "deposit", wallet_id, "500") == 0
+        out = capsys.readouterr().out
+
+        assert "deposited 500.00 NGN" in out
+        assert "failed  wallet_deposit" in out
+        assert "OSError: refused (will retry)" in out
+
+        assert run(db, "balance", wallet_id) == 0
+        assert "available: 500.00 NGN" in capsys.readouterr().out
+
+    def test_an_unconfigured_install_reports_nothing_extra(
+        self, tmp_path, capsys
+    ):
+        """No mail account is a normal install, and its commands stay quiet.
+
+        The environment is cleared for every test by conftest, which is what makes
+        this assertion independent of the machine running it. With no recipient
+        nothing is composed at all - so there is no message to defer, and no line
+        about one.
+        """
+        db = str(tmp_path / "cli.db")
+        wallet_id = opened_wallet_id(db, capsys)
+        capsys.readouterr()
+
+        assert run(db, "deposit", wallet_id, "500") == 0
+        out = capsys.readouterr().out
+
+        assert "deposited 500.00 NGN" in out
+        assert "emailed" not in out
+        assert "queued" not in out
+        assert "failed" not in out
 
 
 class TestSteering:

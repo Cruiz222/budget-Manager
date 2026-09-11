@@ -12,6 +12,9 @@ from app.application.unit_of_work import UnitOfWork
 from app.infrastructure.repositories.sqlite_plan_notice_repository import (
     SqlitePlanNoticeRepository,
 )
+from app.infrastructure.repositories.sqlite_notification_repository import (
+    SqliteNotificationRepository,
+)
 from app.infrastructure.repositories.sqlite_outbound_message_repository import (
     SqliteOutboundMessageRepository,
 )
@@ -122,6 +125,47 @@ CREATE TABLE IF NOT EXISTS outbound_messages (
     -- delivery state in its own row is what keeps "did the email go out?" out
     -- of reach of anything deciding whether a payout may proceed.
     PRIMARY KEY (plan_id, due_at)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+    event_key  TEXT NOT NULL,     -- derived from the event; see domain eventKey.py
+    kind       TEXT NOT NULL,     -- enum name, e.g. PAYOUT_SUCCEEDED
+    subject_id TEXT NOT NULL,     -- the plan or wallet the event is about
+    recipient  TEXT NOT NULL,     -- captured at enqueue, not resolved at send
+    subject    TEXT NOT NULL,
+    body       TEXT NOT NULL,     -- composed once; never re-rendered
+    status     TEXT NOT NULL,     -- enum name: PENDING / SENT / EXPIRED
+    attempts   INTEGER NOT NULL,
+    last_error TEXT,              -- the last delivery failure, NULL if none yet
+    created_at TEXT NOT NULL,
+    settled_at TEXT,              -- when it was sent or expired; NULL while owed
+    -- Every message about something that *happened*, of every kind, in one
+    -- table. Deliberately not keyed on (plan_id, due_at) as outbound_messages
+    -- is: a deposit has no plan anywhere in it, and a payout receipt is not
+    -- about an upcoming occurrence - the identity is the *event*, and an event
+    -- is not always plan-shaped. The key is derived (see
+    -- app/domain/notifications/eventKey.py), namespaced with its kind so a plan
+    -- key and a wallet key cannot collide, and is the primary key so a duplicate
+    -- send is unrepresentable rather than merely unlikely.
+    --
+    -- One table for every kind, rather than one per kind. The delivery rules -
+    -- retry on failure, record the error, never raise, never re-send a settled
+    -- row - are identical for all of them, so a table per kind would mean a
+    -- drain per kind, each free to drift from the others in exactly the way that
+    -- is hardest to notice.
+    --
+    -- There is deliberately no ``expires_at``. A warning stops being worth
+    -- sending when its occurrence arrives; a receipt never does, because "your
+    -- payout went out" does not become false. A nullable column that no code
+    -- writes would advertise expiry as a live concept, so the column stays
+    -- absent until a kind arrives that genuinely has a shelf life - and adding
+    -- it then will be a migration, which is the price decision 18 named.
+    --
+    -- No migration function, for the reason the absence of one for plan_notices
+    -- and outbound_messages already records: CREATE TABLE IF NOT EXISTS above
+    -- creates a missing table on an existing database for free. Only a change to
+    -- a table already on disk is a migration.
+    PRIMARY KEY (event_key)
 );
 """
 
@@ -285,6 +329,7 @@ class SqliteUnitOfWork(UnitOfWork):
         self.plans = SqliteSavingsPlanRepository(connection)
         self.plan_runs = SqlitePlanRunRepository(connection)
         self.notices = SqlitePlanNoticeRepository(connection)
+        self.notifications = SqliteNotificationRepository(connection)
         self.outbound_messages = SqliteOutboundMessageRepository(connection)
 
     def commit(self) -> None:

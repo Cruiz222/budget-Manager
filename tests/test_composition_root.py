@@ -3,7 +3,13 @@ from decimal import Decimal
 from uuid import uuid4
 
 from app import composition_root
-from app.composition_root import build_deliverer, build_notifier, build_wallet_service
+from app.composition_root import (
+    build_deliverer,
+    build_notification_deliverer,
+    build_notifier,
+    build_scheduler,
+    build_wallet_service,
+)
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
@@ -178,3 +184,203 @@ def test_an_injected_channel_beats_the_settings(tmp_path, monkeypatch, build_cha
 
     assert deliverer.execute(datetime(2026, 3, 2, 11, 30)).is_quiet is True
     assert channel.attempts == []
+
+
+# --- the receipt queue ------------------------------------------------------
+
+
+def test_build_notification_deliverer_without_settings_has_nowhere_to_send(tmp_path):
+    """The same unconfigured state as the warning queue, one queue over.
+
+    ``None`` rather than a channel that always fails: an install that has never
+    been set up for email should accumulate receipts, not fill a log with
+    connection errors. And nothing ages out while it waits - see
+    ``DeliverNotifications``.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+
+    deliverer = build_notification_deliverer(
+        unit_of_work_factory=factory, settings=None
+    )
+
+    assert deliverer.execute(datetime(2026, 3, 2, 11, 30)).is_quiet is True
+
+
+def test_both_deliverers_build_the_same_smtp_channel(tmp_path, monkeypatch):
+    """One SMTP configuration for both queues, asserted rather than assumed.
+
+    The two builders share ``_channel_for``, and that sharing is the design: a
+    user who can receive warnings can receive receipts, and a user who cannot
+    has one thing to fix. Asserting both call *sites* - not just the helper -
+    is what catches the receipt drain quietly gaining its own adapter with a
+    field scrambled.
+    """
+    built = []
+
+    class RecordingChannel:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+        def send(self, message):  # pragma: no cover - never called here
+            raise AssertionError("the composition root must not send anything")
+
+    monkeypatch.setattr(
+        composition_root, "SmtpNotificationChannel", RecordingChannel
+    )
+    settings = EmailSettings(
+        host="smtp.example.com",
+        port=2525,
+        sender="alerts@example.com",
+        recipient="chinedu@example.com",
+        username="me@example.com",
+        password="hunter2",
+        starttls=False,
+    )
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+
+    build_deliverer(unit_of_work_factory=factory, settings=settings)
+    build_notification_deliverer(unit_of_work_factory=factory, settings=settings)
+
+    assert len(built) == 2
+    assert built[0] == built[1]
+    assert built[1]["host"] == "smtp.example.com"
+    assert built[1]["port"] == 2525
+    assert built[1]["starttls"] is False
+
+
+def test_an_injected_channel_beats_the_settings_for_receipts(
+    tmp_path, monkeypatch, build_channel
+):
+    """The receipt queue's half of the seam that keeps the suite off the network.
+
+    ``deliver_notifications`` is drained by ``plan tick`` and by every wallet
+    command, so a build here that ignored the injected channel would open sockets
+    from the CLI tests as well as from these.
+    """
+
+    class NeverBuilt:
+        def __init__(self, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("settings must not be used when a channel is given")
+
+    monkeypatch.setattr(composition_root, "SmtpNotificationChannel", NeverBuilt)
+    channel = build_channel()
+
+    deliverer = build_notification_deliverer(
+        unit_of_work_factory=SqliteUnitOfWorkFactory(str(tmp_path / "compose.db")),
+        settings=EmailSettings(
+            host="smtp.example.com",
+            port=587,
+            sender="alerts@example.com",
+            recipient="chinedu@example.com",
+        ),
+        channel=channel,
+    )
+
+    assert deliverer.execute(datetime(2026, 3, 2, 11, 30)).is_quiet is True
+    assert channel.attempts == []
+
+
+def test_build_wallet_service_addresses_receipts_to_the_configured_recipient(
+    tmp_path, build_wallet
+):
+    """The address is an installation's, fixed when the service is built.
+
+    It is deliberately not a parameter of ``deposit``: adding "and where to send
+    the mail" to a money move's signature would put a delivery concern inside a
+    balance change. So the wiring is worth asserting here - a mistake would show
+    up as receipts addressed to nobody, or to the sender.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet()
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.commit()
+    service = build_wallet_service(
+        unit_of_work_factory=factory,
+        settings=EmailSettings(
+            host="smtp.example.com",
+            port=587,
+            sender="alerts@example.com",
+            recipient="chinedu@example.com",
+        ),
+    )
+
+    service.deposit(
+        wallet.wallet_id,
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+
+    read = factory.start()
+    try:
+        queued = read.notifications.pending()
+    finally:
+        read.rollback()
+    assert len(queued) == 1
+    assert queued[0].recipient == "chinedu@example.com"
+
+
+def test_build_wallet_service_without_settings_is_silent_and_still_pays(
+    tmp_path, build_wallet
+):
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet()
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.commit()
+    service = build_wallet_service(unit_of_work_factory=factory, settings=None)
+
+    service.deposit(
+        wallet.wallet_id,
+        Money(Decimal("5000"), NGN),
+        internal_reference=str(uuid4()),
+    )
+
+    read = factory.start()
+    try:
+        assert read.notifications.pending() == []
+        stored = read.wallets.get_by_id(wallet.wallet_id)
+    finally:
+        read.rollback()
+    assert stored.available_balance == Money(Decimal("15000"), NGN)
+
+
+def test_build_scheduler_addresses_run_receipts_to_the_configured_recipient(
+    tmp_path, build_wallet, build_plan
+):
+    """The tick's receipt, wired the same way - and through the *same* factory.
+
+    The shared factory is what makes the receipt land in the run's own
+    transaction, so this is not just about the address: a scheduler built with a
+    different factory would queue its receipts in a different database, and the
+    money would move without them.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet(locked="10000")
+    plan = build_plan(wallet_id=wallet.wallet_id)
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.plans.save(plan)
+    seed.commit()
+    scheduler = build_scheduler(
+        unit_of_work_factory=factory,
+        settings=EmailSettings(
+            host="smtp.example.com",
+            port=587,
+            sender="alerts@example.com",
+            recipient="chinedu@example.com",
+        ),
+    )
+
+    runs = scheduler.execute(datetime(2026, 1, 1))
+
+    assert [run.status.value for run in runs] == ["succeeded"]
+    read = factory.start()
+    try:
+        queued = read.notifications.pending()
+    finally:
+        read.rollback()
+    assert len(queued) == 1
+    assert queued[0].recipient == "chinedu@example.com"
+    assert queued[0].subject_id == plan.plan_id
+

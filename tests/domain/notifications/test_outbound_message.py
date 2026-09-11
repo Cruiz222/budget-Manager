@@ -17,7 +17,7 @@ from app.domain.notifications.exception import (
     MessageAlreadySettledError,
 )
 from app.domain.notifications.outboundMessage import OutboundMessage
-from app.domain.notifications.outboundMessageStatus import OutboundMessageStatus
+from app.domain.notifications.deliveryStatus import DeliveryStatus
 
 NOON = datetime(2026, 3, 2, 12, 0)
 HALF_PAST_ELEVEN = datetime(2026, 3, 2, 11, 30)
@@ -40,7 +40,7 @@ class TestWhatAMessageHolds:
     def test_a_new_message_is_pending_and_untried(self):
         message = build_message()
 
-        assert message.status is OutboundMessageStatus.PENDING
+        assert message.status is DeliveryStatus.PENDING
         assert message.attempts == 0
         assert message.last_error is None
         assert message.settled_at is None
@@ -157,23 +157,23 @@ class TestSettledAndUnsettledMustAgree:
     def test_a_sent_message_with_no_moment_is_rejected(self):
         with pytest.raises(InvalidOutboundMessageSettledAtError):
             build_message(
-                status=OutboundMessageStatus.SENT,
+                status=DeliveryStatus.SENT,
                 settled_at=None,
             )
 
     def test_an_expired_message_with_no_moment_is_rejected(self):
         with pytest.raises(InvalidOutboundMessageSettledAtError):
             build_message(
-                status=OutboundMessageStatus.EXPIRED,
+                status=DeliveryStatus.EXPIRED,
                 settled_at=None,
             )
 
     def test_a_pending_message_carrying_a_settled_moment_is_rejected(self):
         with pytest.raises(InvalidOutboundMessageSettledAtError):
-            build_message(status=OutboundMessageStatus.PENDING, settled_at=NOON)
+            build_message(status=DeliveryStatus.PENDING, settled_at=NOON)
 
     def test_a_sent_message_with_its_moment_is_accepted(self):
-        message = build_message(status=OutboundMessageStatus.SENT, settled_at=NOON)
+        message = build_message(status=DeliveryStatus.SENT, settled_at=NOON)
 
         assert message.is_settled is True
 
@@ -184,7 +184,7 @@ class TestItsLifecycle:
 
         message.mark_sent(NOON)
 
-        assert message.status is OutboundMessageStatus.SENT
+        assert message.status is DeliveryStatus.SENT
         assert message.settled_at == NOON
         assert message.is_settled is True
 
@@ -194,7 +194,7 @@ class TestItsLifecycle:
 
         message.mark_expired(NOON)
 
-        assert message.status is OutboundMessageStatus.EXPIRED
+        assert message.status is DeliveryStatus.EXPIRED
         assert message.settled_at == NOON
         assert message.last_error is None
 
@@ -209,7 +209,7 @@ class TestItsLifecycle:
 
         message.record_failure("OSError: connection refused")
 
-        assert message.status is OutboundMessageStatus.PENDING
+        assert message.status is DeliveryStatus.PENDING
         assert message.attempts == 1
         assert message.last_error == "OSError: connection refused"
         assert message.settled_at is None
@@ -250,16 +250,16 @@ class TestItsLifecycle:
 
         message.mark_sent(NOON)
 
-        assert message.status is OutboundMessageStatus.SENT
+        assert message.status is DeliveryStatus.SENT
         assert message.attempts == 1
         assert message.last_error == "connection refused"
 
 
 class TestTheStatusEnum:
     def test_only_pending_is_unsettled(self):
-        assert OutboundMessageStatus.PENDING.is_settled is False
-        assert OutboundMessageStatus.SENT.is_settled is True
-        assert OutboundMessageStatus.EXPIRED.is_settled is True
+        assert DeliveryStatus.PENDING.is_settled is False
+        assert DeliveryStatus.SENT.is_settled is True
+        assert DeliveryStatus.EXPIRED.is_settled is True
 
     def test_there_is_no_failed_member(self):
         """Named as a test because its absence is a decision, not an oversight.
@@ -267,7 +267,7 @@ class TestTheStatusEnum:
         A failure is recorded on a message that is still PENDING; making it a
         status would make it terminal, and a terminal failure is a lost warning.
         """
-        assert [member.name for member in OutboundMessageStatus] == [
+        assert [member.name for member in DeliveryStatus] == [
             "PENDING",
             "SENT",
             "EXPIRED",

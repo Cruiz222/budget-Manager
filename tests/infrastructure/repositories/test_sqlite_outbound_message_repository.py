@@ -4,7 +4,7 @@ from datetime import datetime
 import pytest
 
 from app.domain.notifications.outboundMessage import OutboundMessage
-from app.domain.notifications.outboundMessageStatus import OutboundMessageStatus
+from app.domain.notifications.deliveryStatus import DeliveryStatus
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SCHEMA,
     open_sqlite_connection,
@@ -63,7 +63,7 @@ def test_round_trips_a_message(build_wallet, build_plan):
     assert stored.subject == "Payout of 2000.00 NGN in 30 minutes"
     assert stored.body == "The plan 'salary' pays 2000.00 NGN at 2026-03-02T12:00."
     assert stored.created_at == HALF_PAST_ELEVEN
-    assert stored.status is OutboundMessageStatus.PENDING
+    assert stored.status is DeliveryStatus.PENDING
     assert stored.attempts == 0
     assert stored.last_error is None
     assert stored.settled_at is None
