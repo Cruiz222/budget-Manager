@@ -136,6 +136,29 @@ class SqliteTransactionRepository(TransactionRepository):
             return None
         return self._row_to_transaction(row)
 
+    def list_awaiting_provider(self) -> list[Transaction]:
+        """See the port for why the filter is two conditions rather than one.
+
+        ``provider_reference IS NOT NULL`` is the half that is easy to leave out
+        and the half that keeps a CLI withdrawal from being asked about. The
+        tiebreak on ``transaction_id`` is not decoration: ``created_at`` is
+        stored at second resolution, so two rows written in the same second
+        would otherwise come back in whatever order SQLite felt like, and a
+        bounded batch would then be free to starve one of them indefinitely -
+        the exact failure the ordering contract exists to prevent.
+        """
+        rows = self._connection.execute(
+            f"""
+            SELECT {_COLUMNS}
+            FROM transactions
+            WHERE status = ?
+              AND provider_reference IS NOT NULL
+            ORDER BY created_at, transaction_id
+            """,
+            (enum_to_text(TransactionStatus.PENDING),),
+        ).fetchall()
+        return [self._row_to_transaction(row) for row in rows]
+
     def _row_to_transaction(self, row) -> Transaction:
         currency = text_to_enum(Currency, row["currency"])
         return Transaction(

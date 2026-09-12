@@ -33,6 +33,14 @@ domain has never heard of a header - so ``bearer_token`` owns the split between
 comes back as ``InvalidSessionError`` through the same handler as every other
 domain refusal. Both are 401s, and the ``error`` field tells the two apart: "you
 sent nothing" against "what you sent was not good enough".
+
+**Two of the dependencies below are not built for an actor at all**, and they are
+the newest, so they are worth flagging on the way in. ``payment_provider``
+answers a question about the *installation* - can this deployment take money -
+and ``settler_service`` builds the one money use case that has no actor to be
+given, because a provider reporting a movement is not a person. Everything else
+here is "the services built for them"; those two are what is left when "them"
+does not exist. Their docstrings carry the arguments.
 """
 
 from datetime import datetime
@@ -43,18 +51,26 @@ from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
+from app.application.payments.initiate_deposit import InitiateDeposit
+from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
+    build_initiate_deposit,
     build_log_in,
     build_log_out,
     build_plan_service,
     build_resolve_actor,
+    build_settler,
     build_sign_up,
     build_wallet_service,
 )
 from app.domain.identity.user import User
-from app.presentation.api.errors import MissingCredentialsError
+from app.domain.payments.paymentProvider import PaymentProvider
+from app.presentation.api.errors import (
+    MissingCredentialsError,
+    PaymentsUnconfiguredError,
+)
 
 #: The scheme a token is presented with, spelled the way the header spells it.
 #:
@@ -210,4 +226,89 @@ def log_out_service(request: Request) -> LogOut:
     """
     return build_log_out(
         unit_of_work_factory=request.app.state.unit_of_work_factory,
+    )
+
+
+def payment_provider(request: Request) -> PaymentProvider:
+    """The provider this installation collects through, or a 503.
+
+    **The one dependency here that answers a question about the installation
+    rather than about the caller**, and it is worth naming because every other
+    function in this module produces a *service for somebody*. This produces the
+    adapter itself, because two routes need it for two different reasons and
+    neither reason is an actor: the deposit route needs something to open a
+    collection with, and the webhook needs something to verify a signature
+    against.
+
+    **``None`` is refused here rather than passed on**, which is the entire
+    content of the function. ``provider_for`` returns ``None`` for an install
+    with no key, deliberately - it is a state, not a failure - and the two
+    callers would each have to branch on it. Branching here means the refusal is
+    written once, at the only door that can produce a provider, and no code
+    below has to ask whether the thing it is holding exists. The same shape as
+    ``bearer_token``: the check lives where the value is produced, so nothing
+    downstream has to be careful.
+
+    A **503**, not a 401, and ``errors.PaymentsUnconfiguredError`` argues why at
+    length. Short version: the installation is not ready, which is a different
+    sentence from the caller being unproven - and the difference decides whether
+    Paystack retries or gives up.
+    """
+    provider = request.app.state.payment_provider
+    if provider is None:
+        raise PaymentsUnconfiguredError(
+            "this installation has no payment provider configured"
+        )
+    return provider
+
+
+def deposit_service(
+    request: Request,
+    actor: User = Depends(current_actor),
+    provider: PaymentProvider = Depends(payment_provider),
+) -> InitiateDeposit:
+    """The deposit use case, acting as this request's actor, over this provider.
+
+    Two dependencies rather than one, and the pair is the point: the actor
+    scopes the wallet and supplies the payer's email, and the provider is what
+    the money will arrive through. Neither can stand in for the other - a
+    provider with no actor cannot say whose wallet to credit, and an actor with
+    no provider cannot open a collection - so a missing payment key is a refusal
+    *before* any wallet is read, which is the correct order for a request that
+    can only fail.
+
+    ``settings`` is ``app.state.paystack``, not ``app.state.settings``, and the
+    two names being adjacent is exactly why it is worth saying: one is the mail
+    installation and one is the payment installation, they are configured
+    separately, and this is the one place both are in scope.
+    """
+    return build_initiate_deposit(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.paystack,
+        actor=actor.user_id,
+        provider=provider,
+    )
+
+
+def settler_service(request: Request) -> SettlePayment:
+    """Settlement, which has no actor and therefore no ``current_actor`` here.
+
+    **This is the only service in the module built without one**, and the
+    absence is not an oversight to be tidied later - it is the shape of the
+    thing. ``SettlePayment`` cannot be told who is acting, because a provider
+    reporting a movement is not a person and there is no honest value to give
+    it. Ownership is established inside the use case, from the ledger row it is
+    settling, through ``WalletRepository.owner_of`` - so the money is still only
+    ever read as its owner's, and the guarantee holds by a different route
+    rather than by an exemption. See ``SettlePayment``'s class docstring.
+
+    ``settings`` is the *mail* settings, so the receipt a settled movement earns
+    is addressed the way every other receipt in this system is. Note the
+    contrast with ``deposit_service`` above: the money arrives through Paystack
+    and the confirmation goes out through SMTP, and a builder taking one settings
+    object for both would be the place the two quietly became one.
+    """
+    return build_settler(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.settings,
     )

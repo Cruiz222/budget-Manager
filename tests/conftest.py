@@ -26,6 +26,9 @@ from app.composition_root import build_log_in, build_sign_up
 from app.domain.identity.password import PlainPassword
 from app.domain.identity.password_hasher import PasswordHasher
 from app.domain.identity.user import User
+from app.infrastructure.payments.paystack_payment_provider import (
+    PaystackPaymentProvider,
+)
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
@@ -38,6 +41,9 @@ from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notificationChannel import NotificationChannel
+from app.domain.payments.paymentIntent import PaymentIntent
+from app.domain.payments.providerAnswer import ProviderAnswer
+from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
 from app.domain.planning.cadence import Cadence
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.plannedAction import PlannedAction
@@ -296,6 +302,7 @@ SETTINGS_VARIABLES = (
     "BUDGET_NOTIFY_FROM",
     "BUDGET_DB",
     "BUDGET_SESSION",
+    "PAYSTACK_SECRET_KEY",
 )
 
 
@@ -664,8 +671,182 @@ class RecordingTransactionRepository(TransactionRepository):
     def get_by_provider_reference(self, provider_reference):
         raise NotImplementedError
 
+    def list_awaiting_provider(self):
+        raise NotImplementedError
+
 
 @pytest.fixture
 def recording_transactions():
     """A ``RecordingTransactionRepository``, fresh for each test."""
     return RecordingTransactionRepository()
+
+
+#: The secret a fake provider signs and verifies with.
+#:
+#: Shaped like Paystack's own keys - ``sk_test_`` and thirty-odd characters of
+#: hex - so that a test which accidentally printed one would be recognisable as a
+#: test value rather than mistaken for a live credential. It is not a credential:
+#: it is a string two functions in one process agree about, and ``sk_test_``
+#: rather than ``sk_live_`` is the honest prefix for exactly that.
+TEST_PAYSTACK_SECRET = "sk_test_" + "0" * 32
+
+
+class FakePaymentProvider(PaystackPaymentProvider):
+    """A payment provider that answers instead of calling out.
+
+    **It subclasses the real adapter and replaces the two methods that call
+    out**, which is a deliberate departure from ``FakeChannel`` and
+    ``FakePasswordHasher`` above, and the difference is worth the paragraph.
+    Those two reimplement their ports from scratch because the real
+    implementations cost something a test cannot pay - argon2 is slow by design,
+    and SMTP needs a server - so there is nothing to inherit. Here the real
+    adapter has three halves and only one of them can hurt: the two that make a
+    request open a socket, and ``verify_signature`` is pure HMAC over bytes with
+    no I/O anywhere in it.
+
+    So the choice is between a fake that reimplements HMAC-SHA512 and one that
+    *is* the adapter's verification with the network calls stubbed out. The first
+    would pass whether or not the adapter's verification worked - the classic
+    way a security test ends up testing itself - and the second is what lets
+    ``test_webhooks.py`` assert that a body altered after signing is refused,
+    with no provider account and no second copy of the signing rule anywhere in
+    this suite.
+
+    That argument used to cover one method, and reconciliation is what made it
+    cover two: ``outcome_for`` also opens a socket, so leaving it un-overridden
+    would have sent the whole API suite to the network the day it was written.
+    The rule that keeps this honest is the one this class has always followed -
+    **every method that leaves the process is replaced here, and every method
+    that is pure is inherited** - which is now two and one rather than one and
+    one.
+
+    What the replacement keeps is the contract: a reference in, a ``PaymentIntent``
+    out, and ``PaymentProviderError`` raised rather than a sentinel returned when
+    it cannot do its job. ``requests`` records every call so a test can ask what
+    was sent - which is how "the provider was told the payer's email and nothing
+    else about them" is assertable.
+
+    ``failures`` is a queue of exceptions to raise from ``initialize_deposit``,
+    consumed one per attempt. Once it is empty, calls succeed - the same shape
+    ``FakeChannel`` uses, and for the same reason: it makes "the retry gets
+    through" expressible without any further arrangement. It belongs to the
+    deposit path alone; a reconciler test that wants a lookup to fail scripts
+    that into ``answers`` instead, where it can name the row.
+
+    ``provider_reference`` is the name this fake reports the collection under.
+    It defaults to the reference it was handed, which is what Paystack does when
+    it is given one - and it is a dial because the honest thing to test is that
+    the two columns are separate even when the values agree.
+
+    ``answers`` is what ``outcome_for`` will say, keyed by the reference asked
+    about, and ``lookups`` is every reference it was asked about in order. Two
+    things about the mapping are worth stating:
+
+      - **An unscripted reference answers ``NOT_SETTLED``**, because that is what
+        a real run mostly hears and because it is the answer that changes
+        nothing. A test therefore scripts only the rows it is about, and a test
+        that forgot to script one gets a quiet run rather than a confusing
+        error - which is why the *other* assertion, that nothing was asked at
+        all, is made against ``lookups`` rather than against the answers.
+      - **A value may be an exception**, which is how "this one row raises and
+        the rest still settle" is expressible without depending on call order.
+        A queue consumed per call would work too, but it would say "the second
+        lookup fails" when the test means "dep-2 fails", and those stop being the
+        same sentence the moment the ordering changes.
+    """
+
+    def __init__(
+        self,
+        secret_key: str = TEST_PAYSTACK_SECRET,
+        failures=(),
+        provider_reference: str | None = None,
+        answers=None,
+    ):
+        super().__init__(secret_key=secret_key)
+        self.requests: list = []
+        self.lookups: list = []
+        self._failures = list(failures)
+        self._provider_reference = provider_reference
+        self._answers = dict(answers or {})
+
+    def initialize_deposit(
+        self, *, reference: str, amount: Money, email: str
+    ) -> PaymentIntent:
+        self.requests.append(
+            {"reference": reference, "amount": amount, "email": email}
+        )
+        if self._failures:
+            raise self._failures.pop(0)
+        return PaymentIntent(
+            authorization_url=f"https://checkout.paystack.test/{reference}",
+            provider_reference=(
+                reference
+                if self._provider_reference is None
+                else self._provider_reference
+            ),
+        )
+
+    def outcome_for(self, reference: str) -> ProviderAnswer:
+        self.lookups.append(reference)
+        answer = self._answers.get(reference)
+        if answer is None:
+            return ProviderAnswer(ProviderAnswerStatus.NOT_SETTLED)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+@pytest.fixture
+def build_payment_provider():
+    """Return a fresh :class:`FakePaymentProvider`.
+
+        build_payment_provider()                              # every call works
+        build_payment_provider(failures=[PaymentProviderError("down")])
+        build_payment_provider(secret_key="sk_test_other")     # a key nothing signs with
+        build_payment_provider(answers={"dep-1": an_answer})   # what a lookup says
+    """
+
+    def _build(**kwargs) -> FakePaymentProvider:
+        return FakePaymentProvider(**kwargs)
+
+    return _build
+
+
+def sign_paystack_body(
+    body: bytes, secret_key: str = TEST_PAYSTACK_SECRET
+) -> str:
+    """The signature Paystack would put on ``body``, for a test to send.
+
+    **This is the one place the suite writes the signing rule, and it writes it
+    on the *test's* side of the wire.** It exists so that a request can be built
+    that a real verifier will accept, and deliberately not so that anything can
+    be checked with it - the verification under test is the adapter's, and a test
+    that asked this function whether a signature was good would be asking the
+    thing it is trying to test. The distinction is the same one ``FakeChannel``
+    makes by recording rather than asserting.
+
+    Hex, lowercase, SHA-512, over the bytes as sent. Everything about that
+    sentence is Paystack's rather than ours, which is why a wrong guess here
+    shows up as a failing test rather than as a passing one that proved nothing.
+    """
+    return hmac.new(
+        secret_key.encode("utf-8"), body, hashlib.sha512
+    ).hexdigest()
+
+
+@pytest.fixture
+def sign_webhook():
+    """``sign_paystack_body`` bound to a secret a caller can override.
+
+    A fixture rather than a bare import so that a test module reads on its own -
+    the same reason ``build_wallet`` and ``build_channel`` are fixtures. The
+    argument is the *secret*, not the body, because the body is the thing under
+    the test's control in every case and the secret is the one dial: signing with
+    the right key and signing with a wrong one are the two halves of every
+    signature test there is.
+    """
+
+    def _sign(body: bytes, secret_key: str = TEST_PAYSTACK_SECRET) -> str:
+        return sign_paystack_body(body, secret_key)
+
+    return _sign

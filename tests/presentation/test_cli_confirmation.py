@@ -65,10 +65,21 @@ def answering(monkeypatch, *answers):
     test would fail loudly rather than quietly reusing the first answer. That is
     the assertion hiding inside the helper, and it is why it is written this way
     rather than as a constant.
+
+    **The prompt is written back out, because ``input`` does that itself.** The
+    real ``input(prompt)`` prints its prompt to stdout and then reads a line, so
+    a double that swallowed the argument would be a double that behaves
+    differently from the thing it replaces - and the difference lands squarely on
+    the tests that are about what the person is *shown*. ``confirm? [y/N]`` is
+    the whole of what the prompt asks; a fake that kept it to itself would make
+    that string unreachable from any test in this file, which is how this line
+    came to be here. Found by running the suite; the module docstring's promise
+    that the prompt is asserted rather than assumed is what caught it.
     """
     remaining = list(answers)
 
     def _input(prompt=""):
+        print(prompt, end="")
         if not remaining:
             raise AssertionError("the CLI asked more times than the test allowed")
         return remaining.pop(0)

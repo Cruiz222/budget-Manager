@@ -1,0 +1,85 @@
+"""Errors raised by the payments side of the domain.
+
+Deriving from ``MoneyError`` rather than from ``Exception`` continues the rule
+``app.domain.planning.exception`` states: **a new exception belongs under the
+existing root, or every catch site in the codebase has to be revisited.** The
+CLI catches ``MoneyError`` once, at the top of ``main``, and turns it into
+``error: ...`` with exit code 1; the API's handlers do the same. A payments root
+outside that tree would mean every refusal escaped as a traceback instead.
+
+There is deliberately very little here, and the absence is the design. A
+webhook that names a reference nobody has heard of, an event that arrives twice,
+an amount that disagrees with the row - none of those is an error, because none
+of them is a failure of anything. They are *reports* that the system handles and
+answers with a 200, and they are modelled as values (``SettlePayment``'s result)
+rather than as exceptions. What is left for this module is the one thing that
+genuinely cannot proceed: the provider itself refusing a call.
+"""
+
+from app.domain.money.exception import MoneyError
+
+
+class PaymentError(MoneyError):
+    """Base for every rejection the payments domain makes."""
+
+
+class PaymentProviderError(PaymentError):
+    """The provider refused a call, or could not be reached.
+
+    Raised by an adapter and never by a use case, exactly as
+    ``NotificationChannel.send`` raises rather than returning a status - see the
+    port's docstring, where the reasoning is the same one and is written out.
+    """
+
+
+class InvalidPaymentIntentError(PaymentError):
+    """A provider answered with something that is not a usable intent.
+
+    Nearly always a wrong secret key: Paystack answers ``401`` with
+    ``{"message": "Invalid key"}`` and no ``data`` at all, so the adapter's parse
+    is where that becomes legible rather than a ``KeyError`` three frames later.
+    """
+
+
+class InvalidProviderOutcomeError(PaymentError):
+    """A set of facts about a provider event that cannot describe one.
+
+    The amount, the reference and the event are each checked by
+    ``ProviderOutcome``, so an event that reaches ``SettlePayment`` is a
+    well-formed thing whatever else is true of it.
+    """
+
+
+class InvalidProviderAnswerError(PaymentError):
+    """A set of facts about a provider's answer that cannot describe one.
+
+    The sibling of ``InvalidProviderOutcomeError``, and it exists for the same
+    reason one level up. An outcome is refused when the three things a provider
+    told us cannot all be true at once; an answer is refused when the status and
+    the outcome disagree about whether anything happened at all.
+
+    Nearly always an adapter bug rather than a provider's doing - a provider
+    answers in its own vocabulary and the adapter is what translates - which is
+    why this is a distinct name rather than reusing the outcome's error. A
+    traceback saying "invalid provider answer" points at the lookup call; one
+    saying "invalid provider outcome" points at the webhook parse, and the two
+    are different methods in a different file.
+    """
+
+
+class DepositAlreadyInitiatedError(PaymentError):
+    """A deposit is already open under this idempotency key.
+
+    Raised rather than answered with the original, and that is a decision worth
+    stating because the opposite looks friendlier. What the client would want
+    back is the ``authorization_url`` from the first call - but nothing stores
+    it, and the reason nothing stores it is that it would be a link the provider
+    has very likely already retired: a checkout URL is single-use, so replaying
+    one that has been paid leaves the client holding a page that will not take
+    money. The honest answer is that a collection is already open under this key,
+    which is a fact the client can act on by using a different key or by
+    reconciling against their own records.
+
+    The refusal is a 409 like every other "this exists and its state refuses
+    you", and like them it names the row rather than blaming the request.
+    """

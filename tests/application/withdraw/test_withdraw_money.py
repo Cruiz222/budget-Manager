@@ -52,6 +52,13 @@ class RecordingTransactionRepository(TransactionRepository):
     def get_by_provider_reference(self, provider_reference):
         raise NotImplementedError
 
+    def list_awaiting_provider(self):
+        # The reconciliation read, which no test in this module serves. It is here
+        # for the reason the identical line in ``test_deposit_money.py`` gives:
+        # the port grew, and an abstract method with no implementation makes the
+        # class un-instantiable whether or not anything calls it.
+        raise NotImplementedError
+
 
 # --- A withdrawal debits the wallet and holds the money ---
 

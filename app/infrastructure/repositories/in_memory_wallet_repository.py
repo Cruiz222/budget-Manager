@@ -29,3 +29,17 @@ class InMemoryWalletRepository(WalletRepository):
             raise WalletNotFoundError
 
         return wallet
+
+    def owner_of(self, wallet_id):
+        """The owner id behind a wallet id, or ``WalletNotFoundError``.
+
+        Deliberately narrow in the same way the SQLite adapter is: it returns the
+        id and not the wallet, so a caller on this fake is held to the same
+        discipline as one on the real store. A fake that handed back the whole
+        wallet would let a caller read balances through a method whose contract
+        says it cannot - and the divergence would only show up in production.
+        """
+        wallet = self.wallets.get(wallet_id)
+        if wallet is None:
+            raise WalletNotFoundError
+        return wallet.user_id

@@ -1459,31 +1459,41 @@ class TestRequestingAConfirmation:
         )
         assert second.confirmation.amount == Money(Decimal("3000"), NGN)
 
-    def test_two_actors_may_use_the_same_reference(self, tmp_path, build_wallet):
+    def test_one_owner_may_use_the_same_reference_on_two_wallets(
+        self, tmp_path, build_wallet
+    ):
         """The key is scoped to the wallet, and a wallet has one owner.
 
         Scoping by owner instead would have left one case open: a single person
         posting the same key to two of their own wallets - which is not a retry,
         and a store that answered it with the first request would be handing them
         a confirmation for the wrong wallet.
+
+        **It takes one actor and two wallets to ask the question at all.** With
+        two actors holding one wallet each - which is what this test used to do -
+        owner-scoping and wallet-scoping give the same answer, so the test passed
+        without ever reaching the difference it was named for. The same reference
+        under one owner is the only arrangement that tells the two scopings
+        apart, and the wallet ids in the two answers are what a store keyed by
+        owner would have got wrong.
         """
         owner = uuid4()
-        stranger = uuid4()
-        owner_wallet = build_wallet(user_id=owner)
-        stranger_wallet = build_wallet(user_id=stranger)
-        service, factory = build_service(tmp_path)
-        seed(factory, owner_wallet)
-        seed(factory, stranger_wallet)
+        own_wallet = build_wallet(user_id=owner)
+        other_wallet = build_wallet(user_id=owner)
+        factory = SqliteUnitOfWorkFactory(str(tmp_path / "same_reference.db"))
+        seed(factory, own_wallet)
+        seed(factory, other_wallet)
+        service = as_somebody_else(factory, owner)
 
         first = service.request_confirmation(
-            owner_wallet.wallet_id,
+            own_wallet.wallet_id,
             ConfirmationKind.WITHDRAWAL,
             MOMENT,
             internal_reference="rent",
             amount=Money(Decimal("100"), NGN),
         )
-        second = as_somebody_else(factory, stranger).request_confirmation(
-            stranger_wallet.wallet_id,
+        second = service.request_confirmation(
+            other_wallet.wallet_id,
             ConfirmationKind.WITHDRAWAL,
             MOMENT,
             internal_reference="rent",
@@ -1494,6 +1504,8 @@ class TestRequestingAConfirmation:
         assert first.confirmation.confirmation_id != (
             second.confirmation.confirmation_id
         )
+        assert first.confirmation.wallet_id == own_wallet.wallet_id
+        assert second.confirmation.wallet_id == other_wallet.wallet_id
 
     def test_a_request_against_a_stranger_s_wallet_finds_nothing(
         self, tmp_path, build_wallet

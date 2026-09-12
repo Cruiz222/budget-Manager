@@ -28,6 +28,7 @@ happened.
 """
 
 from app.domain.money.transaction import Transaction
+from app.domain.money.transactionType import TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.notifications.eventKey import for_plan_event, for_wallet_event
 from app.domain.notifications.notification import Notification
@@ -169,6 +170,48 @@ def _from_pot(fund_name: str | None) -> str:
     if fund_name is None:
         return ""
     return f"Drawn from the pot {fund_name!r}.\n"
+
+
+#: Which receipt a ledger row earns, by what kind of row it is.
+#:
+#: **Keyed on ``TransactionType``, which is a different key from
+#: ``WalletService.ANNOUNCED``'s and cannot be merged with it.** That one is
+#: keyed on the *operation class*, because several classes record the same type -
+#: ``DepositMoney`` and ``DepositIntoFund`` are both a DEPOSIT - and the two
+#: lookups therefore answer two different questions: "is this operation worth
+#: telling the owner about?" at the moment it runs, and "what is this row, now
+#: that it is finished?". They agree today, which is a fact about the code rather
+#: than a guarantee, and this is the third place the question is asked. The
+#: README carries that as an open item; this table is written next to
+#: ``wallet_movement`` so that a drift between the two is visible in one file.
+_WALLET_MOVEMENT_KINDS = {
+    TransactionType.DEPOSIT: NotificationKind.WALLET_DEPOSIT,
+    TransactionType.WITHDRAWAL: NotificationKind.WALLET_WITHDRAWAL,
+    TransactionType.PAYOUT: NotificationKind.WALLET_PAYOUT,
+}
+
+
+def receipt_kind_for_transaction_type(
+    transaction_type: TransactionType,
+) -> NotificationKind | None:
+    """The receipt a finished row earns, or ``None`` if it earns none.
+
+    ``None`` is the answer for a lock or a release, and it is the same silence
+    ``ANNOUNCED`` describes: those move money between the wallet's own two
+    balances, so there is nothing to tell the owner that the terminal they typed
+    the command at has not already printed. It is also the answer for anything
+    unrecognised, which is deliberate - a caller settling a row it does not
+    understand should say nothing rather than guess a kind and send a receipt
+    that confidently describes the wrong event. ``wallet_movement`` raises for
+    exactly that case, and the two behaviours are complementary rather than
+    inconsistent: this function decides *whether* to compose, and that one
+    refuses to compose something it cannot describe.
+
+    Note this says nothing about the row's *status*. A failed deposit still has a
+    DEPOSIT type, and a receipt for it would be a lie - so the caller checks the
+    status, and only ``SettlePayment`` does, because it is the only caller.
+    """
+    return _WALLET_MOVEMENT_KINDS.get(transaction_type)
 
 
 def wallet_movement(

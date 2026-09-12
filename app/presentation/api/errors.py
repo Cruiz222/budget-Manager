@@ -83,6 +83,7 @@ from app.domain.planning.exception import (
     PlanNotPausedError,
     SavingsPlanNotFoundError,
 )
+from app.domain.payments.exception import DepositAlreadyInitiatedError
 
 #: We do not know who is asking, or the proof offered did not hold.
 #:
@@ -151,6 +152,13 @@ NOT_FOUND = (
 #: collapsing them would make "already answered" indistinguishable from "never
 #: answered in time" in a log, which are the two facts worth telling apart when
 #: somebody reports that money did not move.
+#:
+#: ``DepositAlreadyInitiatedError`` is the newest member and the first that is
+#: about a *provider's* resource rather than one of ours. The row that exists is
+#: a PENDING deposit, but what makes the request refusable is that a collection
+#: has already been opened under this key - and a checkout URL is single-use, so
+#: there is nothing to hand back. A duplicate key is the plainest possible
+#: statement about a resource's state, so it is a 409 like the rest.
 CONFLICT = (
     InsufficientFundsError,
     WalletFrozenError,
@@ -171,6 +179,7 @@ CONFLICT = (
     CommittedPayoutRemovalError,
     ConfirmationExpiredError,
     ConfirmationAlreadyUsedError,
+    DepositAlreadyInitiatedError,
 )
 
 
@@ -211,6 +220,78 @@ class MissingCredentialsError(ApiError):
     """
 
     status_code = 401
+
+
+class InvalidWebhookSignatureError(ApiError):
+    """A webhook arrived that this installation's secret key did not sign.
+
+    A 401, and the module docstring's own grading is what puts it there: *"we do
+    not know who is asking, or the proof offered did not hold"*. A webhook
+    presents no session, so the first half is not askable - but the second is
+    exactly what happened. The caller is unidentified and the credential it
+    offered was checked and rejected, which is a 401 in every sense except that
+    the credential is a signature rather than a token.
+
+    **It carries no body detail about *why*.** An absent header, a wrong header
+    and a body altered after signing are one answer, because they are one fact -
+    this request cannot be shown to have come from Paystack - and telling a
+    stranger which of the three it was is telling them how their forgery failed.
+    The distinction exists in the server's log, not in the response; see
+    ``routes/webhooks.py``.
+
+    **Not a ``MoneyError``, and this is the class that most needs the argument.**
+    The domain has never heard of a header, a signature or a byte string. A
+    forged webhook is not a statement about money that the aggregates could have
+    an opinion about - it is a statement about a *request*, which is this layer's
+    whole subject.
+    """
+
+    status_code = 401
+
+
+class MalformedWebhookError(ApiError):
+    """A signed body that is not an event this installation can read.
+
+    A 400 rather than the 200 the *unrecognised* case gets, and the difference
+    between the two words is the whole of this class. An event this code has
+    never heard of is a provider doing something new, which is not a problem and
+    is acknowledged; a body that has no ``event`` field, or whose ``data``
+    carries no reference or no usable amount, is one that cannot be read at all.
+    There is nothing to acknowledge, no row to name, and nothing a retry would do
+    differently - so the honest answer is "this is not a request I can act on".
+
+    400 rather than 500 is also what stops the retry: a provider retries a 5xx
+    and gives up on a 4xx, and giving up is correct here. A 500 would have
+    Paystack redeliver a body that will fail identically every time, which is a
+    retry storm over a bug rather than a recovery from an outage.
+    """
+
+    status_code = 400
+
+
+class PaymentsUnconfiguredError(ApiError):
+    """This installation has no payment key, so it can neither collect nor judge.
+
+    A 503, and the choice of 503 over 401 is the point of writing this class
+    down. It would be easy to call a webhook on an unconfigured install
+    *unauthenticated* - there is no key, so no signature can verify - but that
+    would blame the caller for the installation's state. Paystack's signature may
+    be perfectly good; there is simply nothing here to check it against, and a
+    503 says so: the server cannot serve this request *right now*, try later.
+    Which is what we want a provider to do, because the operator who forgot to
+    set the key will fix it and the events will then land.
+
+    A 401 would tell Paystack to stop, and the money taken during that window
+    would be settled by nothing.
+
+    It covers both routes on this subject, and they reach it the same way: a
+    deposit refused because no collection can be opened, and a webhook refused
+    because no signature can be verified. See
+    ``dependencies.payment_provider`` - one dependency, so that "is this
+    installation configured?" has one answer rather than one per route.
+    """
+
+    status_code = 503
 
 
 def _grade(exc: MoneyError) -> int:

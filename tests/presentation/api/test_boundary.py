@@ -10,6 +10,17 @@ changes" but three separate claims, each written down here:
     the held set       routes that a later phase will add, with the phase named
     the never set      routes this API will not grow, with the reason named
 
+**A fourth claim joined those three in 3a, and it is not about a set at all: not
+every route on the wire is authenticated by a token.** ``POST /webhooks/paystack``
+is exposed, is reachable by anybody who can open a socket, and is authorised by a
+signature - which is a different question from "who is asking" and is answered in
+a different place. It is worth naming here because this file is where somebody
+comes to find out what the API's trust boundary is, and "every route in
+``EXPECTED_OPERATIONS`` requires a bearer token" is a sentence that used to be
+true and is now false. The signature is checked before anything is parsed, no
+route can be *started* through it, and ``routes/webhooks.py`` argues the whole of
+it.
+
 The first is a property of a *set of routes*, and a property of a set is not
 something a docstring can hold - it is one ``@router.post`` away from being
 false, and the commit that makes it false will look like an ordinary feature. So
@@ -102,25 +113,68 @@ EXPECTED_OPERATIONS = {
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/lock"),
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/release"),
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/extend"),
+    # --- money arriving, added in 3a ----------------------------------------
+    #
+    # The deposit, and it is the route this list spent two phases holding. It is
+    # exposed now because the thing that was missing is here: **a deposit credits
+    # nothing until a party outside this system says the money arrived**, and that
+    # party is now able to say so.
+    #
+    # Note what this route is *not* authorised by. A session token would have been
+    # enough to reach it in 2b and would still have been wrong, because the caller
+    # *is* authorised - the request is a lie about where money came from, not a
+    # question about who is asking. What makes it honest is that the credit waits
+    # for Paystack, and Paystack proves itself with a signature. See the deposit
+    # route's docstring and ``/webhooks/paystack`` below.
+    ("post", "/wallets/{wallet_id}/deposits"),
+    # --- the second kind of authority, added in 3a ---------------------------
+    #
+    # **The one route in this API that no person calls, and the reason it needs
+    # its own category here.** The two lists below say what is absent; the list
+    # above says what is exposed; and every entry in the latter that is
+    # *authenticated at all* is authenticated by a bearer token. This one is not,
+    # and cannot be: a payment provider reporting a movement holds no session.
+    #
+    # It is neither of the two shapes already on this page. ``POST /tick`` is
+    # actorless *by nature* - it runs over every plan and there is nobody it could
+    # act as, which is why it is in ``NEVER_ROUTED_OPERATIONS``. This is
+    # actorless too, but the absence of an actor is not what authorises it: a
+    # signature is, and a signature is verified. So it is exposed, it is
+    # unauthenticated in the token sense, and the thing standing between a
+    # stranger and the ledger is an HMAC rather than a 401.
+    #
+    # Anything reachable here can *settle* a movement - credit a wallet, fail a
+    # transfer, reverse a settled one - and nothing here can *start* one. That
+    # asymmetry is the whole safety argument for putting it on the wire at all,
+    # and it is what the signature is protecting.
+    ("post", "/webhooks/paystack"),
 }
 
 #: Balance changes that are still held, each one because the movement's far end
 #: is *outside* this system and nothing here can yet authorise it.
 #:
-#: **These two are the whole list as of 2b**, down from thirteen, and the single
-#: reason they share is worth stating precisely, because it is not "we ran out of
-#: time". A deposit is money arriving from outside, and the only party that can
-#: honestly say money arrived is the one that sent it - Paystack, in Phase 3,
-#: proving itself with a signature. Exposed now, ``POST /wallets/{id}/deposits``
-#: would let any authenticated caller credit their own wallet for free, which is
-#: not a boundary this API can draw with a session token: the caller *is*
-#: authorised, and the request is still a lie about where money came from.
+#: **One entry left, down from two as of 3a**, and the one that remains is here
+#: for a different reason from the deposit that just left.
 #:
-#: The CLI keeps its ``deposit`` command for the same reason it always had it. A
-#: developer's tool operating on their own database is not a wire protocol, and
-#: nothing it does is reachable by anybody else.
+#: ``POST /wallets/{id}/deposits`` was the other, and it moved to
+#: ``EXPECTED_OPERATIONS`` when the webhook landed - which is the only thing that
+#: could have moved it. The paragraph that used to sit here said a deposit was
+#: held because "the only party that can honestly say money arrived is the one
+#: that sent it - Paystack, in Phase 3, proving itself with a signature". Phase 3
+#: arrived, and the route is now honest for exactly that reason: it opens a
+#: collection and credits nothing.
+#:
+#: **A deposit into a pot is still held, and it is not the same feature.** The
+#: one above is money arriving into a wallet, where the destination is decided
+#: when the collection is opened and the provider's event supplies nothing but an
+#: amount. Potting it would mean deciding *after* the money landed which pot it
+#: was for - by which time the payer has already chosen nothing and the wallet
+#: has already been told the money is available. That is a routing decision this
+#: system does not have, and inventing one is not a matter of lowering a flag.
+#: The CLI keeps its pot-deposit command, and its ``deposit``, for the reason it
+#: always had both: a developer's tool on their own database is not a wire
+#: protocol and nothing it does is reachable by anybody else.
 HELD_OPERATIONS = [
-    ("post", "/wallets/{wallet_id}/deposits"),
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/deposits"),
 ]
 
@@ -247,7 +301,7 @@ class TestTheAbsentOperationsAreStillAbsent:
         showing it can distinguish a routed path from an unrouted one.
 
         It is the same check it has always been, and it matters more now than it
-        did in 1b: the parametrize list has shrunk from fifteen entries to five,
+        did in 1b: the parametrize list has shrunk from fifteen entries to four,
         so a broken harness would hide less and less.
         """
         routed = client.get(f"/wallets/{real_ids['wallet_id']}", headers=as_user())

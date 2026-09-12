@@ -1,26 +1,36 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
 from app import composition_root
 from app.composition_root import (
     build_deliverer,
+    build_initiate_deposit,
     build_notification_deliverer,
     build_notifier,
+    build_reconciler,
     build_scheduler,
+    build_settler,
     build_wallet_service,
+    provider_for,
 )
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
+from app.domain.money.transaction import Transaction
+from app.domain.money.transactionType import TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.payments.providerAnswer import ProviderAnswer
+from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
+from app.domain.payments.providerEvent import ProviderEvent
+from app.domain.payments.providerOutcome import ProviderOutcome
 from app.domain.planning.instruction import Instruction
 from app.domain.planning.plannedAction import PlannedAction
-from app.infrastructure.settings import EmailSettings
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
+from app.infrastructure.settings import EmailSettings, PaystackSettings
 from tests.conftest import TEST_USER_ID
 
 NGN = Currency.NGN
@@ -472,4 +482,306 @@ def test_build_scheduler_runs_a_plan_whose_owner_it_was_never_told(
     finally:
         read.rollback()
     assert stored.locked_balance == Money(Decimal("8000"), NGN)
+
+
+# --- payments ---------------------------------------------------------------
+#
+# The same three shapes as the notification side, one direction of money over,
+# and they are here rather than in the payments packages for the same reason the
+# channel tests above are here: what is being checked is *wiring* - which adapter
+# meets which port, and with which arguments - and wiring has exactly one home.
+
+
+#: A key that is not a credential. Shaped like ``TEST_PAYSTACK_SECRET`` so that a
+#: test value is recognisable as one, and deliberately not imported from the
+#: suite's constants: this file is about what a *settings object* carries into an
+#: adapter, and reusing the fake's key would make the two indistinguishable.
+SECRET = "sk_test_" + "a" * 32
+
+
+def a_pending_deposit(wallet, amount="5000", reference="dep-1") -> Transaction:
+    """A deposit row as ``InitiateDeposit`` leaves it: asked for, not arrived.
+
+    Built by hand rather than through the deposit route, because what is under
+    test in this file is which *adapter* a builder chose - and reaching that
+    through an HTTP client would make this file's failure modes indistinguishable
+    from the deposit suite's.
+    """
+    return Transaction(
+        wallet_id=wallet.wallet_id,
+        type=TransactionType.DEPOSIT,
+        amount=Money(Decimal(amount), NGN),
+        internal_reference=f"{wallet.wallet_id}:{reference}",
+        provider_reference=reference,
+    )
+
+
+def a_charge(row: Transaction) -> ProviderOutcome:
+    """The event a provider sends when the payer's card was charged.
+
+    For the row's own reference and the row's own amount, so that the two
+    agreement rules ``SettlePayment`` applies are satisfied by construction and
+    the test is about the wiring rather than about them.
+    """
+    return ProviderOutcome(
+        event=ProviderEvent.CHARGE_SUCCEEDED,
+        reference=row.provider_reference,
+        amount=row.amount,
+    )
+
+
+def test_provider_for_without_settings_is_no_provider():
+    """The unconfigured install, and it is ``None`` rather than a stub.
+
+    A provider that always failed would make every deposit attempt look like a
+    provider outage on a machine that has simply never been set up to take
+    payments. ``None`` is the honest answer, and it is a *value*: the caller
+    checks it and answers 503, which is a state rather than an error.
+    """
+    assert provider_for(None) is None
+
+
+def test_provider_for_turns_settings_into_paystack(monkeypatch):
+    """The port meets the adapter here and nowhere else.
+
+    Asserting on the constructor arguments rather than on the class, for the
+    reason the channel test above does: the mistake this wiring could make is a
+    *value*, and one field is all there is to get wrong.
+    """
+    captured = {}
+
+    class RecordingProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        composition_root, "PaystackPaymentProvider", RecordingProvider
+    )
+
+    provider_for(PaystackSettings(secret_key=SECRET))
+
+    assert captured == {"secret_key": SECRET}
+
+
+def test_an_injected_provider_beats_the_settings(monkeypatch, build_payment_provider):
+    """The seam that keeps this suite off the network, stated as a precedence.
+
+    The settings here are complete, so a build that ignored the injected provider
+    would quietly construct a real adapter - and the next test to open a
+    collection would make an HTTP call. The exploding stand-in is what turns that
+    from a silent change into a failure.
+    """
+
+    class NeverBuilt:
+        def __init__(self, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("settings must not be used when a provider is given")
+
+    monkeypatch.setattr(composition_root, "PaystackPaymentProvider", NeverBuilt)
+    provider = build_payment_provider()
+
+    assert provider_for(PaystackSettings(secret_key=SECRET), provider) is provider
+
+
+def test_build_initiate_deposit_acts_for_the_actor_it_was_given(
+    tmp_path, build_user, build_wallet, build_payment_provider
+):
+    """Both halves of the wiring, asserted through one call that uses both.
+
+    The provider is proven injected by the fake's own record of what it was
+    asked, and the actor is proven by *whose address* that call carried: the
+    email comes from ``uow.users.get_by_id(self._actor)``, so a builder that
+    dropped the actor would not reach this line at all. That is the property
+    worth a test here, because it is the one a wrong builder would break
+    silently - a use case built for nobody would fail on a lookup, and a use case
+    built for the wrong person would send a real payer's address to a third
+    party.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet()
+    user = build_user(email="chinedu@example.com")
+    seed = factory.start()
+    seed.users.save(user)
+    seed.wallets.save(wallet)
+    seed.commit()
+    provider = build_payment_provider()
+
+    deposits = build_initiate_deposit(
+        unit_of_work_factory=factory,
+        settings=PaystackSettings(secret_key=SECRET),
+        actor=ACTOR,
+        provider=provider,
+    )
+    deposits.execute(wallet.wallet_id, Money(Decimal("5000"), NGN), "invoice-7")
+
+    assert provider.requests[0]["email"] == "chinedu@example.com"
+
+
+def test_build_settler_addresses_the_receipt_to_the_configured_recipient(
+    tmp_path, build_wallet
+):
+    """``settings`` here is mail, and this is what proves the builder reads it.
+
+    Not ``PaystackSettings``, which is the one thing about this signature worth
+    noticing: the money arrives through the payment provider and the receipt goes
+    out through the mail one, so the settle builder is told the address receipts
+    are addressed *to* and nothing about how payments are verified.
+
+    Three of the four fields below are never read, and writing them anyway is the
+    honest version: ``EmailSettings`` has no defaults for ``host``, ``port`` and
+    ``sender`` **because a setting with a default is a setting somebody deploys
+    without noticing**, so a test that wanted to name only the recipient would be
+    asking for exactly the wrong convenience. What the builder does with the
+    unread three is nothing - it takes a whole configuration or none.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet()
+    row = a_pending_deposit(wallet)
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.transactions.save(row)
+    seed.commit()
+
+    settler = build_settler(
+        unit_of_work_factory=factory,
+        settings=EmailSettings(
+            host="smtp.example.com",
+            port=587,
+            sender="alerts@example.com",
+            recipient="chinedu@example.com",
+        ),
+    )
+    settled = settler.settle(a_charge(row))
+
+    assert settled.outcome.value == "deposit_credited"
+    read = factory.start()
+    try:
+        queued = read.notifications.pending()
+    finally:
+        read.rollback()
+    assert [notification.recipient for notification in queued] == [
+        "chinedu@example.com"
+    ]
+
+
+def test_build_settler_without_settings_still_settles_and_says_nothing(
+    tmp_path, build_wallet
+):
+    """The mirror of ``build_wallet_service``'s silent install, and the same claim.
+
+    A fresh installation has no mail account and still has to be able to take
+    money. So the money moves, the row settles, and the only thing missing is the
+    sentence telling the owner about it - which is why the address is composed
+    into the notification rather than consulted before the credit.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet()
+    row = a_pending_deposit(wallet)
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.transactions.save(row)
+    seed.commit()
+
+    settler = build_settler(unit_of_work_factory=factory, settings=None)
+    settled = settler.settle(a_charge(row))
+
+    assert settled.outcome.value == "deposit_credited"
+    read = factory.start()
+    try:
+        assert read.notifications.pending() == []
+        stored = read.wallets.get_owned(wallet.wallet_id, wallet.user_id)
+    finally:
+        read.rollback()
+    assert stored.available_balance == Money(Decimal("15000"), NGN)
+
+
+# --- the reconciler ---------------------------------------------------------
+
+
+def a_settled_answer_for(row: Transaction) -> ProviderAnswer:
+    """The provider's answer to "what became of this?", saying the money is there."""
+    return ProviderAnswer(ProviderAnswerStatus.SETTLED, a_charge(row))
+
+
+def test_build_reconciler_recovers_a_lost_payment_over_the_database_it_was_given(
+    tmp_path, build_wallet, build_payment_provider
+):
+    """**Both settings objects, and both proven by one call.**
+
+    This is the only builder in the file that names mail *and* payments, and each
+    half is asserted the way it would fail silently. The payment half is proven by
+    the fake's record of what it was asked - the reference it looked up - and the
+    mail half by *where the receipt went*, which is the one thing that can only
+    have come from ``EmailSettings``.
+
+    The deposit is recovered, which is the claim in miniature: a row nothing
+    settled, credited because the reconciler asked and the settler - the same
+    settler the webhook route uses - applied the answer.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet(available="0")
+    row = a_pending_deposit(wallet)
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.transactions.save(row)
+    seed.commit()
+    provider = build_payment_provider(
+        answers={"dep-1": a_settled_answer_for(row)}
+    )
+
+    reconciler = build_reconciler(
+        unit_of_work_factory=factory,
+        settings=EmailSettings(
+            host="smtp.example.com",
+            port=587,
+            sender="alerts@example.com",
+            recipient="chinedu@example.com",
+        ),
+        paystack=PaystackSettings(secret_key=SECRET),
+        provider=provider,
+    )
+    report = reconciler.execute(datetime.now() + timedelta(hours=1))
+
+    assert provider.lookups == ["dep-1"]
+    assert report.moved
+    read = factory.start()
+    try:
+        stored = read.wallets.get_owned(wallet.wallet_id, wallet.user_id)
+        queued = read.notifications.pending()
+    finally:
+        read.rollback()
+    assert stored.available_balance == Money(Decimal("5000"), NGN)
+    assert [notification.recipient for notification in queued] == [
+        "chinedu@example.com"
+    ]
+
+
+def test_build_reconciler_without_settings_still_recovers_and_says_nothing(
+    tmp_path, build_wallet, build_payment_provider
+):
+    """The silent install, one job over: the money moves and only the sentence
+    about it is missing. A fresh deployment has no mail account and must still be
+    able to notice a payment that arrived."""
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet(available="0")
+    row = a_pending_deposit(wallet)
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.transactions.save(row)
+    seed.commit()
+    provider = build_payment_provider(
+        answers={"dep-1": a_settled_answer_for(row)}
+    )
+
+    reconciler = build_reconciler(
+        unit_of_work_factory=factory, settings=None, provider=provider
+    )
+    reconciler.execute(datetime.now() + timedelta(hours=1))
+
+    read = factory.start()
+    try:
+        assert read.notifications.pending() == []
+        stored = read.wallets.get_owned(wallet.wallet_id, wallet.user_id)
+    finally:
+        read.rollback()
+    assert stored.available_balance == Money(Decimal("5000"), NGN)
 

@@ -233,6 +233,45 @@ class Wallet:
 
         self._available_balance = self._available_balance + amount
 
+    def release_hold(self, amount: Money):
+        """Give back money that was held for a movement that did not happen.
+
+        **This is not ``apply_deposit``, and the difference is the whole reason
+        it exists: this one checks no status.** A hold is money the wallet
+        *already owned* and which was taken out of the owner's reach while an
+        outside party was asked to move it - a payout leaving for a bank
+        account, say. When that party reports the movement failed, the money was
+        never spent, and it belongs back in the available balance.
+
+        ``apply_deposit`` refuses a ``CLOSED`` wallet, and that refusal is right
+        for what it does: money arriving from outside into a wallet nobody can
+        use would sit in a place its owner cannot reach, so the honest answer is
+        to refuse it. A returned hold is the opposite case, and the CLOSED guard
+        would turn a hold into a hole. It is reachable, not hypothetical: a
+        pending payout's money is in neither ``available_balance`` nor a pot, so
+        ``close`` sees an empty wallet and succeeds - and the wallet is closed
+        by the time the provider's failure arrives. Refusing here would leave
+        that money inside a wallet with no way to take it out, forever, which is
+        precisely the outcome every other rule in this class is written to
+        prevent.
+
+        A ``FROZEN`` wallet is credited for the same reason, and the argument is
+        the older one: freezing stops value *leaving*, and this is value coming
+        back. A frozen wallet already permits ``release_from_fund`` and
+        ``release_from_locked`` on exactly this ground.
+
+        The amount is still checked - currency, and strictly positive. A hold
+        that returned nothing, or returned a negative amount, would be a way to
+        move a wallet that the caller never went through the ledger for.
+        """
+        if amount.currency != self.currency:
+            raise CurrencyMismatchError("currency must be the same")
+
+        if amount.amount <= 0:
+            raise InvalidAmountError("amount must be greater than zero")
+
+        self._available_balance = self._available_balance + amount
+
     def withdraw(self, amount: Money):
         if self.status == WalletStatus.CLOSED:
             raise WalletClosedError("this wallet is closed")

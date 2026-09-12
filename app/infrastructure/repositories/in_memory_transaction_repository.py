@@ -2,6 +2,7 @@ from app.domain.repositories.transaction_repository import TransactionRepository
 from app.domain.money.exception import (
     TransactionNotFoundError
 )
+from app.domain.money.transactionStatus import TransactionStatus
 
 class InMemoryTransactionRepository(TransactionRepository):
     def __init__(self):
@@ -39,3 +40,21 @@ class InMemoryTransactionRepository(TransactionRepository):
             if transaction.provider_reference == provider_reference:
                 return transaction
         return None
+
+    def list_awaiting_provider(self):
+        awaiting = [
+            transaction
+            for transaction in self.transactions.values()
+            if transaction.status is TransactionStatus.PENDING
+            and transaction.provider_reference is not None
+        ]
+        # Oldest first, mirroring the SQL ORDER BY - and by the same tiebreak,
+        # because ``created_at`` is stored at second resolution in both stores
+        # and two rows written in one second must order the same way in each.
+        return sorted(
+            awaiting,
+            key=lambda transaction: (
+                transaction.created_at,
+                str(transaction.transaction_id),
+            ),
+        )

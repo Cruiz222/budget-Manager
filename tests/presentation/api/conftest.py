@@ -46,8 +46,8 @@ def db_path(tmp_path):
 
 
 @pytest.fixture
-def app(db_path, password_hasher):
-    """The application, with a fast hasher in place of argon2.
+def app(db_path, password_hasher, build_payment_provider):
+    """The application, with a fast hasher in place of argon2 and a fake provider.
 
     The one place in this suite where a real component is replaced, and the
     replacement is justified by cost rather than by convenience. Argon2 is
@@ -63,6 +63,67 @@ def app(db_path, password_hasher):
     test that passes here is a test that would pass against a server running
     argon2 - which is exactly what ``test_boundary.py`` and ``test_isolation.py``
     are relied upon to be true of.
+
+    **The payment provider is injected for the same class of reason, and it is
+    the newer half of this docstring.** ``create_app`` resolves a provider from
+    the environment when it is not given one, and this suite runs with
+    ``PAYSTACK_SECRET_KEY`` cleared - so the default here would be an install with
+    no payments, and every test that touches a deposit would be exercising a 503.
+    So the fake is passed, which makes the ordinary test app a *configured* one.
+
+    That default is a decision worth stating, because the opposite is defensible:
+    "no key" is the ordinary state of a fresh install. It loses on the grounds
+    that the suite's job is to test the application rather than its configuration
+    - the unconfigured state is one behaviour of one dependency, it is asserted
+    directly, and ``unconfigured_client`` below exists so that it is asserted
+    against a real application rather than described in a comment.
+    """
+    return create_app(
+        unit_of_work_factory=SqliteUnitOfWorkFactory(db_path),
+        password_hasher=password_hasher,
+        payment_provider=build_payment_provider(),
+    )
+
+
+@pytest.fixture
+def client(app):
+    with TestClient(app) as client:
+        yield client
+
+
+@pytest.fixture
+def payment_provider(client):
+    """The fake provider this application is wired to, so a test can read it.
+
+    Read off ``app.state`` rather than kept in a fixture of its own, and that is
+    not a shortcut - it is the assertion that the seam works. A provider the test
+    held separately could differ from the one the application is using, and the
+    failure that produced would be a test asserting about an object the server
+    had never seen.
+
+    What a test wants it for is ``.requests``: the calls this application made,
+    in order, with the arguments they carried. That is how "the payer's email was
+    sent and nothing else about them" and "the reference the provider was given is
+    the one the ledger holds" become assertable at all.
+    """
+    return client.app.state.payment_provider
+
+
+@pytest.fixture
+def unconfigured_app(db_path, password_hasher):
+    """An application with no payment provider at all.
+
+    The genuinely unconfigured installation: no provider injected, and
+    ``PAYSTACK_SECRET_KEY`` cleared by the autouse fixture in ``tests/conftest.py``
+    - so ``create_app`` resolves one from the environment, finds nothing, and
+    leaves ``app.state.payment_provider`` as ``None``. That is the state a fresh
+    deployment is in before anybody sets a key, and the state the 503 tests exist
+    for.
+
+    Separate from ``app`` rather than a parameter on it, because the two are
+    different *installations* rather than two configurations of one test client -
+    and because a test that reached for a dial here could set it without noticing
+    that every other test in the file depends on the default.
     """
     return create_app(
         unit_of_work_factory=SqliteUnitOfWorkFactory(db_path),
@@ -71,8 +132,8 @@ def app(db_path, password_hasher):
 
 
 @pytest.fixture
-def client(app):
-    with TestClient(app) as client:
+def unconfigured_client(unconfigured_app):
+    with TestClient(unconfigured_app) as client:
         yield client
 
 
@@ -197,6 +258,29 @@ def open_wallet(client, as_user):
         return response.json()["wallet_id"]
 
     return _open
+
+
+@pytest.fixture
+def balance_of(client):
+    """A wallet's available balance, as the API reports it - ``"5000.00"``.
+
+    Read back through ``GET /wallets/{id}`` rather than through a repository, so
+    that the number a test asserts is the number a *client* would see. A
+    settlement that credited correctly and a read that reported it wrongly would
+    be one bug, and this is the seam where that shows up.
+
+    A string rather than a number, because that is what the API returns - see
+    ``MoneyOut`` - and a fixture that parsed it into a ``Decimal`` would be
+    quietly undoing the serialization decision every test that used it was
+    supposed to be checking.
+    """
+
+    def _balance(wallet_id, headers):
+        response = client.get(f"/wallets/{wallet_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        return response.json()["available_balance"]["amount"]
+
+    return _balance
 
 
 @pytest.fixture

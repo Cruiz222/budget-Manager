@@ -273,6 +273,64 @@ class HealthOut(BaseModel):
     status: str = Field(examples=["ok"])
 
 
+class DepositIntentOut(BaseModel):
+    """A deposit that has been asked for. **The wallet has not been credited.**
+
+    The inbound mirror of ``ConfirmationOut``, and the resemblance is not
+    accidental: both describe a movement that has not happened, and both exist so
+    that a client cannot mistake a record of intent for a change in balance. What
+    differs is who has to act - a withdrawal request waits for its owner to
+    answer a prompt, and this waits for a *stranger with a card* to pay a page
+    that was opened for them.
+
+    ``authorization_url`` is the provider's page and is the only field this API
+    forwards from a third party without understanding it. Nothing here parses it,
+    stores it or reconstructs it, which is why it travels as an opaque string:
+    see ``InitiatedDeposit``.
+
+    ``status`` is ``pending`` and is sent rather than left implied. A client that
+    read a 201 as "the money is in" would show a balance the wallet does not
+    have, and this is the cheapest possible way to prevent that - the same
+    argument ``TransactionOut`` makes for carrying the status of a payout.
+
+    There is no ``expires_at``, and its absence is honest rather than an
+    omission: nothing in this system knows when the provider's checkout lapses.
+    The URL is single-use and the provider owns its lifetime; inventing a window
+    here would be this API asserting something it cannot see.
+    """
+
+    authorization_url: str
+    provider_reference: str
+    amount: MoneyOut
+    status: str = Field(examples=["pending"])
+
+
+class WebhookAck(BaseModel):
+    """What this API did about a webhook, which a provider only ever reads as a code.
+
+    **The status code is the entire contract and this body is for humans**, which
+    is worth stating so nobody later mistakes it for something Paystack consumes.
+    A provider reads 200 and stops retrying; everything below that is 4xx for
+    "never send this again" and 5xx for "send it again". This object is what
+    appears in a log when somebody asks why a deposit did not credit, so it
+    carries the two facts that answer that question - what this system concluded,
+    and about which reference - and no more.
+
+    ``outcome`` is the ``SettlementOutcome`` member's value, and it is
+    deliberately the *same* vocabulary the use case uses rather than a
+    webhook-specific one. A second set of names for the same facts would be a
+    second thing to keep in step, and the one place they disagreed would be the
+    place somebody was reading to find out what happened to their money.
+
+    ``reference`` is ``None`` for the one outcome that has no reference to name -
+    an event this code does not recognise, which is acknowledged and dropped.
+    """
+
+    outcome: str = Field(examples=["deposit_credited"])
+    reference: str | None = None
+    detail: str = ""
+
+
 # --- requests ---------------------------------------------------------------
 
 
@@ -541,3 +599,39 @@ class ExtendFundIn(BaseModel):
     """
 
     new_date: date = Field(examples=["2027-03-02"])
+
+
+# --- money arriving ---------------------------------------------------------
+#
+# One request, and it is the only place in this API where a client asks for money
+# to be *added* rather than spent. It gets its own heading because it is the only
+# request here whose outcome is not decided by this system: everything above ends
+# when the domain agrees to it, and this one ends when a stranger pays a page.
+
+
+class DepositIn(BaseModel):
+    """An amount to collect, and the key that makes asking twice safe.
+
+    ``amount`` is a string read in the wallet's own currency, exactly as
+    ``MovementIn`` reads one and for the reason ``InstructionIn.amount`` gives:
+    the currency is a property of the wallet, not of the number typed.
+
+    **``ref`` is an idempotency key with a longer reach than the others here.**
+    For a withdrawal it stops a retry recording two requests, and for a purchase
+    the ledger row's ``UNIQUE`` would stop it anyway. This one does more: it is
+    handed to the provider as its own idempotency key, so a retry that gets past
+    this process is refused at the far end too. That is why a repeated key is a
+    **409 rather than a 200 carrying the first answer** - see
+    ``DepositAlreadyInitiatedError`` for why nothing can hand the original back.
+
+    The key is namespaced to the wallet before it becomes a ledger reference, on
+    the same argument ``MovementIn`` gives: two callers choosing the same word do
+    not collide, because the server prefixes a wallet id it has already resolved.
+    """
+
+    amount: str = Field(examples=["5000.00"])
+    ref: str | None = Field(
+        default=None,
+        examples=["deposit-2026-09-12"],
+        description="Idempotency key. Auto-generated when omitted.",
+    )

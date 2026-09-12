@@ -8,6 +8,9 @@ from app.application.notifications.deliver_notifications import DeliverNotificat
 from app.application.notifications.deliver_pending_messages import (
     DeliverPendingMessages,
 )
+from app.application.payments.initiate_deposit import InitiateDeposit
+from app.application.payments.reconcile_payments import ReconcilePayments
+from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
 from app.application.planning.execute_plan_run import ExecutePlanRun
 from app.application.planning.notify_upcoming_runs import NotifyUpcomingRuns
@@ -16,9 +19,12 @@ from app.application.unit_of_work import UnitOfWorkFactory
 from app.application.wallet_service import WalletService
 from app.domain.identity.password_hasher import PasswordHasher
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
-from app.infrastructure.settings import EmailSettings
+from app.infrastructure.settings import EmailSettings, PaystackSettings
 from app.infrastructure.notifications.smtp_notification_channel import (
     SmtpNotificationChannel,
+)
+from app.infrastructure.payments.paystack_payment_provider import (
+    PaystackPaymentProvider,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
@@ -49,6 +55,154 @@ def _channel_for(settings: EmailSettings | None, channel=None):
         username=settings.username,
         password=settings.password,
         starttls=settings.starttls,
+    )
+
+
+def provider_for(settings: PaystackSettings | None, provider=None):
+    """The payment provider to call: the injected one, Paystack, or none at all.
+
+    The exact counterpart of ``_channel_for`` above, one direction of money over.
+    That one picks the thing words leave through; this one picks the thing a
+    collection is opened with. Both return ``None`` when the installation is not
+    configured, and both take an injectable override that wins when given - which
+    is what keeps the suite off the network in both cases.
+
+    ``None`` is a value here, not a failure, in the same sense: it is how "this
+    installation cannot take payments" reaches a caller as a state it can report.
+    What that caller *does* with it differs from mail's, and the difference is
+    the point: a missing mail account means say nothing, and a missing payment
+    key means accept nothing. See ``presentation.api.dependencies`` for where
+    that becomes a status code.
+
+    **Public, where ``_channel_for`` is private, and the difference is a caller.**
+    That one is reached only from builders in this file, so its underscore is
+    accurate. This one has a second caller outside it: ``create_app`` puts the
+    provider on ``app.state`` so the API can verify a signature with it, and a
+    private name imported across modules is a promise about encapsulation that
+    the import itself breaks. Naming it honestly is cheaper than a second
+    construction site, and a second construction site is what this function
+    exists to prevent - the two would drift over which settings they read, and
+    the drift would present as a webhook verified with a key nothing else uses.
+    """
+    if provider is not None:
+        return provider
+    if settings is None:
+        return None
+    return PaystackPaymentProvider(secret_key=settings.secret_key)
+
+
+def build_initiate_deposit(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: PaystackSettings | None = None,
+    *,
+    actor: UUID,
+    provider=None,
+) -> InitiateDeposit:
+    """Wire up the deposit-initiation use case over the provider.
+
+    ``actor`` is required and keyword-only for the reason every other actor
+    parameter in this file is: the use case reads a wallet, so it has to be told
+    whose, and a default would be silence rather than an answer.
+
+    Note what is *not* here: the use case takes a provider that must exist, and
+    ``provider_for`` can return ``None``. The two are kept apart deliberately.
+    Deciding that an unconfigured installation cannot open a collection is a
+    decision about a *request* - it becomes a 503 with a body - and this function
+    is not the layer that knows about either. Its caller checks, and the check
+    lives in ``dependencies`` beside the check for a missing token.
+
+    No shared factory is needed. The use case opens two units of its own and
+    shares no fact between them beyond the reference, which is a string.
+    """
+    return InitiateDeposit(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        provider=provider_for(settings, provider),
+        actor=actor,
+    )
+
+
+def build_settler(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
+) -> SettlePayment:
+    """Wire up settlement, which is the one money use case with no actor.
+
+    **No actor, and no provider either, and both absences are the same fact seen
+    twice.** A payment provider reporting what happened is not a person: it
+    arrives holding a signature rather than a token, so there is nobody this
+    builder could be told to act as - and rather than invent one, the use case
+    derives the owner from the ledger row it is settling, through
+    ``WalletRepository.owner_of``. That is the same shape as ``build_scheduler``,
+    which answers "who is acting?" per plan instead of at this level; the
+    difference is that a plan carries its owner and a transaction carries only a
+    wallet, so this one asks the store.
+
+    No provider, because settling needs no call outward - the provider tells
+    *us*, and what it says has already been parsed into a ``ProviderOutcome`` by
+    the time this is reached. That is why this builder takes no
+    ``PaystackSettings``: the webhook that drives it verifies a signature with
+    the secret key, and verification is the route's business rather than this
+    use case's.
+
+    ``settings`` is the mail settings and only that, for the receipt a settled
+    movement earns - see ``SettlePayment._announce``. It is ``EmailSettings`` and
+    not ``PaystackSettings``, which is worth noticing: the money comes in through
+    Paystack and the receipt goes out through SMTP, and one builder naming both
+    would blur two providers that share nothing but a wallet. (``build_reconciler``
+    below is that builder, and it earns the exception by being the one job that
+    genuinely does both - see its docstring.)
+    """
+    return SettlePayment(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        recipient=settings.recipient if settings is not None else None,
+    )
+
+
+def build_reconciler(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
+    paystack: PaystackSettings | None = None,
+    *,
+    provider=None,
+) -> ReconcilePayments:
+    """Wire up reconciliation, which needs both providers and neither actor.
+
+    **The first builder here that names both settings objects**, and the
+    exception is worth its paragraph because ``build_settler`` above states the
+    rule it breaks. That builder's rule - mail and payments in one signature
+    "would blur two providers that share nothing but a wallet" - holds for every
+    other use case in this file, and it holds because none of them does both.
+    This one does: it asks Paystack a question and it queues the SMTP receipt
+    that the answer earns. A builder with a different signature would not be
+    narrower, it would be a lie - the receipts this job produces would have to be
+    composed with a recipient some other function decided.
+
+    **The settler is built from the *same* factory, and that is a correctness
+    requirement in ``build_scheduler``'s sense.** Each row settles in its own
+    transaction, so the two use cases do not share one - but they must share a
+    *database*, and the failure mode of getting that wrong is silent: the
+    reconciler would ask the provider about rows in one file and credit wallets in
+    another, reporting recovered payments that never happened. One factory for
+    both is how that becomes impossible rather than merely unlikely.
+
+    **Both use cases are built here rather than passed in, and that is the whole
+    point of the function.** ``ReconcilePayments`` takes a settler, so the only
+    thing standing between this system and two settlement paths is where the
+    settler came from - and it comes from here, from the same builder the webhook
+    route uses. A recovered payment and a delivered one are indistinguishable
+    because there is one settler, and this is the line that makes it so.
+
+    ``paystack`` may be ``None``, exactly as it may be for ``build_initiate_deposit``,
+    and for the same reason: deciding that an unconfigured installation cannot
+    reconcile is a decision about a *run*, and the caller makes it. The CLI
+    reports it and exits 0 - a job with nothing to ask with says so, the same way
+    a tick with no mail account does.
+    """
+    factory = unit_of_work_factory or SqliteUnitOfWorkFactory()
+    return ReconcilePayments(
+        unit_of_work_factory=factory,
+        settler=build_settler(unit_of_work_factory=factory, settings=settings),
+        provider=provider_for(paystack, provider),
     )
 
 
@@ -261,8 +415,14 @@ def build_notification_deliverer(
 # is marked rather than interleaved. Nothing above can be called until one of
 # these has produced an actor: ``build_wallet_service`` and ``build_plan_service``
 # both demand a ``UUID`` that only ``LogIn`` and ``build_resolve_actor`` can
-# supply, and the two builders with no actor (``build_scheduler``,
-# ``build_notifier``) are exactly the ones that never touch a wallet.
+# supply.
+#
+# The builders above with no actor are exactly the ones that can answer "whose
+# wallet?" without being told, and each answers it differently: ``build_scheduler``
+# per plan, from the owner the plan carries; ``build_settler`` from the ledger row
+# it is settling, through ``owner_of``; and ``build_notifier`` and
+# ``build_reconciler`` by not touching a wallet at all. None of them invents an
+# actor, which is the property the whole group exists to make visible.
 #
 # All four take the same optional factory the rest do, and none of them takes
 # ``settings``. Mail settings are what the *so-far-built-a-service* side adds to a

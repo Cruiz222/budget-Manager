@@ -6,7 +6,7 @@
 #
 # For a development checkout, install requirements-dev.txt instead - it includes
 # this file plus the test suite's own dependencies, so a production install does
-# not carry pytest and httpx.
+# not carry pytest.
 fastapi==0.115.6
 uvicorn==0.34.0
 
@@ -41,3 +41,21 @@ uvicorn==0.34.0
 # rather than declaring one. This file says what we depend on; ``pip freeze`` says
 # what that resolved to.
 argon2-cffi==25.1.0
+
+# Talking to the payment provider. A runtime dependency since Phase 3, and it was
+# a development one before that - it is the same pinned version, moved rather
+# than added.
+#
+# It used to be here because starlette's ``TestClient`` is built on it, and the
+# comment above it said "Nothing shipped imports it". That sentence is now false:
+# ``PaystackPaymentProvider`` posts a JSON body to open a collection, and that is
+# the only place in the shipped code that touches a network at all. Worth naming
+# the change rather than leaving a stale comment, because the *reason* moved with
+# the line - before, httpx was a test tool by accident of what the framework
+# used; now it is what a real request a real person made depends on.
+#
+# Note what did **not** need it: the webhook's signature check is HMAC-SHA512
+# over the body, which is stdlib ``hmac`` and hashlib. The half of this
+# integration that decides whether money is credited has no third-party
+# dependency in it at all.
+httpx==0.28.1

@@ -135,6 +135,26 @@ class SqliteWalletRepository(WalletRepository):
             raise WalletNotFoundError
         return self._row_to_wallet(row)
 
+    def owner_of(self, wallet_id) -> object:
+        """The owner id behind a wallet id, or ``WalletNotFoundError``.
+
+        ``SELECT user_id`` rather than a row: the point of this method is the
+        column it does not read, and a query that fetched the balances and threw
+        them away would be a query that had them in memory. What is not selected
+        cannot leak into a log line, an error message or a future caller's hands.
+
+        No ``AND user_id = ?`` here, unlike ``get_owned`` - the caller does not
+        know the owner, which is the whole reason it is asking. See the port for
+        why that is not the hole it resembles.
+        """
+        row = self._connection.execute(
+            "SELECT user_id FROM wallets WHERE wallet_id = ?",
+            (uuid_to_text(wallet_id),),
+        ).fetchone()
+        if row is None:
+            raise WalletNotFoundError
+        return text_to_uuid(row["user_id"])
+
     def _row_to_wallet(self, row) -> Wallet:
         currency = text_to_enum(Currency, row["currency"])
         return Wallet(

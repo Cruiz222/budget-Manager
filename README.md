@@ -418,6 +418,71 @@ To see a message actually leave without a mail account, run a local server
 Note that Python's stdlib `smtpd` debug server was removed in 3.12, so the
 familiar `python -m smtpd -c DebuggingServer` no longer exists.
 
+### Reconciling the payments whose webhook never arrived
+
+The webhook is the fast path and it assumes the message arrives. When it does not -
+a proxy swallowed it, the process was down, the endpoint was misconfigured for an
+afternoon - the payer's money has left their account, the ledger row still says
+`PENDING`, and nothing in this system is capable of noticing. `reconcile` is the
+thing that notices: it asks Paystack about every deposit still in flight and
+settles what Paystack says arrived, through the same `SettlePayment` the webhook
+uses, so a recovered payment and a delivered one leave identical state.
+
+It is a second cron line, with its own cadence:
+
+```
+17 * * * * cd /path/to/budget-Manager && PAYSTACK_SECRET_KEY=sk_test_... .venv/bin/python -m app.presentation.cli --db budget.db reconcile >> reconcile.log 2>&1
+```
+
+Five things about that line are worth reading, and two of them differ from the tick:
+
+- **Hourly, not every five minutes.** The tick's five minutes exists because a
+  thirty-minute warning window can be stepped straight over (decision 22), and
+  there is no equivalent window here. A webhook normally settles a deposit within
+  seconds, so anything this job finds is already an anomaly - once an hour is
+  frequent enough that a lost webhook is noticed the same working day, and rare
+  enough that a healthy installation spends almost no provider calls on it. The
+  minute is offset from the tick's, so a busy database does not have both jobs
+  waking at once.
+- **No session, and it needs none - for a different reason than the tick's.** Like
+  `plan tick` it is dispatched above the line that resolves an actor (decision 91).
+  The tick is actorless because it serves *everybody*, minting an executor per
+  plan; this one is actorless because it serves nobody in particular and reads no
+  wallet at all. It hands a reference to `SettlePayment`, which derives the owner
+  from the ledger row it is settling.
+- **A quiet run prints one line and exits 0**, and the line is the point.
+  `nothing in flight` is what an operator *wants* to see, because it means the
+  webhook endpoint is keeping up - the opposite of the drains, which stay silent
+  when there is nothing to do. "Nothing was in flight" and "this job is not
+  running" otherwise look identical in a log.
+- **A provider that cannot be reached is recorded, not raised.** That row is
+  reported as `failed`, the run continues to the next one, and the next run asks
+  again. One unreachable reference says nothing about the next.
+- **Nothing is ever marked `FAILED` by this job.** A checkout Paystack reports as
+  `abandoned` is reported and left `PENDING`, for the hazard decision 142 gives:
+  a row failed a minute before its payment arrives would take the payer's money
+  and never credit it.
+
+The one variable it reads - the email variables above are unchanged and unrelated:
+
+| variable | default | note |
+|---|---|---|
+| `PAYSTACK_SECRET_KEY` | — | required; without it there is nothing to ask with |
+
+**With no key set the run still exits 0.** It prints
+`note: nothing to reconcile as of ... - PAYSTACK_SECRET_KEY is not set` and stops,
+which is the tick's missing-mailbox rule one provider over: a deployment that does
+not take card payments should not have a cron line mailing its operator every
+hour. The variable is named in the note so that somebody who *expected*
+reconciliation to be running finds out that it is not.
+
+To watch a recovery happen without waiting for a real webhook to be lost, start a
+deposit over HTTP (`POST /wallets/{id}/deposits`, with the same test key), then
+**do not** post the webhook, then run `reconcile`. The balance moves, the row is
+`SUCCESSFUL`, and the receipt is queued - exactly what a delivered webhook would
+have left. Run it a second time and it says `nothing in flight`, because the row
+is no longer in flight.
+
 ## Decisions
 
 A running log of the architectural and business decisions this project runs on,
@@ -2475,6 +2540,20 @@ accumulate too. A `CONFIRMED` request stays `CONFIRMED` for ever - expiry is abo
 whether a request may still be *answered*, and one that was answered is not
 un-answered by the clock.
 
+**The window is re-checked on the way in from the store, and that turns up in the
+tests.** `Confirmation.__post_init__` refuses a row whose `expires_at` is not
+strictly after its `created_at` - a request born dead - and the repository builds
+one of these on every load, so a hand-edited row that no code could have produced
+fails loudly at read time rather than quietly authorising nothing. That is the same
+argument the aggregate's field-pairing makes, applied to a different invariant.
+
+The cost is this: a test cannot age a request by writing a past `expires_at` on its
+own. The window runs fifteen minutes from the moment the request was made, so every
+past expiry is *also* before its creation, the row is refused at load, and what
+comes back is a 400 about the window where the test asked for a 409 about expiry.
+`test_money.expire` moves both moments for exactly this reason - found by running
+the suite, and worth writing down because the failure names the wrong thing.
+
 **120. The request does not check the balance, and the absence is the design.**
 A check at request time cannot be relied on - the balance at *confirm* time is the
 one that decides - so it would be a second, weaker copy of the wallet's own rule,
@@ -2501,6 +2580,17 @@ routes grade through the existing `errors.py`: `ConfirmationNotFoundError` → 4
 `ConfirmationExpiredError` and `ConfirmationAlreadyUsedError` → 409. The two 409s
 are the plainest members of that list - the resource is exactly what the path names,
 it is there, and it is its state that refuses.
+
+**A confirmation 404 does not name the id it was looking for.** `ConfirmationNotFoundError`
+is raised bare - like `WalletNotFoundError`, and for the same reason - so
+`errors._detail` renders the class name and the two answers are byte-identical:
+"this request is not yours" and "this request never was". A message interpolating
+the id would have made them distinguishable by body, which is a leak of exactly one
+bit - but the whole authorisation for answering a request is *knowing its id*, so an
+oracle here would be worth more than an oracle anywhere else in the API. The test
+compares both responses whole, against a real request of Alice's and a UUID that
+names nothing; whole-body equality is the only shape of test that can see this,
+since both answers are a 404 either way.
 
 **122. `--yes` is a statement about the room, not about the rules.** The CLI prints
 a preview and asks; `--yes` skips the question. It does not skip the confirmation -
@@ -2538,6 +2628,464 @@ and rate limiting (2c), and Phase 3's provider, which is the only thing that can
 actually settle a payout. Written here rather than left implicit because a
 confirmation that read as a security control would be trusted for something it does
 not do - and the failure would be discovered by somebody who had relied on it.
+
+### The webhook, and money that arrives from outside
+
+Phase 3's first slice, and the one that cashes decision 97's own sentence: *"the
+only party who can honestly say it arrived is the party that sent it - Paystack, in
+Phase 3, proving itself with an HMAC signature."* Two gaps close together, because
+they were never two gaps. Deposits were held (97) and a pending transaction had no
+exit (106), and the single thing that closes both is an **inbound event from the
+party that actually moved the money**.
+
+```
+POST /wallets/{id}/deposits    -> 201  a PENDING row + a provider_reference
+                                       **the wallet is not credited**
+POST /webhooks/paystack        -> 200  raw body + x-paystack-signature
+                                       the only route that can settle anything
+```
+
+Four events are handled, and the middle two are the ones worth reading twice:
+
+| event | row | wallet |
+|---|---|---|
+| `charge.success` | deposit PENDING → SUCCESSFUL | **credit** the arrived amount |
+| `transfer.success` | payout PENDING → SUCCESSFUL | nothing (already debited) |
+| `transfer.failed` | payout PENDING → FAILED | **credit the hold back** |
+| `transfer.reversed` | payout SUCCESSFUL → REVERSED | **credit the money back** |
+
+**124. A webhook is not an actor, so settlement is not a method on
+`WalletService`.** `dependencies.current_actor` is the only function in the
+codebase that can produce a `User`, and it requires a token. A provider event
+carries none - it carries a *signature*, which is a different kind of authority: not
+"who are you" but "who sent this". The answer to a second kind of authority is a
+second, narrowly named thing, `SettlePayment`, whose only input is a
+`ProviderOutcome`. It is reachable from exactly one route.
+
+This is the zero-bypass rule holding rather than being waived, and the distinction
+is worth stating plainly because "the webhook needs a wallet it does not own" is
+exactly the pressure that produces a privileged actor. There is no system user here,
+no `skip_ownership=True` flag, and no "internal read" path. The use case derives the
+owner from the ledger row it is settling - through the narrow read below - and then
+loads the wallet through `get_owned`, the same owner-scoped door every other money
+path uses. A webhook gets no privilege; it gets a different question answered.
+
+**125. `WalletRepository.owner_of(wallet_id)` is the narrowest read that answers the
+question, and a second caller is a hole if it is user-reachable.** It returns a
+`UUID` - one column of one row - and never a `Wallet`: no balance, no status, no
+pots. That is what distinguishes it from the `get_by_id` decision 54 deleted, which
+returned the money. The honest comparison is `list_by_status`, which decision 57
+already accepts as a convention-enforced privileged read, and the same warning
+applies verbatim: today there is one caller and it is not user-reachable.
+
+It is called from `SettlePayment` and nowhere else, and the reason it cannot simply
+be folded into the transaction lookup is that a transaction carries a `wallet_id`
+and not a `user_id` - so the store has to be asked, once, and the answer is an id.
+
+**126. The body stays bytes, so the endpoint stays `def` and gains one async
+dependency.** `app.py`'s rule is that nothing in this presentation is `async` and
+nothing is decorated to look it, because the blocking SQLite work belongs in the
+threadpool. FastAPI cannot `await` inside a `def` endpoint, and a signature must be
+computed over the bytes that *arrived* - verifying one against a re-serialized
+Pydantic model verifies a different byte string, and a difference of one space
+presents as a wrong secret key.
+
+So the raw body comes from an **async dependency** (`raw_body`) and the endpoint
+stays a plain `def`. The rule survives intact: one line in one file, not a
+precedent, and the alternative - an `async def` endpoint - would have put the
+settlement query on the event loop, on the endpoint a provider will hammer. Both the
+rule and the exception are written down, because the next person to read `app.py`
+will otherwise believe the rule.
+
+**127. An unconfigured install refuses every webhook with a 503, and never a 401.**
+With no `PAYSTACK_SECRET_KEY` there is nothing to verify against, and "no key" must
+never mean "accept" - but *unauthenticated* is the wrong name for it, because it
+blames the provider for the installation's state. Paystack's signature may be
+perfectly good. A 503 says the server cannot serve this request right now, which is
+what we want a provider to hear: the operator who forgot to set the key will set it,
+and the events must then land. A 401 tells Paystack to stop, and the money taken
+during that window would be settled by nothing.
+
+This is `EmailSettings`' missing-mail state reaching a place where the safe default
+is the **opposite** one. Mail's `None` means "say nothing"; this one's means "accept
+nothing" - the same value doing opposite jobs, which is why the check lives in one
+dependency (`payment_provider`) rather than per route.
+
+**128. Idempotency is the row's own status, so no `provider_events` table is
+needed.** A second `charge.success` finds a row that is no longer PENDING and stops.
+That is sufficient only because the credit and the status change are written in
+**one** unit of work: there is no instant at which the money has moved and the row
+still says PENDING, so a retry cannot arrive in a window where it would apply twice.
+This is the same argument the confirmation makes for spending a request and moving
+money together.
+
+It is also, deliberately, *not* what reconciliation will be. A replay of received
+events depends on having received them, and not receiving them is the failure mode
+worth catching - so the reconciler polls the provider for PENDING rows instead, which
+is the more robust direction. That is why the table is not merely deferred: it would
+be the wrong shape.
+
+**129. An amount that disagrees settles nothing, and the row stays PENDING.** The
+PENDING row records what was *asked for*; the event carries what *arrived*. If they
+differ it is a bug or tampering, never a partial payment - Paystack's checkout does
+not do those. So the event is acknowledged with a 200, nothing moves, and the
+reconciler is what picks it up. Crediting the arrived amount instead would make the
+ledger row's own amount a lie; refusing loudly would make the provider retry
+something that can never succeed.
+
+**130. `release_hold` is not `apply_deposit`, and the whole difference is a missing
+status check.** It credits the available balance, applies the same currency and
+positivity checks - and **deliberately checks no status**, because the money was
+always the owner's and refusing to return it is exactly how a hold becomes a hole.
+
+The concrete shape, because it is easy to lose: a pending payout's money is in
+neither `available_balance` nor a pot, so `close()` sees an empty wallet and
+*succeeds*. A wallet can therefore be CLOSED with a payout still in flight, and when
+the provider reports that payout failed, `apply_deposit`'s CLOSED guard would refuse
+the money and strand it forever. `apply_deposit` keeps that guard, which is right for
+money arriving from outside into a wallet nobody can use. Two methods, two rules, and
+the difference is the direction the money came from.
+
+**131. The provider's idempotency key is our scoped internal reference.** The
+initiation call passes `_scoped_reference(wallet, ref)` - decision 107's
+`"<wallet_id>:<ref>"` - as Paystack's own `reference`, so Paystack refuses a
+duplicate at *its* end as well as ours. That closes the window the local dedupe
+cannot: two concurrent requests under one client key would otherwise both reach the
+provider and each open a collection.
+
+A repeated key is therefore a **409, not a friendly replay of the first
+`authorization_url`**. Returning the original looks kinder and is worse: nothing
+stores it, and a checkout URL is single-use, so the client would be handed a page the
+provider refuses to take money on - and would believe a deposit was live. The
+`reference` column and the `provider_reference` column stay separate even though they
+hold the same string today, because a provider that minted its own would need a place
+to say so, and discovering that later is a migration.
+
+**132. The provider is called between two units of work, not inside one.**
+`InitiateDeposit` opens a read-only unit that validates and closes it, calls the
+provider, then opens a second unit that writes the PENDING row. Holding one SQLite
+write transaction open across a third party's response time would block every other
+writer on this database for as long as that party felt like taking - a self-inflicted
+outage proportional to an outage elsewhere.
+
+The cost of splitting is a window in which the call can fail after the read and
+before the write, and the honest outcome of that is **no row**: a deposit nothing was
+asked for is not a deposit, and a row written optimistically would be a PENDING
+deposit no webhook will ever settle. The window the split *does* open - two requests
+under one key both reaching the provider - is closed by 131 at the far end, not by
+luck.
+
+**133. The deposit route is a new use case rather than a `WalletOperation`.**
+`WalletOperation.execute` writes the ledger row at step 3 and calls `_apply` at step
+4, which for a withdrawal debits the wallet. A provider-backed deposit must record
+*without* crediting, so this is the template's **mirror** rather than a variant of
+it, and forcing it through would mean a second flag beside `settles_immediately`
+whose two settings mean opposite things - "debited, row pending" against "not
+debited, row pending". One flag cannot say both without becoming a word that means
+nothing.
+
+A CLOSED wallet is refused in `_prepare`, *before* the provider is called. That
+ordering is not performance: a collection opened against a wallet nothing can credit
+would take a real person's money and have nowhere to put it, so the payer is never
+sent anywhere. A **FROZEN** wallet is allowed, deliberately - freezing stops value
+leaving, and this is value arriving.
+
+**134. Every answer a webhook can give is a value, and the vocabulary is ten
+words.** `SettlementOutcome` holds the four movements and six refusals in one enum.
+A webhook answering 5xx makes the provider retry forever, so "unknown reference",
+"already settled", "amount disagrees" and "wrong kind" are answers rather than
+errors - and they are four separate members rather than one `IGNORED` because they
+call for different responses from whoever reads the log.
+
+Two of the ten were not in the plan. **`WALLET_CLOSED`** is a hole the plan did not
+cover: money that arrived for a wallet closed between the payer opening the link and
+the payer paying it. `apply_deposit` would raise, and raising is a 500, and a 500 is
+a retry of something that will never apply - so it is a refusal with a name of its
+own, and it is the one of the six that needs a person. **`EVENT_IGNORED`** is the
+member no use case produces: an event understood well enough to know this deployment
+does not act on it. Keeping it out of the enum would have given the response body two
+vocabularies with a boundary nobody could see.
+
+A third thing was found while writing the tests rather than by reasoning, and it was
+a genuine hole: **`Currency` is a plain enum**, so an unknown currency name raises a
+built-in `ValueError` rather than a `MoneyError` - and it escaped `_outcome_from`'s
+handler as a 500, on the one endpoint where a 5xx makes a provider retry forever.
+The catch was widened to `(MoneyError, ValueError)` and `ProviderOutcome`'s own
+construction moved inside it, so a zero amount takes the same 400.
+
+**135. A settlement that did not move money sends no receipt.** `_announce` is
+decision 101 being kept - `WalletService._announce` skips a PENDING row and its
+docstring promised "the receipt arrives in the phase that settles these movements" -
+but the guard is repeated here, because `compose.wallet_movement` would happily write
+*"5000.00 NGN was paid to Chinedu Okafor"* for a FAILED row. A failed transfer did
+not pay anybody.
+
+A **reversal** is silent for the sharper version of that reason: the money *was* paid
+and then came back, so what the receipt would say is true and no longer the whole
+truth - which is worse than saying nothing.
+
+This makes the receipt guards **three**, not two, and that is the count at which the
+existing open item stops being tolerable. See `### Still open`.
+
+**136. A deposit is not confirmed.** Decision 113 drew the line at "money leaving
+only", and this is that line holding rather than an exception to it: a prompt before
+*receiving* money would be a prompt whose only possible answer is yes. The
+confirmation feature's whole justification - irreversible, outward-facing, worth a
+pause - does not apply to a movement whose worst case is that the owner is richer
+than they were.
+
+Note what this does *not* mean. A deposit is still not a `WalletOperation` (133), and
+it is still a two-step thing on the wire. What it is not is a *third* step.
+
+**137. A wrong secret key is the caller's sentence to write, not `_post`'s.** Every
+other refusal from the provider is reported where the status code is the whole of
+what is knowable - "the payment provider refused the call with 500" is a complete
+sentence. A `401` is not: it means *this installation's key is wrong*, and the
+useful answer is endpoint-shaped, because what a rejected key means depends on what
+the call was for. Only the caller knows that.
+
+This was a bug rather than a preference, and both halves had been written: the
+`missing data` branch in `initialize_deposit` exists precisely to name the secret
+key, its comment says a wrong key is "the common case by a wide margin" - and it was
+**unreachable**, because `_post` raised on any non-2xx before the branch could run.
+The statuses in `AUTHENTICATION_FAILURES` (`401`, `403`) are now passed through to
+be interpreted instead. A wrong key that answers with something other than JSON
+still leaves as a `PaymentProviderError`, which is a less specific answer rather
+than a crash.
+
+The lesson generalises past this adapter: a shared helper that converts failures
+into one shape can *swallow the case its caller was written to handle*, and the
+symptom is a less useful error rather than a wrong one - so nothing fails, and
+nothing points at it either.
+
+**138. The reconciler settles through `SettlePayment` and adds no rule of its own.**
+No new transition, no second settlement path, no domain change at all. Everything
+hard about settling a payment was built in 3a; 3b adds a second *caller*, and the
+whole of `ReconcilePayments` is deciding which rows to ask about and what to do
+with an answer.
+
+The proof is an identity rather than a claim, and it is the strongest assertion
+this slice makes: a deposit whose webhook was lost, recovered by this job, ends
+with the same balance, the same row status and the same queued receipt as one whose
+webhook arrived. That holds because the settler is *injected* - built once at the
+composition root, from the same factory the reconciler is (decision 149) - so a
+recovered payment reaching a different settlement path is not a bug that could be
+introduced quietly; it is a wiring change somebody would have to make on purpose.
+
+**139. `outcome_for(reference)` is the port's third method, and the first one that
+asks.** The previous two *tell* the provider to do something - open a collection,
+and (locally) prove a signature's author. This one asks it a question about
+something that already happened, and that is a new kind of method on this port
+rather than a third instance of the old kind.
+
+The port's docstring already argued that "the inbound half of settlement is
+deliberately not here at all", and this method does not contradict it: that sentence
+is about the **webhook** path, where deciding what a `charge.success` means
+genuinely needs no call outward. The reconciler asks a different question, and the
+docstring's own definition of a port ("A port is what we say; that is what we
+hear") covers it - we say *what happened to this?*. The paragraph was amended to
+read "not on the webhook path" rather than "not here".
+
+**140. It is not called `verify`.** Paystack's name for the endpoint is
+`GET /transaction/verify/:reference`, and `verify_signature` already owns that word
+on this port for proving a byte string's author. Two methods on one port whose names
+both begin with "verify" and mean unrelated things is a hazard with no upside, so
+the vocabulary rule `ProviderEvent` already established applies: our names, not the
+wire's, with the adapter owning the translation. `outcome_for` says what it does -
+it asks for an outcome.
+
+**141. Three answers, so the answer is a value and not `ProviderOutcome | None`.**
+`ProviderAnswer(status, outcome)`, with `SETTLED`, `NOT_SETTLED` and
+`NO_SUCH_REFERENCE`, and `outcome` present *exactly* when the status is `SETTLED` -
+enforced in `__post_init__` in both directions, because both are ways to write a
+record that cannot mean anything.
+
+The third state is the one a nullable outcome cannot express and the one that
+matters most: **"the provider has never heard of this reference"** is unreachable in
+a healthy installation - `InitiateDeposit` writes the row only after the provider
+accepted the call (decision 132) - which is exactly what makes it the loudest signal
+a run can produce. This deployment's rows and this key's transactions do not match,
+and somebody needs to know.
+
+`NO_SUCH_REFERENCE` is deliberately *not* named `UNKNOWN_REFERENCE`, which is
+already a `SettlementOutcome` and means the opposite end of the wire: "no ledger row
+is filed under this reference" is a webhook about a payment this deployment never
+made, while "the provider has no transaction under it" is a lookup about a payment
+it did. One is a phantom event and the other is a misconfigured key, and a shared
+name would make the log lie about which happened.
+
+The reconciler's own vocabulary is then **four** words rather than three, because
+"asking failed" is not an answer the provider gave: `SETTLED`, `NOT_SETTLED`,
+`NO_SUCH_REFERENCE`, `FAILED`. Keeping `FAILED` in the same enum rather than raising
+is `SettlementOutcome`'s decision about its refusals, for the same reason - an
+operator reading one line per row should not have to look somewhere else for the
+rows that went wrong, and a cron job has nowhere to raise to.
+
+**142. Nothing is ever resolved by guessing: the reconciler reports, and never fails
+a row.** Both non-settled answers leave the row PENDING and move nothing, including
+a checkout Paystack reports as *abandoned*. An abandoned checkout will very probably
+never be paid, so marking that row FAILED would be honest about the deposit - and
+dangerous about the money, because `SettlePayment` refuses a `CHARGE_SUCCEEDED` on a
+row that is not PENDING (decision 129's ordering, one branch over). A row failed a
+minute before its payment arrived would take the payer's money and never credit it,
+and there would be nothing left in the system capable of noticing, because the row
+is no longer in flight and the reconciler only ever asks about rows that are.
+
+So the price of the policy is a row that can sit PENDING indefinitely, asked about
+on every run until somebody looks - a small, visible, recoverable cost. The
+alternative is FAILED, which is unrecoverable in exactly one direction and silent in
+that direction. That is why sweeping abandoned charges is an open item with an entry
+of its own rather than a branch here: it needs a fifth `ProviderEvent` and an answer
+to "what does it mean to fail a charge that might still arrive", and neither exists
+yet.
+
+**143. The grace window is a courtesy, not the guard.** Fifteen minutes,
+`DEFAULT_GRACE`, and nothing about correctness depends on it: the guard is that only
+a settled answer makes anything happen, so a payer still on the checkout page is
+protected by the answer they get (`NOT_SETTLED`) rather than by the delay. No delay
+could make asking unsafe.
+
+What the window buys is not spending provider calls on payments that are seconds old
+and almost certainly fine - a webhook is normally what settles a deposit, and this
+job exists for the times it is not. Fifteen minutes is *chosen* rather than derived:
+long enough that a live checkout is never asked about, short enough that a lost
+webhook is noticed inside a coffee break. A deployment that disagrees changes one
+number, `--as-of` makes the window exercisable without waiting for it, and the
+command says so in its help - the same reasoning that put `--as-of` on the tick.
+
+The boundary is inclusive - a row exactly fifteen minutes old is asked about - which
+mirrors `Confirmation.is_expired` treating its own edge the same way. The instant a
+window closes is the instant it stops being open, and the two must agree with each
+other rather than each being individually defensible.
+
+**144. `list_awaiting_provider()` is the fourth unscoped read in this codebase, and
+it is discovery rather than access.** It takes no argument, so it cannot be pointed
+at another status or another wallet, and it returns whole rows oldest-first. The
+filter is `status = PENDING AND provider_reference IS NOT NULL`, and **both halves
+are load-bearing**: the status alone would hand back every CLI withdrawal and every
+plan-run payout, which no provider has ever heard of, and the reference alone would
+hand back settled deposits. Only `InitiateDeposit` writes a `provider_reference`, so
+the second half is what makes the candidate set exactly "payments a provider was
+actually told about".
+
+The defence is the one decision 57 and decision 125 already give, restated because
+it is the whole argument: it is *discovery*, not access. The reconciler reads
+nothing off these rows but the reference; a row names its wallet and the reconciler
+does not follow it; and the only wallet read that follows is `SettlePayment`'s,
+through `owner_of` and then `get_owned` - the same owner-scoped door every other
+money path uses. Nothing user-facing can reach it, which is `PlanService`'s rule
+applied to the wallet side. The `list_by_status` entry under `### Still open` asked
+to be re-read when a fourth unscoped read appeared; this is that re-reading, and the
+answer is that the convention still holds and is still only a convention.
+
+**145. The discovery unit closes before the first call goes out, and the policy lives
+in the use case.** The read happens inside a unit rolled back in a `finally`, which
+is `_due_plans`' arrangement (decision 56) - and it matters more here than there. The
+scheduler follows its read with local work; this method is followed by up to fifty
+network calls, and a unit left open holds a SQLite read transaction for the whole of
+them - the database locked against its own writers for as long as a third party felt
+like taking to answer, multiplied by the size of the batch. Closing the read first is
+what makes that impossible rather than merely unlikely.
+
+The grace filter and the batch limit are then applied in Python, after the read,
+which is `_due_plans`' argument too: neither the age of a payment nor the size of a
+batch is a fact about storage, and materialising either as a column would create a
+second source of truth for a policy the use case already owns. It is also what makes
+both testable without a clock and without a database.
+
+**146. A status that is an answer: `_request`'s 404 stops being a refusal.** This is
+decision 137 recurring one method over in the same file, and it is worth naming as a
+recurrence rather than as a second discovery. 137's rule is right for a call that
+*creates* something - a refusal is the whole of what is knowable - and wrong for a
+call that *asks about* something, where a status is often the answer itself. `404`
+from `/transaction/initialize` is a broken deployment; `404` from
+`/transaction/verify/:reference` is Paystack saying it has never heard of the
+reference.
+
+So the statuses a caller will interpret became a parameter: each call names the ones
+that are *answers* to it, and the transport hands the status back alongside the body
+instead of raising. `initialize_deposit` names `AUTHENTICATION_FAILURES` and keeps
+its present behaviour exactly; `outcome_for` names `LOOKUP_FAILURES`, which is that
+set plus `NO_SUCH_REFERENCE_FAILURES`. A wrong key answering `401` on a lookup still
+leaves as a `PaymentProviderError` naming the secret key, for 137's reason: only the
+caller knows what the call was for.
+
+The generalisable part is the shape of the mistake, and it is now written down
+twice. A shared helper that converts failures into one shape can swallow the case
+its caller was written to handle, and the symptom is a *less useful* error rather
+than a wrong one - so nothing fails, and nothing points at it either.
+
+**147. One run is bounded by a count, and each row settles in its own unit.**
+`RunDuePlans` bounds a tick by running one occurrence per plan; this job's natural
+bound is a count, because its cost is one network call per row rather than one
+execution per row. A provider outage that leaves five thousand rows PENDING must not
+make the next run five thousand calls long - it clears a batch of fifty, reports what
+it left behind, and the next run continues from there. Fifty is chosen so that an
+ordinary run finishes in seconds and a backlog clears inside a few hours at an hourly
+cadence.
+
+The batch takes from the *front* of a read that is oldest-first, which is what stops
+a row being starved: a backlog always longer than the batch still drains from its
+oldest end, so the payment that has been stuck longest is always the one asked about
+next.
+
+The transaction boundary follows the row rather than the batch, which here costs
+nothing because `settle` already opens its own. What it buys is the property
+`RunDuePlans` gets the same way: a run that dies on row nine leaves the first eight
+credited for good.
+
+**148. A third party failing is per-row; our own data being wrong is not.** An ask
+that fails - the provider unreachable, a response that makes no sense - is recorded
+against that row and the run continues, because a provider being briefly unavailable
+about one reference says nothing about the next, and a run that stopped at the first
+hiccup would leave every row behind it unreconciled. That is decision 24's rule
+applied to a job whose whole purpose is noticing things, and it is the same "the next
+tick is the retry" rule the drains follow.
+
+A `settle` that *raises* is deliberately not caught, and the asymmetry is the point.
+The only way it can raise is a ledger row naming a wallet that does not exist - an
+integrity problem rather than a transient one - and reporting that as one row's bad
+luck would be exactly the silence this feature exists to prevent. It also cannot
+happen: the row was discovered through a provider reference, a reference is written
+only by `InitiateDeposit` after a collection was opened, and `transactions.wallet_id`
+is a foreign key. A raise here means the database itself is broken, and failing
+loudly on that is the right answer.
+
+**149. `build_reconciler` is the first builder that names both settings objects.**
+`build_settler`'s docstring says a builder naming both mail and payments "would blur
+two providers that share nothing but a wallet", and this one names both because the
+reconciler *is* both: it asks Paystack a question and it queues the SMTP receipt that
+the answer earns. A builder with a narrower signature would not be narrower, it would
+be a lie - the receipts this job produces would have to be composed with a recipient
+some other function decided. The rule is amended rather than broken, and it is the
+honest measure of what makes this job different from every other actorless one.
+
+It builds the settler itself, from the **same factory** it hands the reconciler. That
+is a correctness requirement in `build_scheduler`'s sense: each row settles in its own
+transaction, so the two use cases do not share one - but they must share a *database*,
+and the failure mode of getting that wrong is silent. The reconciler would ask the
+provider about rows in one file and credit wallets in another, reporting recovered
+payments that never happened. One factory for both is how that becomes impossible
+rather than merely unlikely, and it is the line that makes "recovered and delivered
+are indistinguishable" true by wiring rather than by claim.
+
+**150. The CLI verb is `reconcile`: top-level, actorless, and a missing key is a note
+and an exit 0.** A top-level verb rather than a `plan` sub-command, and the placement
+is the argument - reconciliation has nothing to do with plans, so a reader looking
+for "what asks Paystack what happened" would not think to look under `plan`. `plan
+tick` is nested because a tick *is* about plans.
+
+It is dispatched above the actor line in `main`, beside `plan tick` (decision 91), and
+`_reconcile_command` sits beside `_plan_tick_command` so the missing actor parameter is
+visible in the layout. It takes `--as-of` with the tick's parse and the tick's reason,
+and it reads `PaystackSettings` through the one reader of the environment,
+`paystack_from_environment`.
+
+With no key it prints a `note:` naming `PAYSTACK_SECRET_KEY` and returns 0, which is
+the tick's missing-mailbox rule one provider over. The note names the variable because
+that is `describe_configuration`'s rule: the failure mode of a job with nothing to ask
+with is *silence*, and naming the variable is the difference between a two-minute fix
+and an afternoon of guessing.
 
 ### Still open
 
@@ -2584,7 +3132,34 @@ not do - and the failure would be discovered by somebody who had relied on it.
 - **A second caller of `list_by_status` is a hole if it is user-reachable**
   (decision 57). Today the two callers are both installation-wide background jobs
   and `PlanService` does not expose it. That boundary is enforced by convention
-  rather than by a signature, so it is worth re-reading when a third caller appears.
+  rather than by a signature, so it is worth re-reading when a caller appears.
+
+  **Re-read in 3b, and the answer is that the convention holds and has grown.** No
+  third caller of `list_by_status` appeared, but a fourth *unscoped read* did -
+  `TransactionRepository.list_awaiting_provider` (decision 144) - so the family is now
+  four: `list_by_status` twice, `WalletRepository.owner_of` (decision 125), and this
+  one. All four are kept honest the same way and each is worth re-checking the same
+  way: the read answers a question about the *installation*, nothing user-facing can
+  reach it, and the money is still only ever loaded through an owner-scoped door
+  afterwards. The thing to notice is that four is a count somebody has to maintain by
+  reading the code - which is exactly the fragility this entry has always named, and
+  it is still tolerated rather than fixed.
+- **Two hand-written copies of a test double, and the port growing under them.**
+  `tests/conftest.py` has carried the note for a while: five modules used to define
+  their own `RecordingTransactionRepository`, the three fund modules now share the
+  fixture, and consolidating the remaining two "belongs with whatever touches them
+  next". 3b touched them - not because anything about deposits or withdrawals
+  changed, but because `TransactionRepository` grew `list_awaiting_provider`, and an
+  abstract method with no implementation in a subclass makes the subclass
+  un-instantiable whether or not anything ever calls it. **Four tests in those two
+  modules failed on the first full run of the slice for that reason**, which is the
+  evidence the note never had: a copy of a port is not untidiness, it is a thing that
+  breaks when the port moves, silently, in files that have nothing to do with the
+  change. The fix applied was the three lines each copy needed; the consolidation
+  (delete both classes, swap four `repository = RecordingTransactionRepository()`
+  lines for the fixture the fund modules already use) is small, mechanical, and
+  un-done on purpose - it is a rewrite of two unrelated modules' setup and deserves
+  its own commit rather than a ride along with a payments slice.
 - ~~**`main` resolves the development user for every command, including the ones
   that do not act as anybody.**~~ **Done, in Phase 2a** (decision 91). The identity
   commands and `plan tick` are now dispatched above the line that resolves an actor,
@@ -2620,27 +3195,105 @@ not do - and the failure would be discovered by somebody who had relied on it.
   what each one carries. Worth resolving once, when nothing else is in flight.
 - Any channel other than SMTP. `NotificationChannel` is the port that makes one a
   drop-in; building it now would be guessing at the second case.
-- **The settle-and-refund path, which is Phase 3's first item and the largest thing
-  2b leaves open.** A pending transaction currently has no exit: it cannot become
-  SUCCESSFUL and it cannot be refunded, because both are triggered by a provider
-  event that does not exist yet. Three gaps are visible from here and each wants its
-  own decision - `mark_failed()` does not credit the held funds back, `reverse()`
-  refuses anything that is not SUCCESSFUL, and nothing yet writes
-  `provider_reference` for a payout. Deliberately not built in 2b: its only caller
-  would have been a webhook that does not exist, which is `WalletStatus.CLOSED`
-  again - a state guarded in eleven places and never once set. See decision 106.
+- ~~**The settle-and-refund path, which is Phase 3's first item and the largest thing
+  2b leaves open.**~~ **Done, in 3a** (decisions 124-136). A pending transaction now
+  has an exit: `charge.success` settles a deposit, `transfer.success` settles a
+  payout, `transfer.failed` fails one *and credits the hold back*, and
+  `transfer.reversed` reverses a settled one. The three gaps this entry named were
+  each closed deliberately - `release_hold` is the method that credits held funds
+  back (decision 130), `reverse()` still refuses anything that is not SUCCESSFUL and
+  that is correct for "a settled payout came back", and `provider_reference` is now
+  written by `InitiateDeposit` and read by `SettlePayment` (decision 131). Two
+  pieces were deliberately *not* done and had entries of their own below: the
+  reconciler and deposit reversals. **One of those is now closed** - the reconciler
+  was built in 3b (decisions 138-150), which leaves deposit reversals as the only
+  survivor of this list.
+
+  The last line of the original entry is worth keeping, because it was right and it
+  is the reason this took a phase rather than an afternoon: the path was "deliberately
+  not built in 2b: its only caller would have been a webhook that does not exist".
 - **Migrating the `internal_reference` values already on disk.** Rows written before
   2b read `"<uuid>"` or `"plan:{id}:..."`; a retry of an old key no longer matches,
   once. Accepted at the time because it is a developer database and the change is
   the point (decision 107) - but it is the kind of "accepted" that stops being true
   the moment there is a real install, so it belongs on this list rather than only in
   the decision.
-- **Two receipt guards that mean the same thing and are written twice.**
+- **Three receipt guards that mean the same thing and are written three times.**
   `WalletService._announce` skips a PENDING transaction; `ExecutePlanRun._record_success`
-  skips a run whose rows did not all settle. They agree, neither is derived from the
-  other, and there is no single place that says so - which is fine now and is the
-  shape that drifts. Unifying them is a small job that wants doing before a third
-  caller appears.
+  skips a run whose rows did not all settle; and `SettlePayment._announce` skips
+  anything that is not SUCCESSFUL (decision 135). They agree, none is derived from
+  another, and there is no single place that says so. This entry used to say
+  "unifying them is a small job that wants doing before a **third** caller appears" -
+  and 3a is where the third caller appeared, so the condition has been met and the
+  job is now owed rather than pending. The three are not quite the same rule either,
+  which is the interesting part: two are "this movement has not happened yet" and the
+  third is "this movement happened and then un-happened", and a shared helper would
+  have to say which of those it means.
+- **Deposit reversals and disputes, and the overdraft they imply.** Not built in 3a,
+  and the reason is arithmetic rather than scheduling. Reversing a charge means
+  **debiting** a wallet that may have already spent the money, and there is no honest
+  answer to a wallet that cannot take the debit - the ledger would have to go
+  negative, which is the one thing every rule in `Wallet` exists to prevent. (A
+  chargeback is this system's only *inbound* movement whose far end can take money
+  back, which is exactly what makes it unlike the four events 3a handles: a
+  `transfer.reversed` gives back money the wallet already owned.)
+
+  The shape the fix would take, recorded here so it is not re-derived: **refuse,
+  record, and let a human settle it.** The wallet is left alone, the reversal is
+  written down as a fact about a row, and the resulting shortfall becomes something a
+  person looks at - because "this account owes money" is a real state a business has,
+  and modelling it as a negative balance would be this system pretending it has a
+  credit facility. It is Phase 3's second slice at the earliest.
+- ~~**The reconciler.**~~ **Done, in 3b** (decisions 138-150). A PENDING row whose
+  event never arrives is no longer indistinguishable from one whose event is in
+  flight: `reconcile` asks Paystack about every deposit older than fifteen minutes
+  and settles what Paystack says arrived, through the same `SettlePayment.settle`
+  the webhook uses. The entry named the two things that made it a slice rather than
+  an afternoon, and both were the real work:
+
+  It needed a `verify(reference)`-style read on the provider port, and the port
+  method whose signature was guessed was the mistake decision 124 declined to make
+  once - so the read was *designed* here rather than sketched: `outcome_for ->
+  ProviderAnswer`, three answers rather than an outcome or nothing, and the third
+  one ("the provider has never heard of this reference") is the alarm the whole job
+  exists to raise. And the poll interval, which had "no default", turned out to have
+  a defensible one once the question was asked properly: the window is a courtesy
+  rather than the guard (decision 143), because only a settled answer makes anything
+  happen. Fifteen minutes is a chosen number, not a derived one, and it is one
+  constant in one file.
+
+  What it deliberately does **not** do is in the entry below.
+- **Sweeping abandoned charges, and the fifth `ProviderEvent` that would need.** The
+  reconciler reports an abandoned checkout and leaves it PENDING on purpose (decision
+  142), which means a wallet can accumulate rows that will never settle and are asked
+  about for ever. The fix is a sweep - some age past which an unclaimed charge is
+  failed - and it is not a line in the reconciler because it needs an answer this
+  system does not have yet: what does it mean to *fail* a charge that might still
+  arrive?
+
+  The hazard is concrete and it is the reason this is an open item rather than a
+  branch. `SettlePayment` refuses a `CHARGE_SUCCEEDED` on a row that is not PENDING,
+  so a row failed a minute before its payment arrived would take the payer's money
+  and have nowhere to put it - and nothing would notice, because a FAILED row is not
+  in the candidate set any more. The shape the fix would take is a fifth
+  `ProviderEvent` - something like `CHARGE_EXPIRED` - and the rule around it would
+  have to be one only the reconciler may apply, and only on evidence that the
+  provider has stopped offering the checkout. That evidence is not in the answer the
+  lookup currently returns, which is what makes this a design job rather than a
+  branch. Worth doing against a real abandoned charge rather than against the idea of
+  one.
+
+  Note also what the report gives an operator in the meantime, which is the reason
+  this is tolerable: the row appears in the log on every run, with its reference and
+  `not_settled`, so an abandoned checkout is *visible* rather than lost. What is
+  missing is a way to clear it, not a way to see it.
+- **The `provider_events` audit table, argued against and not built.** Decision 128
+  says why the *feature* does not need one. What it does not settle is whether an
+  operator would want one anyway - a durable record of every event received,
+  acknowledged, ignored or refused, independent of what the ledger ended up saying.
+  The ledger is the answer to "what happened to this money" and is not the answer to
+  "did Paystack send us anything last Tuesday". Worth building the day somebody has
+  to ask the second question, and not before.
 - **A refused withdrawal under an explicit `--ref` can be retried into a silent
   success.** *Found while designing the confirmation, not created by it* - the
   reproduction exists on `main` today:
@@ -2783,12 +3436,12 @@ work now achieves nothing, and neither does a token shaped like an address) and
 `tests/application/identity/test_log_in.py::TestTheSameRefusalForBoth` (the
 account-enumeration oracle, closed).
 
-**Phase 2b - the money endpoints.** Every operation held by decision 62, now that
-there is an actor worth spending a session on - and what looked like a mechanical
+**Phase 2b - the money endpoints. Complete.** Every operation held by decision 62, now
+that there is an actor worth spending a session on - and what looked like a mechanical
 phase turned out to be the one that asked when a withdrawal has actually happened.
 See "The money endpoints, and the pending intent". Two things were deliberately
 *not* done: deposits stay held for Phase 3 (decision 97), and a pending transaction
-is left with no exit (decision 106).
+is left with no exit (decision 106). Both were closed in 3a.
 
 **Phase 2c - the rest of it:**
 
@@ -2803,22 +3456,74 @@ is left with no exit (decision 106).
   session is a row and revocation is a deletion; what is missing is the endpoints.
 - TLS. Non-negotiable, and the reason a reverse proxy sits in Phase 4.
 
+**The second-level confirmation was built ahead of this list**, because it is neither
+of the two phases it sits between: it is a property of the money endpoints 2b built
+rather than a new surface, and it was worth doing while that surface was still the
+thing being thought about. See decisions 113-123.
+
 ### Phase 3 - Paystack
 
-The phase that makes this a product rather than an exercise. It is also the phase
-where the existing domain work pays off, because the hard parts are already built.
+**Phase 3a - the webhook, the settle path, and the deposit route. Complete.** The
+phase that makes this a product rather than an exercise, and the one where the
+existing domain work paid off exactly as predicted: the hard parts - the reference,
+the pending intent, the two boundaries - were already built, and what was missing was
+a second kind of authority. See "The webhook, and money that arrives from outside".
 
-- Payment initiation, writing a `PENDING` transaction with an
-  `internal_reference` - the idempotency key decision 7 derives rather than
-  generates.
-- A webhook endpoint with **signature verification**. This is the highest-risk
-  item in the whole roadmap: without HMAC verification of Paystack's signature,
-  anyone who learns the endpoint URL can POST themselves a deposit. It is the
-  first thing to build here and the first thing to test.
-- The callback wired to the existing `provider_reference` path, so a webhook that
-  arrives twice is already a solved problem.
-- A reconciliation job comparing the ledger against Paystack's records. Webhooks
-  get lost and payments get reversed; drift has to be detected, not assumed away.
+- **Signature verification**, which this roadmap called "the highest-risk item in the
+  whole roadmap", built first and tested hardest. It is HMAC-SHA512 over the raw
+  bytes, stdlib `hmac`, `compare_digest`, and `test_webhooks.py` is where the claim
+  lives - including the test that signs one body and sends another (decision 126).
+- **Payment initiation**, writing a `PENDING` transaction whose
+  `internal_reference` is decision 7's key and which doubles as the provider's own
+  idempotency key (decision 131).
+- **The deposit route, unheld.** Decision 97's boundary crossing, now honest: the
+  route credits nothing, and the only thing that can credit is an event (decision
+  133).
+- **The four settling events**, including the two that give money back - which is
+  decision 106 closing, and the largest single gap 2b left open (decision 130).
+
+What is deliberately still open, with entries under `### Still open`: **the
+reconciliation job** ("webhooks get lost and payments get reversed; drift has to be
+detected, not assumed away" - it wants a port read that does not exist yet, and the
+shape of the fix is recorded there; closed in 3b, below), **deposit reversals and
+chargebacks**, and the `provider_events` audit table.
+
+Two things this phase changes about the roadmap below it. The reconciler became the
+only unbuilt item on the original Phase 3 list, and it moved from "the fourth bullet"
+to "the thing that makes the other three trustworthy at 3am" - which is what 3b below
+is. And the provider port grew to **two** methods rather than the symmetric three the
+plan sketched - `initialize_deposit` and `verify_signature` - because
+`initiate_transfer` and `verify(reference)` would each have been a signature guessed
+rather than derived. One of those two was then designed and built in 3b, and the other
+is still correctly absent.
+
+**Phase 3b - the reconciler, and the port read it needed. Complete.** The slice that
+makes 3a trustworthy rather than merely correct: a webhook that was lost left a
+payer's money spent and their wallet at zero, with nothing in the system able to
+notice. See "Reconciling the payments whose webhook never arrived".
+
+- **`outcome_for(reference) -> ProviderAnswer`**, the port's third method and the
+  first that *asks* rather than tells - three answers, with "the provider has never
+  heard of this reference" as the alarm no other part of this system can raise
+  (decisions 139-141).
+- **`reconcile`**, an actorless top-level command with its own hourly cron line,
+  settling through the *same* `SettlePayment` the webhook uses - so a recovered
+  payment and a delivered one leave identical state, which is the assertion the
+  slice's central test makes (decisions 138, 149-150).
+- **`list_awaiting_provider()`**, the fourth unscoped read and the one that makes the
+  candidate set exactly "deposits a provider was actually told about" (decision 144).
+- **`_request` learns that a status can be an answer**, which is decision 137
+  recurring one method over in the same file: a 404 means "broken deployment" to a
+  call that creates something and "no such transaction" to a call that asks about one
+  (decision 146).
+
+What it deliberately does not do, with entries under `### Still open`: **sweep
+abandoned charges** (nothing is ever marked FAILED, for a hazard the entry spells
+out), **reconcile transfers** (no payout goes through a provider yet, which is why the
+port read is about collections only), and **deposit reversals** - which was already
+open and is unchanged.
+
+That is the last item on the original Phase 3 list. Nothing there is unbuilt any more.
 
 ### Phase 4 - Production
 
@@ -2828,8 +3533,13 @@ where the existing domain work pays off, because the hard parts are already buil
 - **Backups with a tested restore.** A backup nobody has restored is a belief,
   not a backup, and this is the one item whose absence is unrecoverable.
 - Structured logging and error tracking.
-- CI running the suite on every push. 1,191 tests that nobody runs automatically
-  are a liability that feels like an asset.
+- CI running the suite on every push. *"N tests that nobody runs automatically are a
+  liability that feels like an asset"* - and note what has happened to this bullet:
+  it used to name a number, 1,191, and by the time anybody read it the number was
+  wrong. That is the argument for the bullet rather than an embarrassment about it. A
+  suite whose size has to be maintained by hand is a suite whose size nobody knows,
+  and the figure is left out here rather than corrected because the next correction
+  would go stale the same way.
 
 ### Phase 5 - Scale, when a real constraint asks for it
 

@@ -7,13 +7,14 @@ decision out of the domain. The reading is concentrated here so there is exactly
 one place to look when something is configured wrong - when a message does not
 arrive, or when a server is talking to the wrong database.
 
-It holds three unrelated things - mail settings, a database path and a session
-path - and that is a consequence of the sentence above rather than a failure of
-tidiness. The alternative, a second module reading ``os.environ`` for the
-database, would make the promise false, and the promise is the thing that makes
-configuration auditable. This module was ``notifications.email_settings`` until
-the API needed a database path; the *reader* is still singular, which is the
-property worth keeping, and only the name widened to say so.
+It holds four unrelated things - mail settings, a payment provider's secret, a
+database path and a session path - and that is a consequence of the sentence
+above rather than a failure of tidiness. The alternative, a second module reading
+``os.environ`` for the database, would make the promise false, and the promise is
+the thing that makes configuration auditable. This module was
+``notifications.email_settings`` until the API needed a database path; the
+*reader* is still singular, which is the property worth keeping, and only the
+name widened to say so.
 
 The environment rather than the database, for two reasons and only one of them is
 about security:
@@ -22,6 +23,9 @@ about security:
   copied, backed up and committed by accident; a password in one is a password
   leaked. Given that the credential has to come from somewhere outside anyway,
   the address travels with it - one boundary to configure, one boundary to audit.
+  ``PAYSTACK_SECRET_KEY`` is the same argument with more at stake: it is the key
+  that signs webhooks, so a copy of it in a committed file is a copy of the
+  ability to tell this server that money arrived.
 - **Configuration is not data.** Nothing in the database is a *setting*; it is
   the user's money and plans. A row that changed what the software did would be
   the first of its kind, and it would need its own interface, its own migration
@@ -33,6 +37,15 @@ tick still runs, still warns, and still pays - it simply has nowhere to send. Th
 alternative, raising, would mean a user who has not set up email cannot use the
 scheduler at all. ``database_path`` has no equivalent state: a database is not
 optional, so it has a default rather than a ``None``.
+
+**A missing payment key is the same shape of state with the opposite safe
+default**, and that difference is the reason it gets a reader of its own rather
+than sharing mail's. An install with no mail silently says nothing; an install
+with no payment key must silently say *no* - there is nothing to verify a webhook
+against, so accepting one would be accepting a stranger's word that money
+arrived. ``paystack_from_environment`` returning ``None`` is what lets the
+webhook route tell "unconfigured" from "unproven" and answer them differently.
+See that route for why those two are a 503 and a 401 rather than one error.
 """
 
 import os
@@ -161,6 +174,60 @@ def from_environment(environ=None) -> EmailSettings | None:
         password=_text(environ, "SMTP_PASSWORD"),
         starttls=_flag(environ, "SMTP_STARTTLS", default=True),
     )
+
+
+@dataclass(frozen=True)
+class PaystackSettings:
+    """Everything one conversation with Paystack needs, and nothing else.
+
+    One field, and it is deliberately one rather than a key/secret pair. Paystack
+    authenticates with a single secret key, and this is the only secret the
+    integration holds: the public key is a browser-side value that this server
+    has no use for, and adding a field for it would be a field somebody
+    eventually fills in with the wrong one.
+
+    Frozen and behaviour-free, exactly as ``EmailSettings`` is: it opens no
+    connection, signs nothing, and can be built by hand in a test without going
+    near the environment. The signing itself lives in the adapter, because that
+    is where the algorithm belongs - a settings object that knew how to compute
+    an HMAC would be a settings object with an opinion about a wire format.
+
+    ``secret_key`` is *reported* by nothing. There is no ``__repr__`` override
+    here even though the default dataclass one would print it, because the
+    places this value is logged are already controlled: it is passed to the
+    adapter and otherwise never travels. Rewriting ``__repr__`` to hide it would
+    be worth doing the day something starts logging whole settings objects, and
+    pretending to have done it now would be the worse mistake - a redacted
+    ``repr`` reads as "this type is safe to print", which is a claim nothing here
+    has earned.
+    """
+
+    secret_key: str
+
+
+def paystack_from_environment(environ=None) -> PaystackSettings | None:
+    """Build the payment settings from the environment, or ``None`` if unset.
+
+    Shaped exactly like ``from_environment``, and the resemblance is the point:
+    two readers with two different conventions would be two things to remember,
+    and the one that was remembered less often would be the one that mattered.
+
+    ``None`` means this installation cannot take payments, which is a legitimate
+    state - a developer running the suite, a fresh clone, a deployment that has
+    not been configured yet - and *not* an error. What the caller does with it is
+    where the two cases diverge, and the divergence is deliberate: mail's ``None``
+    means "say nothing", and this one's means "accept nothing". A blank value
+    counts as unset for the reason ``_text`` gives everywhere else - a variable
+    set to spaces is a variable somebody meant to fill in, and treating it as a
+    key would mean verifying every signature against a key of whitespace, which
+    is exactly the shape of a bug that looks like a working integration until
+    someone tries it.
+    """
+    environ = os.environ if environ is None else environ
+    secret_key = _text(environ, "PAYSTACK_SECRET_KEY")
+    if secret_key is None:
+        return None
+    return PaystackSettings(secret_key=secret_key)
 
 
 def database_path(environ=None) -> str:

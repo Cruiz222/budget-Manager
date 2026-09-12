@@ -131,6 +131,7 @@ from app.composition_root import (
     build_notification_deliverer,
     build_notifier,
     build_plan_service,
+    build_reconciler,
     build_resolve_actor,
     build_scheduler,
     build_sign_up,
@@ -162,6 +163,7 @@ from app.infrastructure.settings import (
     DEFAULT_DATABASE_PATH,
     describe_configuration,
     from_environment,
+    paystack_from_environment,
     session_path as configured_session_path,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
@@ -644,8 +646,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_plan_commands(subparsers)
     _add_fund_commands(subparsers)
+    _add_reconcile_command(subparsers)
 
     return parser
+
+
+def _add_reconcile_command(subparsers) -> None:
+    """The ``reconcile`` verb - a top-level command, unlike ``plan tick``.
+
+    A top-level verb rather than a ``plan`` sub-command, and the placement is
+    the argument: reconciliation has nothing to do with plans. It asks a payment
+    provider about deposits whose webhook never arrived, so filing it under
+    ``plan`` would put it behind a noun that does not describe it - and a reader
+    looking for "what asks Paystack what happened" would not think to look there.
+    ``plan tick`` is nested because a tick *is* about plans; this is not.
+
+    It takes ``--as-of`` for ``plan tick``'s reason, and with the same parse: the
+    grace window is judged against a moment, and a command that could only judge
+    it against the wall clock would be a command whose most interesting behaviour
+    - "these rows are too young to ask about" - could not be exercised without
+    waiting for it.
+    """
+    reconcile_parser = subparsers.add_parser(
+        "reconcile",
+        help="ask the payment provider about deposits still in flight "
+        "(the reconciliation entry point)",
+    )
+    reconcile_parser.add_argument(
+        "--as-of",
+        type=_datetime,
+        default=datetime.combine(date.today(), time.min),
+        help="the moment to treat as now, e.g. 2026-03-02T12:00 "
+        "(default: today at midnight)",
+    )
 
 
 def _add_fund_commands(subparsers) -> None:
@@ -1507,6 +1540,82 @@ def _plan_tick_command(args, factory, settings, deferred_reason) -> int:
     )
 
 
+def _reconcile_command(args, factory, settings) -> int:
+    """Wire up and run one reconciliation pass, with no actor anywhere in the call.
+
+    **The second command in the CLI that runs as nobody**, and it sits beside
+    ``_plan_tick_command`` for the reason that function gives: this one's whole
+    argument list is missing the ``actor`` every other command handler takes, and
+    the layout is the clearest way to say what it is. The difference between the
+    two is worth stating, because "actorless" is not one property:
+
+    ``plan tick`` is actorless because it serves *everybody* - it mints an
+    executor per plan, owned by that plan's user. This is actorless because it
+    serves nobody in particular and reads no wallet at all: it hands a reference
+    to ``SettlePayment`` and the settler derives the owner from the ledger row,
+    so the ownership of the money this run credits is decided inside the use case
+    that already had to decide it. There is no closure here and nothing to build
+    per record.
+
+    **A missing key is a note and an exit 0**, which is the tick's
+    missing-mailbox rule one provider over. With no ``PAYSTACK_SECRET_KEY``
+    there is nothing to ask with, and a job that failed loudly in that state
+    would be a cron line that mailed an operator every hour about a deployment
+    that simply does not take card payments. It says so once - so that somebody
+    who *expected* reconciliation to be running finds out it is not - and stops.
+
+    ``--as-of`` is threaded straight through to the use case rather than being
+    read here, because the grace window is judged against it and the use case is
+    what owns that policy.
+    """
+    paystack = paystack_from_environment()
+    if paystack is None:
+        # The variable is named, which is ``describe_configuration``'s rule one
+        # provider over: the failure mode of a job with nothing to ask with is
+        # silence, and "PAYSTACK_SECRET_KEY is not set" is the difference between
+        # a two-minute fix and an afternoon of guessing.
+        print(
+            f"note: nothing to reconcile as of {_moment(args.as_of)} - "
+            f"PAYSTACK_SECRET_KEY is not set (see 'Running the scheduler' "
+            f"in the README)"
+        )
+        return 0
+
+    reconciler = build_reconciler(
+        unit_of_work_factory=factory, settings=settings, paystack=paystack
+    )
+    _report_reconciliation(reconciler.execute(args.as_of))
+    return 0
+
+
+def _report_reconciliation(report) -> None:
+    """Print one line per row the run asked about, and one when it found none.
+
+    **A quiet run still speaks**, unlike ``_report_delivery`` which stays silent
+    when there is nothing to do. The two rules are the opposite and both are
+    right: a drain with an empty queue has nothing an operator needs to know,
+    while a reconciler with nothing in flight has *the* thing an operator wants
+    to know - that the webhook path is keeping up. "Nothing was in flight" and
+    "this job is not running" look identical from cron's output otherwise.
+
+    The rows that were too young and the rows left for the next run are a single
+    clause at the end, and they are counts rather than lines because neither is
+    actionable on its own: a payment started two minutes ago is not news, and a
+    backlog is only interesting as a trend.
+    """
+    if not report.reconciled:
+        print("nothing in flight")
+    else:
+        for one in report.reconciled:
+            print(f"{one.reference}  {one.outcome.value}  {one.detail}")
+
+    if report.too_young or report.remaining:
+        print(
+            f"note: {report.too_young} too young to ask about, "
+            f"{report.remaining} left for the next run"
+        )
+
+
 def _plan_create(
     args, service: PlanService, wallet_service: WalletService
 ) -> int:
@@ -1841,10 +1950,11 @@ def main(argv=None) -> int:
         # Dispatched before any actor is resolved, and that ordering is the
         # design rather than an optimisation. The three identity commands cannot
         # need a session - they are how a session comes to exist, or cease to -
-        # and ``plan tick`` must not, because it serves the whole installation
-        # and there is no person it could act as. Resolving an actor first, as
-        # this function used to do unconditionally, would have made a scheduler
-        # that requires a login.
+        # ``plan tick`` must not, because it serves the whole installation and
+        # there is no person it could act as, and ``reconcile`` must not either,
+        # because it asks a payment provider about payments that belong to
+        # whoever made them. Resolving an actor first, as this function used to
+        # do unconditionally, would have made a scheduler that requires a login.
         if args.command == "signup":
             return _signup(args, factory)
         if args.command == "login":
@@ -1853,6 +1963,8 @@ def main(argv=None) -> int:
             return _logout(args, factory)
         if args.command == "plan" and args.plan_command == "tick":
             return _plan_tick_command(args, factory, settings, deferred_reason)
+        if args.command == "reconcile":
+            return _reconcile_command(args, factory, settings)
 
         # --- everything else runs as somebody, proved by the stored token ----
         #

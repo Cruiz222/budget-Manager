@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -234,3 +235,73 @@ def test_a_transaction_without_a_destination_round_trips_as_none(build_wallet):
     repository.save(transaction)
 
     assert repository.get_by_id(transaction.transaction_id).destination is None
+
+
+# --- the reconciliation read ------------------------------------------------
+
+
+def test_list_awaiting_provider_returns_pending_rows_that_carry_a_reference(
+    build_wallet,
+):
+    """**Both halves of the filter, and neither is decorative.**
+
+    The reconciler asks a provider "what became of this reference?", so it may
+    only ask about rows a provider was actually told about. The status half
+    excludes a finished deposit; the reference half excludes every CLI
+    withdrawal and plan-run payout, which are PENDING for ever as far as a
+    provider is concerned because ``app/presentation/cli.py`` never writes a
+    ``provider_reference`` at all.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+
+    awaiting = build_transaction(wallet, provider_reference="prov-awaiting")
+    finished = build_transaction(wallet, provider_reference="prov-finished")
+    finished.mark_successful()
+    unsponsored = build_transaction(wallet)
+    for transaction in (awaiting, finished, unsponsored):
+        repository.save(transaction)
+
+    found = repository.list_awaiting_provider()
+
+    assert [t.transaction_id for t in found] == [awaiting.transaction_id]
+
+
+def test_list_awaiting_provider_is_oldest_first(build_wallet):
+    """The order is the contract, because the batch takes from the front.
+
+    A run asks about the oldest rows first, so a backlog longer than one batch
+    drains from the end that has been waiting longest rather than starving it -
+    ``get_by_wallet_id``'s ordering rule, for the same reason and with the same
+    tiebreak.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+
+    rows = [
+        build_transaction(
+            wallet,
+            provider_reference=f"prov-{n}",
+            created_at=datetime(2026, 1, 2, 11, n),
+        )
+        for n in range(3)
+    ]
+    for transaction in reversed(rows):
+        repository.save(transaction)
+
+    found = repository.list_awaiting_provider()
+
+    assert [t.provider_reference for t in found] == [
+        "prov-0",
+        "prov-1",
+        "prov-2",
+    ]
+
+
+def test_list_awaiting_provider_is_empty_when_nothing_is_in_flight(build_wallet):
+    """The ordinary state of a healthy installation, and the one the CLI reports
+    as ``nothing in flight`` rather than as silence."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+
+    assert repository.list_awaiting_provider() == []

@@ -4,6 +4,7 @@ from app.infrastructure.settings import (
     database_path,
     describe_configuration,
     from_environment,
+    paystack_from_environment,
 )
 
 
@@ -234,3 +235,53 @@ class TestWhereTheDatabaseLives:
         """
         assert database_path(environment()) == "budget.db"
         assert from_environment({"BUDGET_DB": "/tmp/x.db"}) is None
+
+
+class TestThePaymentKey:
+    """The second reader, and the one whose absent case is the dangerous one.
+
+    Mail's ``None`` means "say nothing"; this one's means "accept nothing", and
+    the two are the same value doing opposite jobs. That is why the absent cases
+    are tested first and in the same shape as the mail ones: a blank value counts
+    as unset here, and the reason is sharper than it is there. A key of
+    whitespace verifies every signature against whitespace - which is not a crash
+    and not a refusal but a working-looking integration that anybody who reads the
+    source can forge against.
+    """
+
+    def test_a_key_is_read(self):
+        settings = paystack_from_environment({"PAYSTACK_SECRET_KEY": "sk_test_abc"})
+
+        assert settings.secret_key == "sk_test_abc"
+
+    def test_no_key_means_no_settings(self):
+        assert paystack_from_environment({}) is None
+
+    def test_an_empty_string_counts_as_absent(self):
+        """The variable somebody exported while clearing it."""
+        assert paystack_from_environment({"PAYSTACK_SECRET_KEY": ""}) is None
+
+    def test_whitespace_counts_as_absent(self):
+        assert paystack_from_environment({"PAYSTACK_SECRET_KEY": "   "}) is None
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        """A key pasted out of a dashboard can carry a newline, and a key with
+        one in it signs nothing - so the value is trimmed rather than kept whole.
+        """
+        settings = paystack_from_environment(
+            {"PAYSTACK_SECRET_KEY": " sk_test_abc\n"}
+        )
+
+        assert settings.secret_key == "sk_test_abc"
+
+    def test_it_is_not_a_mail_setting_and_does_not_depend_on_one(self):
+        """The independence claim stated in both directions.
+
+        A fully configured mail install implies no payment key, and a payment key
+        implies no mail settings - which is what makes it correct for the API to
+        read this one on every webhook without reading the other, and for a
+        receipt to be attempted on an install that takes money and sends nothing.
+        """
+        assert paystack_from_environment(environment()) is None
+        assert from_environment({"PAYSTACK_SECRET_KEY": "sk_test_abc"}) is None
+

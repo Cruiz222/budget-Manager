@@ -52,6 +52,17 @@ class RecordingTransactionRepository(TransactionRepository):
     def get_by_provider_reference(self, provider_reference):
         raise NotImplementedError
 
+    def list_awaiting_provider(self):
+        # The reconciliation read, which no test in this module serves. It is
+        # here because ``TransactionRepository`` grew it: an abstract method with
+        # no implementation in a subclass makes the subclass un-instantiable, so
+        # this copy was broken by a change that has nothing to do with deposits.
+        # That is the argument ``RecordingTransactionRepository`` in
+        # ``tests/conftest.py`` already makes for consolidating these copies -
+        # see its docstring, and note that this is the second time the port has
+        # grown under one of them.
+        raise NotImplementedError
+
 
 # --- Successful deposit ---
 

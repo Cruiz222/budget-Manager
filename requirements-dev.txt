@@ -7,11 +7,14 @@
 #
 # This is the file to install for a checkout that will run the tests.
 # requirements.txt holds what the software needs to *run*, so a deployment does
-# not carry a test runner or an HTTP client.
+# not carry a test runner.
 #
-# httpx is here rather than in requirements.txt because it exists for exactly one
-# reason: starlette's ``TestClient`` is built on it, which is how the API tests
-# drive a real application without opening a socket. Nothing shipped imports it.
+# httpx used to be listed here and is not any more. That was not a change of
+# mind: it exists for exactly one reason - starlette's ``TestClient`` is built on
+# it, which is how the API tests drive a real application without opening a
+# socket - and the shipped code now needs it too, because
+# ``PaystackPaymentProvider`` posts to a provider. It moved to requirements.txt
+# rather than being listed in both, and the note beside it there says which half
+# of the payment integration is responsible.
 -r requirements.txt
 pytest==9.1.1
-httpx==0.28.1

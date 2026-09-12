@@ -1,12 +1,13 @@
 from datetime import datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Response
 
+from app.application.payments.initiate_deposit import InitiateDeposit
 from app.application.wallet_service import WalletService
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.presentation.api import schemas, translate
-from app.presentation.api.dependencies import wallet_service
+from app.presentation.api.dependencies import deposit_service, wallet_service
 
 router = APIRouter(tags=["wallets"])
 
@@ -277,3 +278,87 @@ def close_wallet(
     )
     _status_for(response, requested.created)
     return translate.confirmation_out(requested.confirmation, now)
+
+
+# --- money arriving ---------------------------------------------------------
+#
+# One route, and it is the only one on this router that does not move money
+# *between* the wallet's own balances or out of it. It is here rather than in a
+# module of its own because its path says where it belongs - a deposit is
+# something you do to a wallet - and the contrast that matters is with the
+# withdrawal and payout routes directly above.
+#
+# **It is not confirmed, and that is the line decision 113 drew rather than an
+# exception to it.** That decision put a second look before operations where
+# money *leaves*, because those are the ones where a mistake is irreversible and
+# a prompt can still catch it. A prompt before receiving money would be a prompt
+# whose only possible answer is yes.
+#
+# **A deposit is the one wallet operation the provider pays for, and the one
+# whose settlement is not ours to decide.** The withdrawal above answers with a
+# request because a person has to answer it; this answers with a collection
+# because a person has to pay it, and neither has moved anything yet. What
+# settles them is different in kind: the withdrawal is settled by its owner at
+# ``/confirmations/{id}/confirm``, and the deposit is settled by Paystack at
+# ``/webhooks/paystack``, which no client of this API can call.
+
+
+@router.post(
+    "/wallets/{wallet_id}/deposits",
+    response_model=schemas.DepositIntentOut,
+    status_code=201,
+)
+def deposit(
+    wallet_id: UUID,
+    payload: schemas.DepositIn,
+    wallets: WalletService = Depends(wallet_service),
+    deposits: InitiateDeposit = Depends(deposit_service),
+) -> schemas.DepositIntentOut:
+    """Open a collection for this wallet. **The wallet is not credited.**
+
+    The wallet is read first, and only to learn its currency - the amount arrives
+    as a bare string and has to be read in something. That is one extra read per
+    deposit, and it is exactly the read ``withdraw`` above makes for exactly the
+    same reason, so the two money-in and money-out routes agree about how a bare
+    amount becomes a ``Money``: the wallet decides the currency, never the
+    request.
+
+    **The order of the two dependencies is the feature, not the wiring.** An
+    installation with no payment key refuses this request at
+    ``dependency.payment_provider`` - a 503 - and it does so *before* the wallet
+    is read, before the amount is parsed and before any row is written. There is
+    no partial state to clean up because nothing has happened yet, which is the
+    property to want from a request whose whole purpose is to reach outside this
+    system.
+
+    Three refusals, and they are graded by ``errors`` like every other domain
+    refusal:
+
+    - ``WalletNotFoundError`` -> **404**, the same answer a wallet that never
+      existed gets. A caller cannot open a collection against somebody else's
+      wallet, and cannot tell that one exists by trying.
+    - ``WalletClosedError`` -> **409**. A closed wallet is refused *here*, before
+      the payer is ever sent anywhere, because ``Wallet.apply_deposit`` will not
+      credit one - so a collection opened against it would take money that
+      nothing could ever put anywhere.
+    - ``DepositAlreadyInitiatedError`` -> **409**. A deposit is already open
+      under this key. **This is deliberate rather than the friendlier-sounding
+      alternative**, and it is the one refusal here worth reading twice: this
+      route does not return the first collection's ``authorization_url`` for a
+      repeated key, because nothing stores it and a checkout URL is single-use.
+      Handing back a page that has already been paid would be telling the client
+      a deposit is live when the provider would refuse to take the money. See
+      ``DepositAlreadyInitiatedError``.
+
+    A **frozen** wallet is allowed, and the asymmetry with closed is deliberate:
+    freezing stops value *leaving*, and this is value arriving. The balance it
+    lands in is one the freeze already protects.
+    """
+    wallet = wallets.get_wallet(wallet_id)
+    amount = translate.money_in(payload.amount, wallet.currency)
+    initiated = deposits.execute(
+        wallet_id,
+        amount,
+        payload.ref if payload.ref is not None else str(uuid4()),
+    )
+    return translate.initiated_deposit_out(initiated)

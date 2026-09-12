@@ -23,12 +23,13 @@ there is load.
 
 from fastapi import FastAPI
 
+from app.composition_root import provider_for
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
 from app.infrastructure.settings import database_path as configured_database_path
-from app.infrastructure.settings import from_environment
+from app.infrastructure.settings import from_environment, paystack_from_environment
 from app.presentation.api import errors
 from app.presentation.api.routes import (
     confirmations,
@@ -38,11 +39,17 @@ from app.presentation.api.routes import (
     sessions,
     users,
     wallets,
+    webhooks,
 )
 
 
 def create_app(
-    unit_of_work_factory=None, settings=None, database_path=None, password_hasher=None
+    unit_of_work_factory=None,
+    settings=None,
+    database_path=None,
+    password_hasher=None,
+    paystack_settings=None,
+    payment_provider=None,
 ) -> FastAPI:
     """Build the application.
 
@@ -76,6 +83,30 @@ def create_app(
     of an environment. A configurable hash is a hash that can be configured wrong
     in production, and all a test needs is to skip the work, not to change what
     the work is.
+
+    ``paystack_settings`` - the payment settings, a ``PaystackSettings``. ``None``
+    means "read this installation's configuration", and an installation without a
+    key resolves to ``None`` - which is a *supported state* rather than a broken
+    one. It is not the same kind of absence the mail settings' ``None`` is,
+    though, and the difference is the reason the next paragraph exists: no mail
+    address means this installation says nothing, and no payment key means it
+    takes nothing. See ``routes/webhooks.py`` for what "takes nothing" looks like
+    from outside - a 503, so the provider retries rather than giving up.
+
+    ``payment_provider`` - the ``PaymentProvider`` port, for the same reason
+    ``unit_of_work_factory`` and ``password_hasher`` are parameters: it is the
+    seam a test substitutes. ``None`` builds the Paystack adapter from
+    ``paystack_settings``, or resolves to ``None`` when there are no settings to
+    build it from. **The substitute matters more here than anywhere else in this
+    file**, because the real adapter opens sockets - and it is not only the
+    deposit route that is kept off the network by it: the webhook's signature
+    check is *also* the adapter's, so this one seam is what lets a test drive the
+    real verification path without a provider account.
+
+    Both are resolved together rather than independently, and the pair is
+    deliberately not collapsed into one parameter. Settings without a provider is
+    an installation that *can* take payments; a provider without settings is a
+    test. One parameter could not say which of those it meant.
     """
     application = FastAPI(
         title="Budget Manager",
@@ -107,9 +138,26 @@ def create_app(
     application.state.password_hasher = (
         Argon2PasswordHasher() if password_hasher is None else password_hasher
     )
+    application.state.paystack = (
+        paystack_from_environment() if paystack_settings is None else paystack_settings
+    )
+    application.state.payment_provider = (
+        provider_for(application.state.paystack)
+        if payment_provider is None
+        else payment_provider
+    )
 
     errors.install(application)
-    for module in (health, users, sessions, wallets, funds, plans, confirmations):
+    for module in (
+        health,
+        users,
+        sessions,
+        wallets,
+        funds,
+        plans,
+        confirmations,
+        webhooks,
+    ):
         application.include_router(module.router)
 
     return application

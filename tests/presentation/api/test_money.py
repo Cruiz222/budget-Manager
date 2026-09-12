@@ -228,11 +228,28 @@ def refused(client, path, headers, **body):
 
 
 def expire(db_path, confirmation_id) -> None:
-    """Push a confirmation's window into the past, in the store.
+    """Push a confirmation's whole window into the past, in the store.
 
     Rewritten rather than waited for, and it is the same trick ``_rewrite_session``
     below uses: the row is the API's own, and the only thing changed is when the
-    window closes. A test that slept fifteen minutes would not be run.
+    window falls.
+
+    **Both moments move, and that is the aggregate's rule turning up in a test.**
+    ``Confirmation`` refuses a row whose ``expires_at`` is not strictly after its
+    ``created_at`` - a request born dead - and the window runs fifteen minutes
+    from the moment the request was made. So a confirmation made *this instant*
+    cannot be aged by writing a past ``expires_at`` on its own: every such value
+    is before ``created_at``, the row is refused at load, and what the test gets
+    back is a 400 about the window rather than the expiry it asked for. Moving
+    the creation an hour back and the expiry fifty minutes back keeps the
+    interval the shape the aggregate demands, and puts both ends in 2000 - the
+    past by any clock this suite will ever run against.
+
+    That the domain can say this at all is worth noticing: the invariant is
+    checked on the way *in* from the store as well as on the way out, so a
+    hand-edited row that no code could have produced fails loudly at load. The
+    cost is exactly this - a test aging a row has to write a row the domain would
+    have written.
 
     Raw SQL rather than ``uow.confirmations.save``, and that is not laziness:
     ``save`` deliberately writes only ``status`` and ``transaction_id``, so that
@@ -244,8 +261,9 @@ def expire(db_path, confirmation_id) -> None:
     connection = sqlite3.connect(db_path)
     try:
         connection.execute(
-            "UPDATE confirmations SET expires_at = ? WHERE confirmation_id = ?",
-            ("2000-01-01T00:00:00", str(confirmation_id)),
+            "UPDATE confirmations SET created_at = ?, expires_at = ? "
+            "WHERE confirmation_id = ?",
+            ("2000-01-01T00:00:00", "2000-01-01T00:15:00", str(confirmation_id)),
         )
         connection.commit()
     finally:

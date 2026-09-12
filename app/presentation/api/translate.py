@@ -26,6 +26,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from app.application.identity.log_in import LoggedIn
+from app.application.payments.initiate_deposit import InitiatedDeposit
 from app.application.wallet_service import ConfirmedOperation
 from app.domain.identity.user import User
 from app.domain.money.confirmation import Confirmation
@@ -242,6 +243,30 @@ def confirmed_operation_out(
             else None
         ),
         wallet=wallet_out(operation.wallet),
+    )
+
+
+def initiated_deposit_out(deposit: InitiatedDeposit) -> schemas.DepositIntentOut:
+    """A deposit that has been asked for, as the client sees it.
+
+    The four fields pass straight through, which makes this look like a function
+    that need not exist - and it exists for the reason every other function in
+    this section does: it is the one place that decides what crosses the wire.
+    ``money_out`` is doing real work on the amount, and ``status`` is a
+    ``TransactionStatus`` becoming its ``.value``. A route that built this
+    response itself would be a second place that formats an amount, which is the
+    file's whole warning.
+
+    ``authorization_url`` is forwarded unread. It is the provider's page, and the
+    only transformation applied to it anywhere in this codebase is the JSON
+    encoding a client's HTTP library will do - which is the correct amount of
+    handling for a URL that is not ours to interpret.
+    """
+    return schemas.DepositIntentOut(
+        authorization_url=deposit.authorization_url,
+        provider_reference=deposit.provider_reference,
+        amount=money_out(deposit.amount),
+        status=deposit.status.value,
     )
 
 

@@ -132,7 +132,16 @@ class SqliteConfirmationRepository(ConfirmationRepository):
     ) -> Confirmation:
         confirmation = self._find_owned(confirmation_id, user_id)
         if confirmation is None:
-            raise ConfirmationNotFoundError(f"no confirmation {confirmation_id}")
+            # Raised bare, and that is the point rather than an omission. A
+            # message naming the id would make this 404 differ from the same 404
+            # against an id that names nothing - the two answers would be
+            # distinguishable by a client comparing bodies, and the whole
+            # authorisation for answering a request is knowing its id, so an
+            # oracle here would be worth more than an oracle anywhere else in the
+            # API. Bare matches ``WalletNotFoundError``, which is raised the same
+            # way for the same reason; ``errors._detail`` turns the empty message
+            # into the class name, so the client still gets something to read.
+            raise ConfirmationNotFoundError
         return confirmation
 
     def save(self, confirmation: Confirmation) -> Confirmation:
@@ -207,8 +216,11 @@ class SqliteConfirmationRepository(ConfirmationRepository):
         """
         confirmation = self._find_owned(confirmation_id, user_id)
         if confirmation is None or confirmation.kind is not kind:
-            # Absent, foreign and wrong-kind alike, for the reason in the port.
-            return ConfirmationNotFoundError(f"no confirmation {confirmation_id}")
+            # Absent, foreign and wrong-kind alike, for the reason in the port -
+            # and bare, for the reason ``get_owned`` gives: the message must not
+            # name the id, or the answer to "this is not yours" and the answer to
+            # "this never was" would differ by more than their shared status code.
+            return ConfirmationNotFoundError
         if confirmation.status is ConfirmationStatus.CONFIRMED:
             return ConfirmationAlreadyUsedError(
                 f"confirmation {confirmation_id} has already been answered"
