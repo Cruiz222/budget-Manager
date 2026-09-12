@@ -22,6 +22,7 @@ from app.domain.planning.exception import (
     InvalidPlanScheduleError,
     InvalidPlanSourceError,
     InvalidPlanStatusError,
+    InvalidPlanUserIDError,
     InvalidPlanWalletIDError,
     IrreversibleReleasePlanError,
     MixedInstructionCurrenciesError,
@@ -118,6 +119,25 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanWalletIDError):
             SavingsPlan(
                 wallet_id="not-a-uuid",
+                user_id=uuid4(),
+                name="salary",
+                source=PlanSource.LOCKED,
+                schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
+                _instructions=(payout("500"),),
+            )
+
+    def test_an_invalid_user_id_is_rejected(self):
+        """A plan without an owner cannot exist, so a non-UUID owner is refused.
+
+        The duplicate of ``wallets.user_id`` is deliberate (see ``SavingsPlan``),
+        and this assertion is the half of that trade that keeps it honest: the
+        field is not merely carried, it is checked, so a plan that reached the
+        store with a bad owner would have had to get past the aggregate first.
+        """
+        with pytest.raises(InvalidPlanUserIDError):
+            SavingsPlan(
+                wallet_id=uuid4(),
+                user_id="not-a-uuid",
                 name="salary",
                 source=PlanSource.LOCKED,
                 schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
@@ -128,6 +148,7 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanIDError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                user_id=uuid4(),
                 name="salary",
                 source=PlanSource.LOCKED,
                 schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
@@ -139,6 +160,7 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanSourceError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                user_id=uuid4(),
                 name="salary",
                 source="locked",
                 schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
@@ -149,6 +171,7 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanScheduleError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                user_id=uuid4(),
                 name="salary",
                 source=PlanSource.LOCKED,
                 schedule="monthly",
@@ -159,6 +182,7 @@ class TestConstructionValidation:
         with pytest.raises(InvalidPlanStatusError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                user_id=uuid4(),
                 name="salary",
                 source=PlanSource.LOCKED,
                 schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),
@@ -170,6 +194,7 @@ class TestConstructionValidation:
         with pytest.raises(InvalidCompletedRunsError):
             SavingsPlan(
                 wallet_id=uuid4(),
+                user_id=uuid4(),
                 name="salary",
                 source=PlanSource.LOCKED,
                 schedule=Schedule(cadence=Cadence.MONTHLY, anchor=datetime(2026, 1, 1)),

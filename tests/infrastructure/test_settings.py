@@ -1,5 +1,7 @@
-from app.infrastructure.notifications.email_settings import (
+from app.infrastructure.settings import (
+    DEFAULT_DATABASE_PATH,
     DEFAULT_PORT,
+    database_path,
     describe_configuration,
     from_environment,
 )
@@ -174,3 +176,61 @@ class TestTheStartTlsFlag:
                 from_environment(environment(SMTP_STARTTLS=spelling)).starttls
                 is True
             )
+
+
+class TestWhereTheDatabaseLives:
+    """The second thing this module reads, and the reason it was renamed.
+
+    These tests are about a *different* kind of setting from the ones above, and
+    the contrast is the point. Mail has an unconfigured state and this does not:
+    an install with no mail account still works, and an install with no database
+    has nothing to work on. So there is a default here where there is a ``None``
+    there.
+    """
+
+    def test_it_falls_back_to_the_file_the_cli_has_always_used(self):
+        """The absent case is the behaviour that existed before the API did.
+
+        This is what makes the API additive: an installation that sets nothing
+        and runs the server gets the same database the CLI would have used, so
+        the two presentations are looking at one set of money rather than two.
+        """
+        assert DEFAULT_DATABASE_PATH == "budget.db"
+        assert database_path({}) == "budget.db"
+
+    def test_the_variable_overrides_the_default(self):
+        assert database_path({"BUDGET_DB": "/var/lib/budget/prod.db"}) == (
+            "/var/lib/budget/prod.db"
+        )
+
+    def test_an_empty_value_is_not_a_path(self):
+        """``""`` would otherwise be a database called nothing at all.
+
+        The same rule ``_text`` applies to every other setting, and it matters
+        more here than there: an operator who exported ``BUDGET_DB=`` while
+        clearing a value gets the default and their data, rather than an empty
+        filename SQLite would happily create in the working directory.
+        """
+        assert database_path({"BUDGET_DB": ""}) == "budget.db"
+
+    def test_a_whitespace_value_is_not_a_path_either(self):
+        assert database_path({"BUDGET_DB": "   "}) == "budget.db"
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        """An exported path can pick up a stray space, and the file is real.
+
+        Trimming rather than refusing, for the same reason ``User`` folds an
+        email: the person who typed it has done nothing wrong, and the value is
+        unambiguous once trimmed.
+        """
+        assert database_path({"BUDGET_DB": " /tmp/x.db\n"}) == "/tmp/x.db"
+
+    def test_it_is_not_a_mail_setting_and_does_not_depend_on_one(self):
+        """The two halves of this module are independent.
+
+        A complete mail configuration does not imply a database path and the
+        reverse, which is what makes it safe for the API to read one without
+        reading the other.
+        """
+        assert database_path(environment()) == "budget.db"
+        assert from_environment({"BUDGET_DB": "/tmp/x.db"}) is None

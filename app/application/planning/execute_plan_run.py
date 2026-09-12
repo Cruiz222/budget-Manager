@@ -69,9 +69,22 @@ class ExecutePlanRun:
     def __init__(
         self,
         unit_of_work_factory: UnitOfWorkFactory,
+        *,
+        actor: uuid.UUID,
         recipient: str | None = None,
     ):
         self._unit_of_work_factory = unit_of_work_factory
+        # Who this run is executed *as*.
+        #
+        # This is the class that makes "the scheduler is not a privileged actor"
+        # true rather than merely asserted. It was a single long-lived object
+        # serving every user; it now takes an owner like any other service, and
+        # ``RunDuePlans`` builds one per plan with that plan's ``user_id``. So
+        # the scheduler holds no authority a user does not - it holds a loop over
+        # single-user executions. See ``RunDuePlans`` for the building, and the
+        # wallet read in ``execute`` for why it could not be written any other
+        # way.
+        self._actor = actor
         # ``None`` means this installation has no notification address, which is
         # the ordinary state of a fresh install rather than an error. The run
         # happens exactly as it would otherwise and simply says nothing about it.
@@ -94,7 +107,7 @@ class ExecutePlanRun:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            plan = uow.plans.get_by_id(plan_id)
+            plan = uow.plans.get_owned(plan_id, self._actor)
 
             # Not due: nothing to do, and nothing to record. A tick over many
             # plans will take this branch most of the time.
@@ -102,7 +115,14 @@ class ExecutePlanRun:
                 uow.rollback()
                 return None
 
-            wallet = uow.wallets.get_by_id(plan.wallet_id)
+            # Read as the plan's owner, which is who this executor was built for.
+            # The scheduler therefore reaches a wallet it does not own without
+            # any authority of its own: the owner is named on the plan, and this
+            # is an ordinary scoped read made with that name. A plan whose owner
+            # is not the actor this was built for fails here rather than
+            # proceeding - there is no path that reads a wallet on behalf of
+            # nobody.
+            wallet = uow.wallets.get_owned(plan.wallet_id, self._actor)
             due_at = plan.next_due_at
 
             reason = self._blocking_reason(plan, wallet, as_of)

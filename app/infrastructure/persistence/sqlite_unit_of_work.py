@@ -39,11 +39,82 @@ from app.infrastructure.repositories.sqlite_savings_plan_repository import (
 from app.infrastructure.repositories.sqlite_transaction_repository import (
     SqliteTransactionRepository,
 )
+from app.infrastructure.repositories.sqlite_password_credential_repository import (
+    SqlitePasswordCredentialRepository,
+)
+from app.infrastructure.repositories.sqlite_session_repository import (
+    SqliteSessionRepository,
+)
+from app.infrastructure.repositories.sqlite_user_repository import (
+    SqliteUserRepository,
+)
 from app.infrastructure.repositories.sqlite_wallet_repository import (
     SqliteWalletRepository,
 )
 
 SCHEMA = """
+-- Users come first, because every wallet names one and a wallet is only
+-- meaningful because somebody owns it. There is deliberately no foreign key
+-- from ``wallets.user_id`` to this table, and the reason is a SQLite one rather
+-- than a design preference: ``wallets`` already exists on every database in the
+-- wild, and a foreign key cannot be added to an existing column without
+-- rebuilding the whole table. Integrity between the two is the repository's job
+-- for now, and the rebuild is recorded in the README as a later candidate.
+CREATE TABLE IF NOT EXISTS users (
+    user_id        TEXT PRIMARY KEY,
+    email          TEXT NOT NULL UNIQUE,   -- folded to lowercase by the aggregate
+    -- The Google account this user signs in with, when they have one. NULL is
+    -- the ordinary case for an account created any other way, and SQLite's
+    -- UNIQUE permits any number of NULLs - which is exactly right here, and is
+    -- why an empty string would be wrong instead: every Google-less account
+    -- would collide on "" and the second signup would fail against the first.
+    google_subject TEXT UNIQUE,
+    created_at     TEXT NOT NULL           -- ISO moment
+);
+
+-- How a user proves they are that user, and deliberately a table of its own
+-- rather than two more columns on ``users``. ``User`` is the identity - who a
+-- wallet belongs to - and it carries no credential by design; see its docstring,
+-- and ``PasswordCredential`` for what went here instead. The practical half of
+-- the reason is that a ``User`` is loaded by every authenticated request and
+-- rendered by ``translate.user_out``, so a hash living on it would be one
+-- forgotten omission away from being served to a client.
+--
+-- There is no foreign key to ``users``, for the same SQLite reason recorded
+-- above: the constraint cannot be added later without rebuilding, and the
+-- repository is where integrity lives for now.
+CREATE TABLE IF NOT EXISTS password_credentials (
+    -- The primary key, so a password change is an update to this row rather than
+    -- a second credential. One account, one password.
+    user_id       TEXT PRIMARY KEY,
+    -- The *encoded* hash: salt, cost parameters and digest in one string, as
+    -- argon2 emits it. Storing the parameters alongside is what allows the cost
+    -- to be raised later without invalidating every existing password.
+    password_hash TEXT NOT NULL,
+    updated_at    TEXT NOT NULL           -- ISO moment
+);
+
+-- A record that somebody proved who they are, and until when. Not a credential:
+-- this table holds no secret that can be presented. The server hashes whatever
+-- token arrives and looks the *hash* up, so a copy of this table is a list of
+-- sessions that cannot be used - which is what "hashed at rest" buys, and it is a
+-- different property from the one a password hash has.
+--
+-- There is no ``revoked_at``. Revocation is deletion (decision 49): a deleted row
+-- cannot be misread, where a flag obliges every query to remember to filter on it
+-- and the one that forgets is a session that never ended.
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    -- UNIQUE for the same reason ``users.email`` is: two sessions sharing a token
+    -- cannot realistically happen, and if it did - a broken RNG, a row copied by
+    -- hand - the store refuses it rather than letting one token resolve to two
+    -- identities. It is also the index every authenticated request reads through.
+    token_hash TEXT NOT NULL UNIQUE,
+    issued_at  TEXT NOT NULL,             -- ISO moment
+    expires_at TEXT NOT NULL             -- ISO moment; absolute, never extended
+);
+
 CREATE TABLE IF NOT EXISTS wallets (
     wallet_id         TEXT PRIMARY KEY,
     user_id           TEXT NOT NULL,
@@ -102,6 +173,19 @@ CREATE TABLE IF NOT EXISTS transactions (
 CREATE TABLE IF NOT EXISTS savings_plans (
     plan_id        TEXT PRIMARY KEY,
     wallet_id      TEXT NOT NULL REFERENCES wallets(wallet_id),
+    -- Who owns this plan - the same person who owns ``wallet_id``, recorded
+    -- here as well. A plan cannot reach its wallet's owner without loading the
+    -- wallet, and loading a wallet requires naming its owner; the scheduler,
+    -- which runs everybody's plans, needs this column to break out of that
+    -- circle without a privileged read. See ``SavingsPlan.user_id`` for the
+    -- full reasoning and for what the duplication costs.
+    --
+    -- No REFERENCES users(user_id), and that is the same choice the migration
+    -- adding this column to an existing database is forced into: SQLite refuses
+    -- ALTER TABLE ADD COLUMN with a REFERENCES clause unless the default is
+    -- NULL, and this column is NOT NULL. Declaring one here would leave fresh
+    -- databases and migrated ones different shapes.
+    user_id        TEXT NOT NULL,
     name           TEXT NOT NULL,    -- what the user calls this plan, e.g. "Rent"
     source         TEXT NOT NULL,
     schedule       TEXT NOT NULL,    -- JSON: cadence name + anchor moment
@@ -393,6 +477,62 @@ def _migrate_add_plan_fund_id_column(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE savings_plans ADD COLUMN fund_id TEXT")
 
 
+def _migrate_add_plan_user_column(connection: sqlite3.Connection) -> None:
+    """Add savings_plans.user_id to a database written before users existed.
+
+    The column is ``NOT NULL``, and that forces the two decisions worth setting
+    out here.
+
+    **The default.** ALTER TABLE cannot add a NOT NULL column without one, so
+    ``''`` it is - and it is the only value that keeps the backfill below total.
+    This is the corner ``_migrate_add_plan_name_column`` was pushed into before,
+    with the same consequence: a *migrated* database ends up with a default where
+    a fresh one has none. On such a database an INSERT that forgot ``user_id``
+    would write an empty string and produce a plan that no actor can ever be
+    scoped to find - a row present in the table and invisible to every query the
+    application is able to make. That is unreachable through the application,
+    because ``SavingsPlan`` refuses a plan with no owner and the repository
+    always writes one; the test that keeps it unreachable is named in the README
+    decision rather than left to trust.
+
+    **The backfill is derived, not invented.** Every plan already has an owner -
+    it is on the wallet the plan draws on - so copying it across reads a fact
+    that is already recorded rather than guessing one. The subquery cannot come
+    back empty: ``savings_plans.wallet_id`` references ``wallets(wallet_id)``
+    and ``PRAGMA foreign_keys = ON`` is set before this runs, so no plan can
+    name a wallet that does not exist. **That totality is what makes NOT NULL
+    safe here.** On a database where the reference could dangle, this UPDATE
+    would have to tolerate NULLs and the column would have to accept them - and
+    the honest design would be a nullable column plus a scheduler that refused to
+    run an ownerless plan, rather than a constraint that quietly failed.
+
+    Contrast ``_migrate_add_plan_fund_id_column``, which deliberately backfills
+    nothing: there was no recorded fact to copy, only a choice somebody would
+    have had to invent. Here there is one, and refusing to read it would leave
+    every existing plan invisible to its own owner.
+    """
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(savings_plans)")
+    }
+    if "user_id" in columns:
+        return
+
+    connection.execute(
+        "ALTER TABLE savings_plans ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"
+    )
+    connection.execute(
+        """
+        UPDATE savings_plans
+           SET user_id = (
+               SELECT wallets.user_id
+                 FROM wallets
+                WHERE wallets.wallet_id = savings_plans.wallet_id
+           )
+        """
+    )
+
+
 def _migrate_add_fund_commitment_columns(connection: sqlite3.Connection) -> None:
     """Add funds.sealed_at and funds.first_funded_at, and backfill both.
 
@@ -581,11 +721,23 @@ def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.executescript(SCHEMA)
     # Every call below is here because it changes something about a table that
-    # may *already exist*. Nothing does the same for ``plan_notices`` or
-    # ``outbound_messages``, and that absence is deliberate: ``CREATE TABLE IF
-    # NOT EXISTS`` above creates a missing table on an existing database quite
-    # happily, so a brand-new table arrives for free. Adding a table is not a
-    # migration; changing a table that is already on disk is.
+    # may *already exist*. Nothing does the same for ``users``, ``plan_notices``,
+    # ``outbound_messages``, ``password_credentials`` or ``sessions``, and that
+    # absence is deliberate: ``CREATE TABLE IF NOT EXISTS`` above creates a missing
+    # table on an existing database quite happily, so a brand-new table arrives for
+    # free. Adding a table is not a migration; changing a table that is already on
+    # disk is.
+    #
+    # ``users`` is the table that makes the distinction concrete rather than
+    # abstract: the table itself is free, but the *plan owner* column below is
+    # not, because ``savings_plans`` already exists on every database in the wild
+    # and needs a value filled in for rows that predate it.
+    #
+    # The two identity tables are the newest example of the free kind, and they
+    # are the reason Phase 2a touched no migration code at all: the password
+    # credential went into a table of its own rather than becoming three columns
+    # on ``users``, and a new table costs nothing here. That was a security
+    # decision first - see ``user.py`` - and this is the second thing it bought.
     _migrate_add_destination_column(connection)
     _migrate_add_plan_name_column(connection)
     _migrate_plan_run_due_at_to_datetime(connection)
@@ -596,6 +748,12 @@ def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     # the column it replaces.
     _migrate_add_fund_id_column(connection)
     _migrate_add_plan_fund_id_column(connection)
+    # After executescript, which is what guarantees the ``wallets`` table this
+    # reads from exists and is populated: it copies each plan's owner across
+    # from the wallet that plan draws on. See the function for why that copy is
+    # the reading of a recorded fact rather than a guess, and why the constraint
+    # it rests on is what lets the column be NOT NULL.
+    _migrate_add_plan_user_column(connection)
     # Before the migration below, and that ordering is load-bearing: the pot it
     # creates carries a NOT NULL ``sealed_at``, so the column has to exist on an
     # older database before the INSERT names it. Both of these are no-ops on a
@@ -616,6 +774,9 @@ class SqliteUnitOfWork(UnitOfWork):
         self.notices = SqlitePlanNoticeRepository(connection)
         self.notifications = SqliteNotificationRepository(connection)
         self.outbound_messages = SqliteOutboundMessageRepository(connection)
+        self.users = SqliteUserRepository(connection)
+        self.password_credentials = SqlitePasswordCredentialRepository(connection)
+        self.sessions = SqliteSessionRepository(connection)
 
     def commit(self) -> None:
         self._connection.commit()

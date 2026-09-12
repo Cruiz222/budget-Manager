@@ -17,6 +17,7 @@ from .exception import (
     InvalidPlanScheduleError,
     InvalidPlanSourceError,
     InvalidPlanStatusError,
+    InvalidPlanUserIDError,
     InvalidPlanWalletIDError,
     IrreversibleReleasePlanError,
     MixedInstructionCurrenciesError,
@@ -79,6 +80,27 @@ class SavingsPlan:
     """
 
     wallet_id: uuid.UUID
+    #: Who owns this plan - the same person who owns ``wallet_id``, recorded in
+    #: both places, and the duplication is the design rather than an oversight.
+    #:
+    #: **Why it is here at all.** The scheduler runs everybody's plans, so it has
+    #: to read wallets it does not own. ``WalletRepository`` refuses to read a
+    #: wallet without being told whose it is, which leaves a circle: the plan
+    #: names a wallet, the wallet names its owner, and the scheduler cannot load
+    #: the wallet to find out who it should ask. The owner on the plan breaks the
+    #: circle - and breaks it without a privileged method, because the scheduler
+    #: reads the plan, then reads the wallet *as the plan's owner*. There is no
+    #: bypass left to audit because there is no bypass to write.
+    #:
+    #: **What the duplication costs.** Two rows now record one fact, and they are
+    #: free to disagree. They cannot today, and the reason is narrow enough to
+    #: state plainly: nothing reassigns a plan's ``wallet_id``. There is no "move
+    #: this plan to another wallet", so the owner is exactly as fixed as the
+    #: wallet it names, the copy is made once at creation, and it never has an
+    #: occasion to drift. A future method that *does* move a plan would have to
+    #: move this field with it - and that is the moment this trade stops being
+    #: free and starts being a rule somebody has to remember.
+    user_id: uuid.UUID
     name: str
     source: PlanSource
     schedule: Schedule
@@ -267,6 +289,15 @@ class SavingsPlan:
 
         if not isinstance(self.wallet_id, uuid.UUID):
             raise InvalidPlanWalletIDError("invalid wallet id")
+
+        # Required, unlike ``fund_id``, and the difference is what an absence
+        # would mean. A plan with no pot is a plan that draws on the pool, and
+        # ``None`` says so honestly. A plan with no *owner* is not a variety of
+        # plan - it is a row no actor can ever be scoped to find, present in the
+        # table and invisible to every query the application is able to make.
+        # The store's column is NOT NULL for the same reason.
+        if not isinstance(self.user_id, uuid.UUID):
+            raise InvalidPlanUserIDError("invalid user id")
 
         # A name is not decoration. Without one, a wallet holding five plans can
         # only be read as five UUIDs, and "cancel the rent plan" stops being

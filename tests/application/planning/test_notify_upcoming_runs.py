@@ -92,17 +92,20 @@ def stored_messages(factory):
     return read(factory, lambda uow: uow.outbound_messages.pending())
 
 
-def advance_past(factory, plan_id):
+def advance_past(factory, plan):
     """Move a plan on to its next occurrence, as a successful run would.
 
     Done directly rather than by ticking, so these tests stay about the warning
     and do not quietly become tests of the scheduler.
+
+    Takes the plan rather than its id so the read is scoped to the plan's own
+    owner - the same reason every test helper in this suite does.
     """
     uow = factory.start()
     try:
-        plan = uow.plans.get_by_id(plan_id)
-        plan.record_run()
-        uow.plans.save(plan)
+        stored = uow.plans.get_owned(plan.plan_id, plan.user_id)
+        stored.record_run()
+        uow.plans.save(stored)
         uow.commit()
     except BaseException:
         uow.rollback()
@@ -285,7 +288,7 @@ class TestItDoesNotRepeat:
         notifier, factory = build_notifier(tmp_path)
         seed(factory, [(wallet, plan)])
         assert len(notifier.execute(datetime(2026, 4, 2, 11, 30))) == 1
-        advance_past(factory, plan.plan_id)
+        advance_past(factory, plan)
 
         raised = notifier.execute(datetime(2026, 5, 2, 11, 30))
 
@@ -369,7 +372,7 @@ class TestItIsNotAGate:
         seed(factory, [(wallet, plan)])
 
         notifier.execute(HALF_PAST_ELEVEN)
-        run = ExecutePlanRun(factory).execute(plan.plan_id, NOON)
+        run = ExecutePlanRun(factory, actor=plan.user_id).execute(plan.plan_id, NOON)
 
         assert run.status is RunStatus.SUCCEEDED
         assert run.due_at == NOON
@@ -390,7 +393,7 @@ class TestItIsNotAGate:
         seed(factory, [(wallet, plan)])
 
         # Never ticked inside the window. Straight to the due moment.
-        run = ExecutePlanRun(factory).execute(plan.plan_id, NOON)
+        run = ExecutePlanRun(factory, actor=plan.user_id).execute(plan.plan_id, NOON)
 
         assert run.status is RunStatus.SUCCEEDED
         assert stored_notices(factory, plan.plan_id) == []
@@ -410,7 +413,7 @@ class TestItIsNotAGate:
         seed(factory, [(wallet, plan)])
 
         notifier.execute(HALF_PAST_ELEVEN)
-        run = ExecutePlanRun(factory).execute(plan.plan_id, NOON)
+        run = ExecutePlanRun(factory, actor=plan.user_id).execute(plan.plan_id, NOON)
 
         assert run.status is RunStatus.BLOCKED
         assert run.reason is RunBlockReason.INSUFFICIENT_BALANCE
@@ -533,7 +536,7 @@ class TestItQueuesTheMessage:
         notifier, factory = build_notifier(tmp_path)
         seed(factory, [(wallet, plan)])
         notifier.execute(datetime(2026, 4, 2, 11, 30))
-        advance_past(factory, plan.plan_id)
+        advance_past(factory, plan)
 
         notifier.execute(datetime(2026, 5, 2, 11, 30))
 

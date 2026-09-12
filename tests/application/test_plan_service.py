@@ -34,10 +34,16 @@ from app.domain.planning.schedule import Schedule
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
+from tests.conftest import TEST_USER_ID
 
 NGN = Currency.NGN
 USD = Currency.USD
 ANCHOR = datetime(2026, 1, 1)
+
+#: The user every service in this file acts as - the same one ``build_wallet``
+#: and ``build_plan`` give their objects, so a wallet or plan built by a fixture
+#: is reachable from here. See ``test_wallet_service.ACTOR``.
+ACTOR = TEST_USER_ID
 
 DESTINATION = Destination(
     kind=DestinationKind.BANK_ACCOUNT,
@@ -49,7 +55,7 @@ DESTINATION = Destination(
 
 def build_service(tmp_path, name="plan_service.db"):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / name))
-    return PlanService(factory), factory
+    return PlanService(factory, actor=ACTOR), factory
 
 
 def save_wallet(factory, wallet):
@@ -74,7 +80,7 @@ def stored_wallet(factory, wallet_id):
     """
     uow = factory.start()
     try:
-        return uow.wallets.get_by_id(wallet_id)
+        return uow.wallets.get_owned(wallet_id, ACTOR)
     finally:
         uow.rollback()
 
@@ -110,7 +116,7 @@ def open_pot(factory, wallet_id, name="Savings"):
     """
     uow = factory.start()
     try:
-        wallet = uow.wallets.get_by_id(wallet_id)
+        wallet = uow.wallets.get_owned(wallet_id, ACTOR)
         if not any(fund.name == name for fund in wallet.funds):
             wallet.open_fund(name, FundKind.PERSONAL, as_of=ANCHOR)
         uow.wallets.save(wallet)

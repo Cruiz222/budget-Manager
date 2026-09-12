@@ -79,9 +79,18 @@ class WalletService:
     def __init__(
         self,
         unit_of_work_factory: UnitOfWorkFactory,
+        *,
+        actor: UUID,
         recipient: str | None = None,
     ):
         self._unit_of_work_factory = unit_of_work_factory
+        # Who this service acts for, for every method it has. Required and
+        # keyword-only, so each construction site has to answer the question
+        # rather than inherit silence - and note that there is no default to
+        # inherit, because ``WalletRepository`` has no owner-less read left for a
+        # forgotten actor to fall into. A service built for the wrong user can
+        # read nothing of the right one's.
+        self._actor = actor
         # ``None`` means this installation has no notification address, which is
         # the ordinary state of a fresh install rather than an error: every
         # operation behaves exactly as it would otherwise and simply says nothing
@@ -172,7 +181,7 @@ class WalletService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            wallet = uow.wallets.get_by_id(wallet_id)
+            wallet = self._wallet(uow, wallet_id)
             fund = wallet.open_fund(name, kind, maturity_date, as_of)
             uow.wallets.save(wallet)
             uow.commit()
@@ -198,7 +207,7 @@ class WalletService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            wallet = uow.wallets.get_by_id(wallet_id)
+            wallet = self._wallet(uow, wallet_id)
             fund = wallet.fund_by_name(name)
             wallet.extend_fund(fund.fund_id, new_date, as_of)
             uow.wallets.save(wallet)
@@ -282,7 +291,7 @@ class WalletService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            return list(uow.wallets.get_by_id(wallet_id).funds)
+            return list(self._wallet(uow, wallet_id).funds)
         finally:
             uow.rollback()
 
@@ -295,17 +304,24 @@ class WalletService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            return uow.wallets.get_by_id(wallet_id)
+            return self._wallet(uow, wallet_id)
         finally:
             uow.rollback()
 
-    def open_wallet(self, user_id: UUID, currency: Currency) -> Wallet:
-        """Open a new empty wallet for a user, in the given currency."""
+    def open_wallet(self, currency: Currency) -> Wallet:
+        """Open a new empty wallet for this service's actor, in the given currency.
+
+        The owner is not a parameter. It used to be - ``open_wallet(user_id,
+        currency)`` - and the argument was the one place a caller could have
+        named somebody else, so it is gone: the wallet is opened for whoever this
+        service acts for, and there is no longer a spelling that opens one for
+        anybody else.
+        """
         uow = self._unit_of_work_factory.start()
         try:
             wallet = Wallet(
                 wallet_id=uuid4(),
-                user_id=user_id,
+                user_id=self._actor,
                 status=WalletStatus.ACTIVE,
                 _available_balance=Money(Decimal("0"), currency),
                 currency=currency,
@@ -327,7 +343,7 @@ class WalletService:
         try:
             # Validate the wallet exists so "unknown wallet" and "no activity
             # yet" are distinguishable to the caller.
-            uow.wallets.get_by_id(wallet_id)
+            self._wallet(uow, wallet_id)
             return uow.transactions.get_by_wallet_id(wallet_id)
         finally:
             uow.rollback()
@@ -348,7 +364,7 @@ class WalletService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            wallet = uow.wallets.get_by_id(wallet_id)
+            wallet = self._wallet(uow, wallet_id)
             transition(wallet)
             uow.wallets.save(wallet)
             uow.commit()
@@ -356,6 +372,21 @@ class WalletService:
         except BaseException:
             uow.rollback()
             raise
+
+    def _wallet(self, uow: UnitOfWork, wallet_id: UUID) -> Wallet:
+        """The wallet this service's actor owns, or ``WalletNotFoundError``.
+
+        **The single door every wallet read in this class goes through**, and
+        that is what makes the actor impossible to forget: there is no other way
+        to reach a wallet from here, and the repository behind this call cannot
+        return one belonging to somebody else. Adding a method later means
+        reaching for this helper, because the alternative no longer exists.
+
+        A wallet belonging to another user and a wallet that does not exist raise
+        the same error, so no caller here can tell the two apart - which is the
+        point rather than a side effect. See ``WalletRepository.get_owned``.
+        """
+        return uow.wallets.get_owned(wallet_id, self._actor)
 
     def _run(
         self,
@@ -377,7 +408,7 @@ class WalletService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            wallet = uow.wallets.get_by_id(wallet_id)
+            wallet = self._wallet(uow, wallet_id)
             operation: WalletOperation = operation_cls(
                 wallet, uow.transactions, **extra
             )

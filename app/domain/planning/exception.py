@@ -84,6 +84,10 @@ class InvalidPlanWalletIDError(PlanError):
     pass
 
 
+class InvalidPlanUserIDError(PlanError):
+    pass
+
+
 class InvalidPlanSourceError(PlanError):
     pass
 

@@ -19,8 +19,14 @@ from app.domain.planning.planStatus import PlanStatus
 from app.domain.planning.runBlockReason import RunBlockReason
 from app.domain.planning.runStatus import RunStatus
 from app.infrastructure.persistence.sqlite_unit_of_work import SqliteUnitOfWorkFactory
+from tests.conftest import TEST_USER_ID
 
 NGN = Currency.NGN
+
+#: The user this file's executors act as - the same one ``build_wallet`` and
+#: ``build_plan`` give their objects, so a plan built by a fixture can be read
+#: and run by an executor built here. See ``test_wallet_service.ACTOR``.
+ACTOR = TEST_USER_ID
 
 #: Where a run's receipt is addressed. Passed in rather than read from the
 #: environment, because ``ExecutePlanRun`` takes its inputs as arguments -
@@ -57,7 +63,7 @@ def release(amount: str, label: str = "emergency") -> Instruction:
 
 def build_executor(tmp_path, name="plans.db", recipient=None):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / name))
-    return ExecutePlanRun(factory, recipient=recipient), factory
+    return ExecutePlanRun(factory, recipient=recipient, actor=ACTOR), factory
 
 
 def seed(factory, wallet, plan):
@@ -81,11 +87,11 @@ def read(factory, accessor):
 
 
 def wallet_after(factory, wallet_id):
-    return read(factory, lambda uow: uow.wallets.get_by_id(wallet_id))
+    return read(factory, lambda uow: uow.wallets.get_owned(wallet_id, ACTOR))
 
 
 def plan_after(factory, plan_id):
-    return read(factory, lambda uow: uow.plans.get_by_id(plan_id))
+    return read(factory, lambda uow: uow.plans.get_owned(plan_id, ACTOR))
 
 
 def runs_of(factory, plan_id):
@@ -149,7 +155,7 @@ def top_up_locked(factory, wallet_id, amount):
     """
     uow = factory.start()
     try:
-        wallet = uow.wallets.get_by_id(wallet_id)
+        wallet = uow.wallets.get_owned(wallet_id, ACTOR)
         wallet.apply_deposit(Money(Decimal(amount), NGN))
         wallet.lock_into_fund(
             wallet.fund_by_name("Locked").fund_id, Money(Decimal(amount), NGN), ANCHOR
@@ -164,7 +170,7 @@ def top_up_locked(factory, wallet_id, amount):
 def resume(factory, plan_id):
     uow = factory.start()
     try:
-        plan = uow.plans.get_by_id(plan_id)
+        plan = uow.plans.get_owned(plan_id, ACTOR)
         plan.resume()
         uow.plans.save(plan)
         uow.commit()
@@ -1402,12 +1408,16 @@ class TestNoPayoutWithoutAReceipt:
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         factory = SqliteUnitOfWorkFactory(str(tmp_path / "exploding.db"))
         seed(factory, wallet, plan)
-        executor = ExecutePlanRun(ExplodingCommitFactory(factory), recipient=RECIPIENT)
+        executor = ExecutePlanRun(
+            ExplodingCommitFactory(factory), recipient=RECIPIENT, actor=ACTOR
+        )
 
         with pytest.raises(RuntimeError, match="commit failed"):
             executor.execute(plan.plan_id, ANCHOR)
 
-        after = read(factory, lambda uow: uow.wallets.get_by_id(wallet.wallet_id))
+        after = read(
+            factory, lambda uow: uow.wallets.get_owned(wallet.wallet_id, ACTOR)
+        )
         assert notifications_of(factory) == []
         assert runs_of(factory, plan.plan_id) == []
         assert ledger_of(factory, wallet.wallet_id) == []
@@ -1427,7 +1437,9 @@ class TestNoPayoutWithoutAReceipt:
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         factory = SqliteUnitOfWorkFactory(str(tmp_path / "exploding.db"))
         seed(factory, wallet, plan)
-        executor = ExecutePlanRun(ExplodingCommitFactory(factory), recipient=RECIPIENT)
+        executor = ExecutePlanRun(
+            ExplodingCommitFactory(factory), recipient=RECIPIENT, actor=ACTOR
+        )
 
         with pytest.raises(RuntimeError, match="commit failed"):
             executor.execute(plan.plan_id, ANCHOR)
@@ -1448,12 +1460,14 @@ class TestNoPayoutWithoutAReceipt:
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
         factory = SqliteUnitOfWorkFactory(str(tmp_path / "recovered.db"))
         seed(factory, wallet, plan)
-        broken = ExecutePlanRun(ExplodingCommitFactory(factory), recipient=RECIPIENT)
+        broken = ExecutePlanRun(
+            ExplodingCommitFactory(factory), recipient=RECIPIENT, actor=ACTOR
+        )
 
         with pytest.raises(RuntimeError):
             broken.execute(plan.plan_id, ANCHOR)
 
-        working = ExecutePlanRun(factory, recipient=RECIPIENT)
+        working = ExecutePlanRun(factory, recipient=RECIPIENT, actor=ACTOR)
         paid = working.execute(plan.plan_id, ANCHOR)
 
         assert paid.status is RunStatus.SUCCEEDED

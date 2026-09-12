@@ -6,6 +6,7 @@ import pytest
 from app.application.planning.execute_plan_run import ExecutePlanRun
 from app.application.planning.run_due_plans import RunDuePlans
 from app.domain.money.currency import Currency
+from app.domain.money.exception import WalletNotFoundError
 from app.domain.money.money import Money
 from app.domain.planning.planStatus import PlanStatus
 from app.domain.planning.runBlockReason import RunBlockReason
@@ -17,8 +18,23 @@ ANCHOR = datetime(2026, 1, 1)
 
 
 def build_scheduler(tmp_path, name="scheduler.db"):
+    """A tick over its own database, with a per-plan executor builder.
+
+    The builder is the whole of the ownership story at this level: the tick hands
+    it a user id and gets back an executor acting as that user, so a plan is
+    always run by an executor built for its own owner. There is no single
+    long-lived executor here to be granted authority over everybody - which is
+    what makes ``RunDuePlans`` free of privilege rather than merely free of the
+    word.
+    """
     factory = SqliteUnitOfWorkFactory(str(tmp_path / name))
-    return RunDuePlans(factory, ExecutePlanRun(factory)), factory
+    return (
+        RunDuePlans(
+            factory,
+            lambda user_id: ExecutePlanRun(factory, actor=user_id),
+        ),
+        factory,
+    )
 
 
 def seed(factory, plans_and_wallets):
@@ -46,12 +62,45 @@ def read(factory, accessor):
         uow.rollback()
 
 
-def wallet_after(factory, wallet_id):
-    return read(factory, lambda uow: uow.wallets.get_by_id(wallet_id))
+def wallet_after(factory, wallet):
+    """Read a wallet back as its own owner - which is the only way there is."""
+    return read(
+        factory, lambda uow: uow.wallets.get_owned(wallet.wallet_id, wallet.user_id)
+    )
 
 
-def plan_after(factory, plan_id):
-    return read(factory, lambda uow: uow.plans.get_by_id(plan_id))
+def plan_after(factory, plan):
+    return read(factory, lambda uow: uow.plans.get_owned(plan.plan_id, plan.user_id))
+
+
+def explode_when_running(scheduler, plan_id, monkeypatch):
+    """Make the executor built for a plan raise when it is asked to run it.
+
+    Written against the *builder* rather than against an executor, because there
+    is no longer one executor to reach for: the tick mints a fresh one per plan
+    from the factory it was given. Wrapping the factory keeps the test's shape
+    the same as it always was - one plan in the batch raises, the tick does not
+    finish - and it is worth noticing that the indirection is what the ownership
+    rule costs here. There is no shared object left whose ``execute`` could be
+    monkeypatched once for the whole tick.
+    """
+    build = scheduler._build_execute_plan_run
+
+    def build_with_a_failing_plan(user_id):
+        executor = build(user_id)
+        real_execute = executor.execute
+
+        def execute(requested, as_of):
+            if requested == plan_id:
+                raise RuntimeError("simulated infrastructure failure")
+            return real_execute(requested, as_of)
+
+        executor.execute = execute
+        return executor
+
+    monkeypatch.setattr(
+        scheduler, "_build_execute_plan_run", build_with_a_failing_plan
+    )
 
 
 class TestTicking:
@@ -113,7 +162,7 @@ class TestClearingABacklog:
         runs = scheduler.execute(datetime(2026, 4, 15))
 
         assert [run.due_at for run in runs] == [ANCHOR]
-        assert plan_after(factory, plan.plan_id).completed_runs == 1
+        assert plan_after(factory, plan).completed_runs == 1
 
     def test_successive_ticks_work_through_the_backlog(
         self, build_wallet, build_plan, tmp_path
@@ -163,7 +212,7 @@ class TestBlockedPlansStopBeingRetried:
 
         assert first[0].reason is RunBlockReason.INSUFFICIENT_BALANCE
         assert second == []
-        assert plan_after(factory, plan.plan_id).status is PlanStatus.PAUSED
+        assert plan_after(factory, plan).status is PlanStatus.PAUSED
 
 
 class TestTheTransactionBoundary:
@@ -186,23 +235,16 @@ class TestTheTransactionBoundary:
         # good is seeded first, so list_by_status returns it first.
         seed(factory, [(good_wallet, good), (bad_wallet, bad)])
 
-        real_execute = scheduler._execute_plan_run.execute
-
-        def explode(plan_id, as_of):
-            if plan_id == bad.plan_id:
-                raise RuntimeError("simulated infrastructure failure")
-            return real_execute(plan_id, as_of)
-
-        monkeypatch.setattr(scheduler._execute_plan_run, "execute", explode)
+        explode_when_running(scheduler, bad.plan_id, monkeypatch)
 
         with pytest.raises(RuntimeError):
             scheduler.execute(ANCHOR)
 
         # The good plan's payout is durable, despite the tick never finishing.
-        assert wallet_after(factory, good_wallet.wallet_id).locked_balance == Money(
+        assert wallet_after(factory, good_wallet).locked_balance == Money(
             Decimal("8000"), NGN
         )
-        assert plan_after(factory, good.plan_id).completed_runs == 1
+        assert plan_after(factory, good).completed_runs == 1
 
     def test_the_failed_plan_left_nothing_behind(
         self, build_wallet, build_plan, tmp_path, monkeypatch
@@ -214,19 +256,85 @@ class TestTheTransactionBoundary:
         scheduler, factory = build_scheduler(tmp_path)
         seed(factory, [(good_wallet, good), (bad_wallet, bad)])
 
-        real_execute = scheduler._execute_plan_run.execute
-
-        def explode(plan_id, as_of):
-            if plan_id == bad.plan_id:
-                raise RuntimeError("simulated infrastructure failure")
-            return real_execute(plan_id, as_of)
-
-        monkeypatch.setattr(scheduler._execute_plan_run, "execute", explode)
+        explode_when_running(scheduler, bad.plan_id, monkeypatch)
 
         with pytest.raises(RuntimeError):
             scheduler.execute(ANCHOR)
 
-        assert wallet_after(factory, bad_wallet.wallet_id).locked_balance == Money(
+        assert wallet_after(factory, bad_wallet).locked_balance == Money(
             Decimal("10000"), NGN
         )
-        assert plan_after(factory, bad.plan_id).completed_runs == 0
+        assert plan_after(factory, bad).completed_runs == 0
+
+
+class TestTheSchedulerIsNotAPrivilegedActor:
+    """The load-bearing test for the whole phase, at the layer where it is hardest.
+
+    A tick serves every user in the installation, so it is the one caller that
+    cannot be built for a single actor - and the tempting answer, the one most
+    systems take, is to give it an authority of its own: a system user, a skipped
+    check, a flag that says "this read is internal". Every one of those is a
+    bypass, and a bypass is a thing that exists at runtime whether or not anyone
+    currently calls it.
+
+    So the design gives the tick no authority at all. It reads plans across the
+    installation - which is *discovery*, and returns each plan with its owner -
+    and then builds one executor per plan, acting as that plan's user. This test
+    is what holds that in place: two users, both plans due, one tick. It fails if
+    the executor stops being built per plan, and it fails if any read inside the
+    run stops being scoped - because a mis-scoped read is not a wrong answer
+    here, it is a plan that cannot be found.
+    """
+
+    def test_two_users_plans_both_run_from_one_tick(
+        self, build_wallet, build_plan, tmp_path, actor, stranger
+    ):
+        first_wallet = build_wallet(locked="10000", user_id=actor)
+        second_wallet = build_wallet(locked="10000", user_id=stranger)
+        first = build_plan(wallet_id=first_wallet.wallet_id, user_id=actor)
+        second = build_plan(wallet_id=second_wallet.wallet_id, user_id=stranger)
+        scheduler, factory = build_scheduler(tmp_path)
+        seed(factory, [(first_wallet, first), (second_wallet, second)])
+
+        runs = scheduler.execute(ANCHOR)
+
+        assert {run.plan_id for run in runs} == {first.plan_id, second.plan_id}
+        assert all(run.status is RunStatus.SUCCEEDED for run in runs)
+        # Each wallet paid out of its own balance: the second plan's run read the
+        # second user's wallet, not the first's, and there was never an executor
+        # that could have reached either one without naming its owner.
+        assert wallet_after(factory, first_wallet).locked_balance == Money(
+            Decimal("8000"), NGN
+        )
+        assert wallet_after(factory, second_wallet).locked_balance == Money(
+            Decimal("8000"), NGN
+        )
+
+    def test_a_plan_whose_owner_is_not_its_wallets_owner_is_not_run(
+        self, build_wallet, build_plan, tmp_path, actor, stranger
+    ):
+        """The denormalized ``user_id`` is checked by the read, not trusted.
+
+        ``savings_plans.user_id`` duplicates ``wallets.user_id`` deliberately, and
+        a duplicate can disagree with its original. This is the state where it
+        does: the plan claims a different owner from the wallet it draws on. The
+        tick builds an executor as the plan's owner, that executor reads the
+        wallet scoped to itself, and the wallet is not there.
+
+        What it *does* mean is that no money moves and no run is recorded, which
+        is the safe half. What it does not mean is that anything repairs the
+        disagreement - there is no code that would. The value of asserting it is
+        that the failure mode is loud and attributable rather than a run that
+        pays out of a wallet belonging to somebody the plan does not name.
+        """
+        wallet = build_wallet(locked="10000", user_id=actor)
+        plan = build_plan(wallet_id=wallet.wallet_id, user_id=stranger)
+        scheduler, factory = build_scheduler(tmp_path)
+        seed(factory, [(wallet, plan)])
+
+        with pytest.raises(WalletNotFoundError):
+            scheduler.execute(ANCHOR)
+
+        assert wallet_after(factory, wallet).locked_balance == Money(
+            Decimal("10000"), NGN
+        )

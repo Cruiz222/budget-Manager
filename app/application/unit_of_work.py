@@ -5,9 +5,14 @@ from app.domain.repositories.outbound_message_repository import (
     OutboundMessageRepository,
 )
 from app.domain.repositories.plan_notice_repository import PlanNoticeRepository
+from app.domain.repositories.password_credential_repository import (
+    PasswordCredentialRepository,
+)
 from app.domain.repositories.plan_run_repository import PlanRunRepository
 from app.domain.repositories.savings_plan_repository import SavingsPlanRepository
+from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.transaction_repository import TransactionRepository
+from app.domain.repositories.user_repository import UserRepository
 from app.domain.repositories.wallet_repository import WalletRepository
 
 
@@ -61,6 +66,25 @@ class UnitOfWork(ABC):
     notices: PlanNoticeRepository
     outbound_messages: OutboundMessageRepository
     notifications: NotificationRepository
+    #: Convenience, like ``notices``, and one of the two repositories here whose
+    #: reads are not scoped to an actor - because it is where an actor comes
+    #: from. See ``UserRepository`` for why that is the shape of the problem
+    #: rather than a gap in the rule.
+    users: UserRepository
+    #: Correctness, not convenience, and the newest member of that small group:
+    #: signing up writes a user *and* this row, and they must land together. A
+    #: user with no credential is an account nobody can ever log into, and the
+    #: failure would be invisible - the sign-up would have reported success, and
+    #: the address would already be taken, so the person could neither log in nor
+    #: try again. See ``PasswordCredentialRepository``.
+    password_credentials: PasswordCredentialRepository
+    #: Convenience, and the second of the two unscoped repositories above.
+    #: ``sessions`` is unscoped for the same reason ``users`` is, which is worth
+    #: stating because it is the thing that makes both look like mistakes: a
+    #: session is looked up *before* the caller is known, because looking it up
+    #: is how they become known. Asking a session who it belongs to cannot
+    #: require already knowing the answer. See ``SessionRepository``.
+    sessions: SessionRepository
 
     @abstractmethod
     def commit(self) -> None:

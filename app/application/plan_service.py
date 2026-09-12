@@ -7,8 +7,9 @@ and commits or rolls back as one transaction.
 import uuid
 from datetime import date
 
-from app.application.unit_of_work import UnitOfWorkFactory
+from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from app.domain.money.exception import CurrencyMismatchError
+from app.domain.money.wallet import Wallet
 from app.domain.planning.exception import (
     MissingPlanFundError,
     SavingsPlanNotFoundError,
@@ -37,8 +38,15 @@ class PlanService:
     on the same unit. See ``UnitOfWork``.
     """
 
-    def __init__(self, unit_of_work_factory: UnitOfWorkFactory):
+    def __init__(
+        self, unit_of_work_factory: UnitOfWorkFactory, *, actor: uuid.UUID
+    ):
         self._unit_of_work_factory = unit_of_work_factory
+        # Who this service acts for, for every method it has. Required and
+        # keyword-only, for the reason ``WalletService`` gives - and here it
+        # scopes plans as well as wallets, so a service built for one user can
+        # neither read nor steer another's.
+        self._actor = actor
 
     # --- creating -----------------------------------------------------------
 
@@ -128,7 +136,7 @@ class PlanService:
 
         uow = self._unit_of_work_factory.start()
         try:
-            wallet = uow.wallets.get_by_id(wallet_id)
+            wallet = self._wallet(uow, wallet_id)
 
             # Raises FundNotFoundError for a pot this wallet does not have.
             fund_id = None
@@ -137,6 +145,7 @@ class PlanService:
 
             plan = SavingsPlan(
                 wallet_id=wallet_id,
+                user_id=self._actor,
                 name=name,
                 source=source,
                 schedule=schedule,
@@ -167,7 +176,7 @@ class PlanService:
         """Read one plan. Absence raises SavingsPlanNotFoundError."""
         uow = self._unit_of_work_factory.start()
         try:
-            return uow.plans.get_by_id(plan_id)
+            return self._plan(uow, plan_id)
         finally:
             uow.rollback()
 
@@ -177,11 +186,19 @@ class PlanService:
         The wallet itself is validated first, so "no such wallet" and "a wallet
         with no plans yet" are distinguishable - the same distinction
         ``transactions_for_wallet`` makes, for the same reason.
+
+        That first call is also the **ownership proof** for the list that
+        follows, and the second call is scoped in its own right rather than
+        leaning on it. The pair is not redundant: the proof is what makes the
+        answer correct - it is how a wallet with no plans is told from a wallet
+        that is not yours, which now raise different errors - and the filter is
+        what makes it safe, so a caller who forgets the proof still cannot read a
+        stranger's plans.
         """
         uow = self._unit_of_work_factory.start()
         try:
-            uow.wallets.get_by_id(wallet_id)
-            return uow.plans.get_by_wallet_id(wallet_id)
+            self._wallet(uow, wallet_id)
+            return uow.plans.get_by_wallet_id(wallet_id, self._actor)
         finally:
             uow.rollback()
 
@@ -193,7 +210,7 @@ class PlanService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            uow.plans.get_by_id(plan_id)
+            self._plan(uow, plan_id)
             return uow.plan_runs.list_by_plan_id(plan_id)
         finally:
             uow.rollback()
@@ -233,6 +250,27 @@ class PlanService:
 
         return self._apply(plan_id, edit)
 
+    def _wallet(self, uow: UnitOfWork, wallet_id: uuid.UUID) -> Wallet:
+        """The wallet this service's actor owns, or ``WalletNotFoundError``.
+
+        The same single door ``WalletService`` routes every read through. Here it
+        appears twice and each time proves something different: in
+        ``create_plan`` it is what stops a plan being created against a stranger's
+        wallet, and in ``plans_for_wallet`` it is what tells "no such wallet" from
+        "wallet with no plans".
+        """
+        return uow.wallets.get_owned(wallet_id, self._actor)
+
+    def _plan(self, uow: UnitOfWork, plan_id: uuid.UUID) -> SavingsPlan:
+        """The plan this service's actor owns, or ``SavingsPlanNotFoundError``.
+
+        Every read and every steering method starts here, so ``pause_plan`` on a
+        stranger's plan is not refused - it is a plan that does not exist, which
+        is the same answer ``get_plan`` gives and the same answer a plan that was
+        never created gives.
+        """
+        return uow.plans.get_owned(plan_id, self._actor)
+
     def _apply(self, plan_id: uuid.UUID, transition) -> SavingsPlan:
         """Load a plan, apply a change, persist it atomically.
 
@@ -242,7 +280,7 @@ class PlanService:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            plan = uow.plans.get_by_id(plan_id)
+            plan = self._plan(uow, plan_id)
             transition(plan)
             uow.plans.save(plan)
             uow.commit()

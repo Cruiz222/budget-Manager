@@ -34,13 +34,13 @@ def build_repository():
     return SqliteWalletRepository(open_sqlite_connection(":memory:"))
 
 
-def test_save_and_get_by_id_round_trips_the_wallet(build_wallet):
+def test_save_and_get_owned_round_trips_the_wallet(build_wallet):
     wallet = build_wallet()
     repository = build_repository()
 
     repository.save(wallet)
 
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
     assert stored.wallet_id == wallet.wallet_id
     assert stored.user_id == wallet.user_id
     assert stored.status is WalletStatus.ACTIVE
@@ -57,15 +57,39 @@ def test_save_overwrites_an_existing_wallet(build_wallet):
     wallet.apply_deposit(Money(Decimal("5000"), NGN))
     repository.save(wallet)
 
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
     assert stored.available_balance == Money(Decimal("15000"), NGN)
 
 
-def test_get_by_id_of_missing_wallet_raises():
+def test_get_owned_of_a_missing_wallet_raises(actor):
     repository = build_repository()
 
     with pytest.raises(WalletNotFoundError):
-        repository.get_by_id(uuid4())
+        repository.get_owned(uuid4(), actor)
+
+
+def test_get_owned_of_a_foreign_wallet_raises_not_found(build_wallet, actor, stranger):
+    """A wallet owned by someone else is not found, exactly as if it were absent.
+
+    The pair of tests - this one and the one above - is the whole point, and they
+    have to be read together. Here a real, savable, entirely valid wallet exists
+    and the asker names it by its correct id, and the answer is
+    ``WalletNotFoundError``: the same error the test above gets for an id that was
+    never used.
+
+    Nothing in this class distinguishes the two, and that is deliberate rather
+    than incidental. The repository has one ``raise`` and no branch between the
+    cases, so there is no code path that could leak "this exists, but not for
+    you" - and a caller who could tell the difference could enumerate other
+    people's wallet ids one guess at a time, learning from each refusal that the
+    guess was right.
+    """
+    wallet = build_wallet(user_id=stranger)
+    repository = build_repository()
+    repository.save(wallet)
+
+    with pytest.raises(WalletNotFoundError):
+        repository.get_owned(wallet.wallet_id, actor)
 
 
 # --- pots ------------------------------------------------------------------
@@ -86,7 +110,7 @@ def test_a_wallets_pots_round_trip(build_wallet):
     repository = build_repository()
 
     repository.save(wallet)
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
 
     assert [fund.name for fund in stored.funds] == ["Vacation", "Float"]
     assert [fund.kind for fund in stored.funds] == [
@@ -110,7 +134,7 @@ def test_a_pots_identity_survives_the_database(build_wallet):
     repository = build_repository()
 
     repository.save(wallet)
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
 
     assert stored.fund_by_name("Vacation").fund_id == fund.fund_id
 
@@ -129,7 +153,7 @@ def test_pots_come_back_in_the_order_they_were_opened(build_wallet):
     repository = build_repository()
 
     repository.save(wallet)
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
 
     assert [fund.name for fund in stored.funds] == ["First", "Second", "Third"]
 
@@ -149,7 +173,7 @@ def test_saving_again_does_not_duplicate_pots(build_wallet):
 
     wallet.deposit_into_fund(wallet.fund_by_name("Vacation").fund_id, ngn("500"), MOMENT)
     repository.save(wallet)
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
 
     assert len(stored.funds) == 1
     assert stored.funds[0].balance == ngn("500")
@@ -173,9 +197,10 @@ def test_a_pot_removed_from_the_aggregate_is_removed_from_the_database(build_wal
     wallet._funds = tuple(fund for fund in wallet.funds if fund.name == "Salary")
     repository.save(wallet)
 
-    assert [fund.name for fund in repository.get_by_id(wallet.wallet_id).funds] == [
-        "Salary"
-    ]
+    assert [
+        fund.name
+        for fund in repository.get_owned(wallet.wallet_id, wallet.user_id).funds
+    ] == ["Salary"]
 
 
 def test_a_wallet_with_no_pots_round_trips_as_no_pots(build_wallet):
@@ -183,7 +208,7 @@ def test_a_wallet_with_no_pots_round_trips_as_no_pots(build_wallet):
     repository = build_repository()
 
     repository.save(wallet)
-    stored = repository.get_by_id(wallet.wallet_id)
+    stored = repository.get_owned(wallet.wallet_id, wallet.user_id)
 
     assert stored.funds == ()
     assert stored.locked_balance == ngn("0")

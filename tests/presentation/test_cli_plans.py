@@ -18,11 +18,32 @@ from app.application.notifications.deliver_pending_messages import (
 )
 from app.presentation import cli
 from app.presentation.cli import main
+from tests.conftest import session_path_for, signed_in
+
+
+@pytest.fixture(autouse=True)
+def signed_in_cli(tmp_path):
+    """Start every test in this file signed in as the suite's standard user.
+
+    The same precondition as the fixture of that name in the other two CLI test
+    modules, written out in each so that a module reads on its own.
+
+    Note what it deliberately does *not* do for the ``plan tick`` tests below:
+    a tick is dispatched before any actor is resolved, so it never reads this file.
+    Those tests are unaffected by its presence, and the one test that asserts a
+    tick runs with no session at all deletes it - which is a stronger claim than
+    running on a machine that never had one.
+    """
+    return signed_in(str(tmp_path / "cli.db"))
 
 
 def run(db_path, *argv):
-    """Invoke the CLI in-process against the given database file."""
-    return main(["--db", db_path, *argv])
+    """Invoke the CLI in-process against the given database file.
+
+    ``--session`` travels with ``--db`` - see the fixture above, which is what puts
+    a token at that path.
+    """
+    return main(["--db", db_path, "--session", session_path_for(db_path), *argv])
 
 
 def install_deliverer(monkeypatch, channel):
@@ -739,7 +760,7 @@ class TestTheWarningIsDelivered:
         """No mail account is a normal install, not a broken one.
 
         The environment is cleared for every test by the suite's
-        ``no_notification_environment`` fixture, which is what makes this
+        ``no_settings_environment`` fixture, which is what makes this
         assertion independent of how the machine running it is configured.
         """
         db = str(tmp_path / "cli.db")

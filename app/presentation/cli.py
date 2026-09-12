@@ -4,10 +4,30 @@ The presentation layer's only job is to translate user intent into calls on the
 application service and render the result. It touches the services built by the
 composition root - never repositories, never the Unit of Work.
 
-Run from the repo root:
+**Every wallet command runs as somebody, and that somebody is proved by a
+token.** The CLI is a client of its own accounts rather than a privileged
+operator of them: it registers with ``signup``, obtains a token with ``login``,
+keeps that token in a file, and presents it on every command that reads or moves
+money. There is no flag that names a user, because a flag would be an assertion
+and an assertion is what a session replaced.
 
+    .venv/bin/python -m app.presentation.cli --db budget.db signup ada@example.com
+    .venv/bin/python -m app.presentation.cli --db budget.db login ada@example.com
     .venv/bin/python -m app.presentation.cli --db budget.db open --currency NGN
     .venv/bin/python -m app.presentation.cli --db budget.db deposit <wallet_id> 5000
+    .venv/bin/python -m app.presentation.cli --db budget.db logout
+
+The password is asked for, never passed as an argument: an argument lands in the
+shell's history file and in ``ps`` output where anyone on the machine can read
+it. Nothing else about the token is hidden - it lives in a file the user owns,
+at ``--session``, defaulting to ``$BUDGET_SESSION`` or
+``~/.config/budget/session``, created ``0600``.
+
+``plan tick`` is the one command that runs as nobody, and it is worth knowing
+why: it serves every user with a plan, so there is no person it could act as, and
+a scheduler that needed one would need a privileged account to run under - which
+is exactly the seat this arrangement removes. It therefore works with no session
+at all, on a machine where nobody has ever logged in.
 
     .venv/bin/python -m app.presentation.cli --db budget.db plan create \\
         --wallet <wallet_id> --name "Salary 2026" \\
@@ -95,6 +115,8 @@ slow costs latency and never correctness.
 """
 
 import argparse
+import getpass
+import os
 import sys
 import uuid
 from datetime import date, datetime, time, timedelta
@@ -104,12 +126,17 @@ from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
     build_deliverer,
+    build_log_in,
+    build_log_out,
     build_notification_deliverer,
     build_notifier,
     build_plan_service,
+    build_resolve_actor,
     build_scheduler,
+    build_sign_up,
     build_wallet_service,
 )
+from app.domain.identity.user import User
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
@@ -130,9 +157,11 @@ from app.domain.planning.planRun import PlanRun
 from app.domain.planning.planSource import PlanSource
 from app.domain.planning.savingsPlan import SavingsPlan
 from app.domain.planning.schedule import Schedule
-from app.infrastructure.notifications.email_settings import (
+from app.infrastructure.settings import (
+    DEFAULT_DATABASE_PATH,
     describe_configuration,
     from_environment,
+    session_path as configured_session_path,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
@@ -168,6 +197,164 @@ _FUND_MONEY = {
     "lock": ("lock_into_fund", "locked into"),
     "release": ("release_from_fund", "released from"),
 }
+
+#: Who the CLI acts as when nobody says otherwise.
+#:
+#: **There is no such constant any more, and its absence is the phase.** This
+#: used to hold ``DEV_USER_EMAIL``, an address every invocation acted as unless
+#: ``--user`` named another one - a shim that made the single-user install work
+#: while ownership rules landed. It is gone along with the ``--user`` flag, and
+#: what replaced it is not a better default: it is the requirement that a person
+#: prove who they are before any command that touches money or reads a balance
+#: will run. ``plan tick`` is the only command that acts as nobody, and it is
+#: handled by never resolving an actor at all rather than by inventing one.
+#:
+#: Leaving a default here would have been the whole bypass in one line: every
+#: command on every machine would authenticate as the same account, and it would
+#: look like convenience rather than a hole.
+
+
+class CliError(Exception):
+    """A refusal this presentation makes, with no domain opinion behind it.
+
+    Deliberately *not* a ``MoneyError``, for the reason ``errors.ApiError``
+    gives on the HTTP side: the domain has no view about where a token file
+    lives, whether it exists, or who can read it. Deriving from the money root to
+    reuse its handler would put a filesystem concern inside the domain's
+    exception tree, which is the one place this codebase keeps such things out
+    of.
+
+    It exists at all because ``main`` needs one place to turn a refusal into
+    ``error: ...`` and exit 1, and a second root is cheaper than a message that
+    pretends to be about money. The two presentations now have the same
+    arrangement - a domain root and a presentation root, both caught at the top -
+    which is a coincidence worth having rather than one worth engineering.
+    """
+
+    pass
+
+
+class NotSignedInError(CliError):
+    """There is no usable token at the session path, so no command can act.
+
+    One class for "the file is missing", "it cannot be read" and "it is empty",
+    because all three leave the user with the same next move and the message
+    names which one happened. Telling them apart in the *type* would give
+    ``main`` three branches that do the same thing.
+    """
+
+    pass
+
+
+def _read_token(path: str) -> str:
+    """The token at ``path``, or a refusal naming what is wrong with it.
+
+    Read as plain text and stripped, because the file holds nothing else - see
+    ``_write_token``. There is no format to parse and deliberately so: a file
+    with fields in it invites a reader to trust one of them, and the only field
+    that would be worth trusting here is the token, which is the one thing that
+    cannot be checked locally anyway. Everything about whether this token is
+    *good* is answered by the store, on the next command that uses it.
+
+    The refusals are ``NotSignedInError`` rather than an unhandled ``OSError``,
+    and the difference is what the user sees: a traceback with a path in it is
+    what a bug looks like, and this is not a bug - it is the ordinary state of a
+    machine where nobody has logged in yet.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except FileNotFoundError:
+        raise NotSignedInError(
+            f"not signed in: no session at {path} - run 'login' first"
+        )
+    except OSError as exc:
+        raise NotSignedInError(f"could not read the session at {path}: {exc}")
+
+    if not token:
+        raise NotSignedInError(
+            f"not signed in: the session at {path} is empty - run 'login'"
+        )
+    return token
+
+
+def _write_token(path: str, token: str) -> None:
+    """Store ``token`` at ``path``, readable by its owner and nobody else.
+
+    **Created with the mode already set, not written and then chmodded.** The
+    two-step version leaves a window - between the ``open`` and the ``chmod`` -
+    in which the file exists with whatever the umask allows, and a token that is
+    world-readable for ten milliseconds on a shared machine is a token that was
+    world-readable. ``os.open`` takes the mode as an argument, so the file is
+    born private.
+
+    The mode is subject to the umask, which can only ever *remove* bits - so the
+    result is at most ``0600`` and possibly stricter. That asymmetry is the
+    reason this is the safe direction to be wrong in.
+
+    The parent directory is created if it is missing, because the default lives
+    under ``~/.config`` and a fresh machine may not have that directory. It is
+    created with the default mode rather than ``0700``: the token file's own mode
+    is what protects the token, and a directory is not a place to be clever about
+    permissions the rest of the user's config directory does not use.
+    """
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    # A trailing newline, so the file is a well-formed text file rather than a
+    # 43-character line with no end - which matters for anything that ever reads
+    # it, including a person running `cat` to find out whether they are logged in.
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+
+
+def _forget_token(path: str) -> bool:
+    """Delete the session file. Returns whether one was there to delete.
+
+    The return value is for the *report*, not for control flow: signing out on a
+    machine that was not signed in is not an error, and both paths end the same
+    way. It is worth a line of output telling them apart anyway, because "logged
+    out" after a command that found no session is mildly confusing, and the
+    difference costs one boolean.
+    """
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _prompt_password(confirm: bool) -> str:
+    """Ask for a password, twice when it is being chosen rather than presented.
+
+    ``getpass`` and never an argument, which is the whole reason this function
+    exists: ``--password hunter2`` lands in the shell's history file, in the
+    process table while the command runs, and in whatever the terminal is
+    recording. A password typed at a prompt invisible to over-the-shoulder
+    reading is the best a terminal offers.
+
+    The confirmation is for ``signup`` and not for ``login``, and the asymmetry
+    is deliberate rather than an oversight. A mistyped password at sign-up
+    creates an account whose password nobody knows - including its owner, who
+    will discover it at the login prompt and have no recourse. A mistyped
+    password at login simply does not match, which is a refusal the user
+    understands immediately and can retry. Confirming the second would be a
+    second invisible typing of a secret that is about to be checked anyway.
+
+    An empty password is *not* refused here. ``PlainPassword`` owns that rule -
+    including the minimum length - and a second check would be a rule free to
+    disagree with it. The mismatch case is refused here, because "you typed two
+    different things" is a fact about this prompt and not about passwords.
+    """
+    password = getpass.getpass("password: ")
+    if not confirm:
+        return password
+    again = getpass.getpass("password again: ")
+    if password != again:
+        raise CliError("the two passwords did not match")
+    return password
 
 
 def _uuid(value: str) -> uuid.UUID:
@@ -245,17 +432,60 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db",
-        default="budget.db",
-        help="SQLite database file (default: budget.db)",
+        default=DEFAULT_DATABASE_PATH,
+        help=f"SQLite database file (default: {DEFAULT_DATABASE_PATH})",
+    )
+    # Where the token lives, defaulted rather than read here.
+    #
+    # ``configured_session_path()` is called at parse time, which is the one
+    # moment ``os.environ`` is read for this setting - so it is read exactly
+    # once, by ``app.infrastructure.settings``, exactly as ``--db``'s own default
+    # is a constant that module owns. Reading ``os.environ`` here would be the
+    # second reader of the environment this codebase has been keeping out, and it
+    # would be the one that made the promise false.
+    #
+    # Unlike ``--db`` there is no unlogged-in default path that works, and that
+    # is not a gap: a token cannot be defaulted the way a filename can, because a
+    # default token would be a token every install shares.
+    parser.add_argument(
+        "--session",
+        default=configured_session_path(),
+        metavar="PATH",
+        help="file holding the session token (default: $BUDGET_SESSION, else "
+        "~/.config/budget/session)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    open_parser = subparsers.add_parser("open", help="open a new wallet")
-    open_parser.add_argument(
-        "--user",
-        type=_uuid,
-        help="owner user UUID (auto-generated if omitted)",
+    # --- identity: the three commands that need no session -------------------
+    #
+    # They are top-level rather than nested under a noun, because there is no
+    # noun that covers them - ``account signup`` would suggest the other two act
+    # on an account too, and logging out discards a token rather than touching
+    # one. Three verbs, no group.
+    signup_parser = subparsers.add_parser(
+        "signup",
+        help="register an address, with a password to prove it later",
     )
+    signup_parser.add_argument("email", help="the address to register")
+    # No --password argument, and its absence is deliberate. See
+    # ``_prompt_password``: an argument lands in the history file.
+    signup_parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="ask for the password once instead of twice (for scripts that "
+        "generate it, where a second typing proves nothing)",
+    )
+
+    login_parser = subparsers.add_parser(
+        "login", help="obtain a session token and store it at --session"
+    )
+    login_parser.add_argument("email", help="the address to sign in as")
+
+    subparsers.add_parser(
+        "logout", help="discard the stored token and end the session"
+    )
+
+    open_parser = subparsers.add_parser("open", help="open a new wallet")
     open_parser.add_argument(
         "--currency",
         required=True,
@@ -282,6 +512,17 @@ def build_parser() -> argparse.ArgumentParser:
         "history", help="show a wallet's transaction ledger, oldest first"
     )
     history_parser.add_argument("wallet_id", type=_uuid)
+
+    # Reads nothing and moves nothing - it prints the identity every other
+    # command is about to act as. It used to be here to make the dev shim
+    # visible: ``--user`` created accounts nobody could inspect, so "whose is
+    # this wallet?" needed a command that answered it. The shim is gone and the
+    # command earned its place anyway, for a better reason - it is the cheapest
+    # way to ask whether the token on this machine still works, and to find out
+    # which account it belongs to when the answer is yes.
+    subparsers.add_parser(
+        "whoami", help="show the user this invocation acts as"
+    )
 
     # Not in OPERATIONS below: a payout takes a destination as well as an
     # amount, and OPERATIONS drives the plain amount+--ref operations.
@@ -554,13 +795,125 @@ def _add_plan_commands(subparsers) -> None:
     )
 
 
+def _signup(args, factory) -> int:
+    """Register an address. Deliberately does not sign in afterwards.
+
+    It would be easy to log the new account in here - the password is in hand,
+    and every service the next command needs could be built immediately. It is
+    not done, and the reason is the phase's thesis rather than a missing
+    convenience: creating an identity and *proving* you hold it are separate acts,
+    and the whole of the guarantee this CLI now offers rests on them staying
+    separate. A registration that silently authenticated would mean the first
+    session on a machine came from a command that never checked a password.
+
+    The password is asked for twice by default. See ``_prompt_password``.
+    """
+    user = build_sign_up(unit_of_work_factory=factory).execute(
+        args.email,
+        _prompt_password(confirm=not args.no_confirm),
+        datetime.now(),
+    )
+    print(f"registered {user.email} ({user.user_id})")
+    print("next: run 'login' to start a session")
+    return 0
+
+
+def _login(args, factory) -> int:
+    """Obtain a token and put it where every later command will look for it.
+
+    **This is the only command that writes the session file**, which is worth
+    knowing when something goes wrong with the CLI's identity: there is exactly
+    one place a token can come from, and it is a password typed at a prompt.
+
+    Overwriting an existing session is not refused. Logging in as somebody else
+    while already signed in is a normal thing to want, and the alternative - a
+    ``logout`` first - would mean two commands to do one thing, with a state in
+    between where the machine is signed in as nobody. The old session is left
+    alone on the server, which is the same shape ``LogIn`` describes for two
+    simultaneous logins: it expires on its own, and nothing here decides that a
+    person only has one device.
+    """
+    logged_in = build_log_in(unit_of_work_factory=factory).execute(
+        args.email, _prompt_password(confirm=False), datetime.now()
+    )
+    _write_token(args.session, logged_in.token)
+    print(
+        f"logged in as {logged_in.user.email} | "
+        f"expires {_moment(logged_in.session.expires_at)} | "
+        f"token stored at {args.session}"
+    )
+    return 0
+
+
+def _logout(args, factory) -> int:
+    """End the session, on the server and on this machine.
+
+    **Server first, then the file**, and the order is the whole of the safety
+    here. Deleting the file first would mean a failure in between leaves a token
+    that still works with no copy of it anywhere - the session is not ended and
+    the user cannot end it, because the thing that names it is gone. This way a
+    failure leaves the token in place and the command can simply be run again.
+
+    A machine that is not signed in is not an error. The postcondition is "there
+    is no usable session at this path", and it is already true - the same
+    idempotence ``LogOut`` argues for one layer down, arriving here as an exit
+    code of 0.
+    """
+    try:
+        token = _read_token(args.session)
+    except NotSignedInError as exc:
+        # The message already says what is wrong and what to do about it, so it
+        # is printed as the note it is rather than reworded into a generic one.
+        print(str(exc))
+        return 0
+
+    build_log_out(unit_of_work_factory=factory).execute(token)
+    _forget_token(args.session)
+    print(f"logged out | session at {args.session} discarded")
+    return 0
+
+
+def _current_actor(args, factory) -> User:
+    """The user this invocation acts as, proved by the token at ``--session``.
+
+    The CLI's half of what ``dependencies.current_actor`` does for a request, and
+    the same two steps: read the credential from where this presentation keeps
+    it, then hand it to the one use case that turns one into an identity. The
+    *rule* about what a token means - which hash, what counts as expired - is in
+    the domain behind that use case, so the two presentations cannot disagree
+    about it.
+
+    ``datetime.now()`` is read at this line, following the API's boundary: this
+    is where the wall clock enters, and everything underneath compares against a
+    moment it was handed.
+
+    It raises ``NotSignedInError`` rather than returning ``None``, because every
+    caller of this function needs a user and none of them has a sensible
+    alternative to offer. A caller that had one would ask ``_read_token``
+    directly.
+    """
+    return build_resolve_actor(unit_of_work_factory=factory).execute(
+        _read_token(args.session), datetime.now()
+    )
+
+
 def _open(service: WalletService, args) -> int:
-    user_id = args.user if args.user is not None else uuid.uuid4()
-    wallet = service.open_wallet(user_id, Currency[args.currency])
+    # The owner is not passed, and cannot be: a service acts for exactly one
+    # user, so the token is spent once in ``main`` when the service is built and
+    # there is no longer an argument here through which a caller could name
+    # somebody else. See ``WalletService.open_wallet``.
+    wallet = service.open_wallet(Currency[args.currency])
     print(
         f"opened wallet {wallet.wallet_id} "
         f"(currency {wallet.currency.name})"
     )
+    return 0
+
+
+def _whoami(args, actor: User) -> int:
+    """Print the identity this invocation acts as."""
+    print(f"email: {actor.email}")
+    print(f"user_id: {actor.user_id}")
     return 0
 
 
@@ -920,36 +1273,34 @@ def _run_outcome(run: PlanRun) -> str:
 
 
 def _plan_command(
-    args, factory, wallet_service: WalletService, settings, deferred_reason
+    args, factory, wallet_service: WalletService, settings, deferred_reason, actor
 ) -> int:
     """Route a ``plan`` sub-command to its handler.
 
-    The scheduler and the notifier are built only for ``tick``, and that is not
-    just laziness: the scheduler wires two use cases onto one Unit of Work
-    factory (see ``build_scheduler``), and constructing that for a command that
-    will never run a plan would hide the fact that the sharing matters only
-    there.
+    **``tick`` is not routed here**, and its absence is deliberate rather than an
+    oversight: it is the one ``plan`` verb that belongs to the installation
+    rather than to a person, so it is dispatched in ``main`` *before* an actor is
+    resolved - because resolving one is exactly what it must not need. A tick
+    that arrived here would already have required a session, and a scheduler that
+    requires a session is a scheduler that needs a privileged account to run
+    under. See ``_plan_tick_command``.
 
     ``settings`` and ``deferred_reason`` arrive from ``main`` rather than being
     read here. They used to be read in this branch, and they moved up with the
     receipts: a wallet command now delivers too, so there are two places that
     need to know how this invocation is configured, and two readers would mean a
     process could in principle act on two different configurations. It also keeps
-    the promise ``email_settings`` makes - that ``os.environ`` is read in one
+    the promise ``settings`` makes - that ``os.environ`` is read in one
     module, by the CLI at one moment.
+
+    ``actor`` arrives the same way and for the same reason. ``build_plan_service``
+    takes it, because plans are owned and a service that could read another
+    user's plan would be the leak this phase closed. Nothing reachable from here
+    is built without one.
     """
-    plan_service = build_plan_service(unit_of_work_factory=factory)
-    if args.plan_command == "tick":
-        return _plan_tick(
-            args,
-            build_scheduler(unit_of_work_factory=factory, settings=settings),
-            build_notifier(unit_of_work_factory=factory, settings=settings),
-            build_deliverer(unit_of_work_factory=factory, settings=settings),
-            build_notification_deliverer(
-                unit_of_work_factory=factory, settings=settings
-            ),
-            deferred_reason=deferred_reason,
-        )
+    plan_service = build_plan_service(
+        unit_of_work_factory=factory, actor=actor.user_id
+    )
     if args.plan_command == "create":
         return _plan_create(args, plan_service, wallet_service)
     if args.plan_command == "list":
@@ -959,6 +1310,37 @@ def _plan_command(
     if args.plan_command == "edit":
         return _plan_edit(args, plan_service)
     return _plan_steer(args, plan_service)
+
+
+def _plan_tick_command(args, factory, settings, deferred_reason) -> int:
+    """Wire up and run one scheduler tick, with no actor anywhere in the call.
+
+    **This is the only command in the CLI that runs as nobody**, and it is
+    reachable without a session on purpose. A tick serves every user with a plan,
+    so the question "who is acting?" has no answer at this level - and rather
+    than invent one, the builders below are the two that take no actor at all.
+    ``build_scheduler`` answers it per plan, with the owner each plan carries;
+    ``build_notifier`` never reads a wallet, so it has no owner to need.
+
+    All four builders are fed the *same* factory, and for the scheduler that is a
+    correctness requirement rather than tidiness: the executor moves money
+    through the wallet repositories and records the run through the plan
+    repositories, and it relies on both landing in one transaction. A different
+    factory would be a different database.
+
+    It sits beside ``_plan_command`` rather than inside it so that the split
+    above is visible in the file layout: this function's whole argument list is
+    missing the one parameter every other command handler takes, and that is the
+    clearest way to say what it is.
+    """
+    return _plan_tick(
+        args,
+        build_scheduler(unit_of_work_factory=factory, settings=settings),
+        build_notifier(unit_of_work_factory=factory, settings=settings),
+        build_deliverer(unit_of_work_factory=factory, settings=settings),
+        build_notification_deliverer(unit_of_work_factory=factory, settings=settings),
+        deferred_reason=deferred_reason,
+    )
 
 
 def _plan_create(
@@ -1267,7 +1649,7 @@ def _report_notifications(report, deferred_reason=None) -> None:
             )
 
 
-def _describe(exc: MoneyError) -> str:
+def _describe(exc: BaseException) -> str:
     return str(exc) if str(exc) else exc.__class__.__name__
 
 
@@ -1289,13 +1671,42 @@ def main(argv=None) -> int:
     # about *this* installation's environment, and the deliverers - which only
     # see messages - have no way to know it.
     deferred_reason = describe_configuration() if settings is None else None
-    service = build_wallet_service(
-        unit_of_work_factory=factory, settings=settings
-    )
     try:
+        # --- the commands that need nobody ----------------------------------
+        #
+        # Dispatched before any actor is resolved, and that ordering is the
+        # design rather than an optimisation. The three identity commands cannot
+        # need a session - they are how a session comes to exist, or cease to -
+        # and ``plan tick`` must not, because it serves the whole installation
+        # and there is no person it could act as. Resolving an actor first, as
+        # this function used to do unconditionally, would have made a scheduler
+        # that requires a login.
+        if args.command == "signup":
+            return _signup(args, factory)
+        if args.command == "login":
+            return _login(args, factory)
+        if args.command == "logout":
+            return _logout(args, factory)
+        if args.command == "plan" and args.plan_command == "tick":
+            return _plan_tick_command(args, factory, settings, deferred_reason)
+
+        # --- everything else runs as somebody, proved by the stored token ----
+        #
+        # Once, before any service is built, because every one of them is
+        # constructed *for* this user - the same arrangement the HTTP side has,
+        # where one resolved actor is handed to the services built per request.
+        # A token that is unknown, expired or orphaned refuses the command here,
+        # before anything is read or moved, which is what makes "not signed in"
+        # and "signed in as somebody else" impossible to confuse.
+        actor = _current_actor(args, factory)
+        service = build_wallet_service(
+            unit_of_work_factory=factory, settings=settings, actor=actor.user_id
+        )
+        if args.command == "whoami":
+            return _whoami(args, actor)
         if args.command == "plan":
             return _plan_command(
-                args, factory, service, settings, deferred_reason
+                args, factory, service, settings, deferred_reason, actor
             )
         if args.command == "fund":
             return _fund_command(args, service, factory, settings, deferred_reason)
@@ -1312,7 +1723,13 @@ def main(argv=None) -> int:
         if args.command == "payout":
             return _payout(service, args, factory, settings, deferred_reason)
         return _operation(service, args, factory, settings, deferred_reason)
-    except MoneyError as exc:
+    except (MoneyError, CliError) as exc:
+        # Two roots, one renderer. A domain refusal and a refusal this
+        # presentation makes arrive at the same line of output and the same exit
+        # code, because from a terminal they are the same event: the command did
+        # not do the thing, and here is why. The API makes the identical
+        # arrangement in ``errors.install``, where ``MoneyError`` and ``ApiError``
+        # are registered side by side.
         print(f"error: {_describe(exc)}", file=sys.stderr)
         return 1
 

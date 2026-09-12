@@ -363,8 +363,8 @@ class TestTheNewTableNeedsNoMigration:
         for _ in range(2):  # every connection runs this
             connection = open_sqlite_connection(path)
             try:
-                reloaded = SqliteSavingsPlanRepository(connection).get_by_id(
-                    plan.plan_id
+                reloaded = SqliteSavingsPlanRepository(connection).get_owned(
+                    plan.plan_id, plan.user_id
                 )
             finally:
                 connection.close()

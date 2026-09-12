@@ -71,7 +71,7 @@ def test_round_trips_a_plan(build_wallet, build_plan):
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert stored.plan_id == plan.plan_id
     assert stored.wallet_id == wallet.wallet_id
     assert stored.source is PlanSource.LOCKED
@@ -89,7 +89,7 @@ def test_the_name_survives(build_wallet, build_plan):
 
     repository.save(plan)
 
-    assert repository.get_by_id(plan.plan_id).name == "Rent 2026"
+    assert repository.get_owned(plan.plan_id, plan.user_id).name == "Rent 2026"
 
 
 def test_renaming_a_plan_persists(build_wallet, build_plan):
@@ -101,7 +101,7 @@ def test_renaming_a_plan_persists(build_wallet, build_plan):
     plan.name = "Rent 2027"
     repository.save(plan)
 
-    assert repository.get_by_id(plan.plan_id).name == "Rent 2027"
+    assert repository.get_owned(plan.plan_id, plan.user_id).name == "Rent 2027"
 
 
 def test_instructions_survive_with_their_destinations(build_wallet, build_plan):
@@ -111,7 +111,7 @@ def test_instructions_survive_with_their_destinations(build_wallet, build_plan):
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert len(stored.instructions) == 1
     instruction = stored.instructions[0]
     assert instruction.action is PlannedAction.PAYOUT
@@ -132,7 +132,7 @@ def test_a_release_instruction_survives_without_a_destination(build_wallet, buil
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert stored.instructions[0].action is PlannedAction.RELEASE
     assert stored.instructions[0].destination is None
 
@@ -151,7 +151,7 @@ def test_several_instructions_keep_their_order(build_wallet, build_plan):
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert [instruction.label for instruction in stored.instructions] == [
         "salary",
         "rent",
@@ -171,7 +171,7 @@ def test_the_schedule_round_trips(build_wallet, build_plan):
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert stored.schedule.cadence is Cadence.WEEKLY
     assert stored.schedule.anchor == datetime(2026, 5, 7)
 
@@ -193,7 +193,7 @@ def test_the_time_of_day_of_the_anchor_survives(build_wallet, build_plan):
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert stored.schedule.anchor == datetime(2026, 3, 2, 12, 0)
     assert stored.next_due_at == datetime(2026, 3, 2, 12, 0)
 
@@ -205,7 +205,7 @@ def test_the_anchor_survives_so_drift_protection_survives(build_wallet, build_pl
     repository = build_repository(wallet)
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     seen = [stored.next_due_at]
     for _ in range(3):
         stored.record_run()
@@ -226,7 +226,7 @@ def test_an_open_ended_plan_round_trips_ends_on_as_none(build_wallet, build_plan
 
     repository.save(plan)
 
-    assert repository.get_by_id(plan.plan_id).ends_on is None
+    assert repository.get_owned(plan.plan_id, plan.user_id).ends_on is None
 
 
 def test_the_run_count_survives_so_a_reloaded_plan_is_due_where_it_left_off(
@@ -238,17 +238,36 @@ def test_the_run_count_survives_so_a_reloaded_plan_is_due_where_it_left_off(
 
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert stored.completed_runs == 3
     assert stored.next_due_at == datetime(2026, 4, 1)
 
 
-def test_get_by_id_of_a_missing_plan_raises(build_wallet):
+def test_get_owned_of_a_missing_plan_raises(build_wallet, actor):
     wallet = build_wallet()
     repository = build_repository(wallet)
 
     with pytest.raises(SavingsPlanNotFoundError):
-        repository.get_by_id(uuid4())
+        repository.get_owned(uuid4(), actor)
+
+
+def test_get_owned_of_a_foreign_plan_raises_not_found(
+    build_wallet, build_plan, actor, stranger
+):
+    """A plan owned by someone else is not found, exactly as if it were absent.
+
+    The plan here is real and its id is correct - it is simply not this actor's.
+    Note what that means for steering: ``PlanService.pause_plan`` on somebody
+    else's plan reaches this call, so it too reports a plan that does not exist
+    rather than a permission it was denied. See ``PlanService._plan``.
+    """
+    wallet = build_wallet(user_id=stranger)
+    plan = build_plan(wallet_id=wallet.wallet_id, user_id=stranger)
+    repository = build_repository(wallet)
+    repository.save(plan)
+
+    with pytest.raises(SavingsPlanNotFoundError):
+        repository.get_owned(plan.plan_id, actor)
 
 
 def test_get_by_wallet_id_returns_only_that_wallets_plans(build_wallet, build_plan):
@@ -263,16 +282,36 @@ def test_get_by_wallet_id_returns_only_that_wallets_plans(build_wallet, build_pl
     for plan in (first, second, stranger):
         repository.save(plan)
 
-    found = repository.get_by_wallet_id(wallet.wallet_id)
+    found = repository.get_by_wallet_id(wallet.wallet_id, wallet.user_id)
 
     assert {plan.plan_id for plan in found} == {first.plan_id, second.plan_id}
+
+
+def test_get_by_wallet_id_refuses_a_wallet_the_actor_does_not_own(
+    build_wallet, build_plan, actor, stranger
+):
+    """The listing is scoped in its own right, not by the caller's good manners.
+
+    ``PlanService.plans_for_wallet`` proves ownership of the wallet *before*
+    calling this, and the two are not redundant: the proof is what tells "no such
+    wallet" from "wallet with no plans", and this filter is what makes the read
+    safe even for a caller who skipped the proof. Tested at this level because
+    this is where the filter lives - a service-level test would pass just as well
+    if only the proof existed, and would then not be testing this line at all.
+    """
+    wallet = build_wallet(user_id=stranger)
+    plan = build_plan(wallet_id=wallet.wallet_id, user_id=stranger)
+    repository = build_repository(wallet)
+    repository.save(plan)
+
+    assert repository.get_by_wallet_id(wallet.wallet_id, actor) == []
 
 
 def test_get_by_wallet_id_is_empty_for_a_wallet_without_plans(build_wallet):
     wallet = build_wallet()
     repository = build_repository(wallet)
 
-    assert repository.get_by_wallet_id(wallet.wallet_id) == []
+    assert repository.get_by_wallet_id(wallet.wallet_id, wallet.user_id) == []
 
 
 def test_saving_a_changed_plan_updates_the_same_row(build_wallet, build_plan):
@@ -285,7 +324,7 @@ def test_saving_a_changed_plan_updates_the_same_row(build_wallet, build_plan):
     plan.pause()
     repository.save(plan)
 
-    stored = repository.get_by_id(plan.plan_id)
+    stored = repository.get_owned(plan.plan_id, plan.user_id)
     assert stored.completed_runs == 1
     assert stored.status is PlanStatus.PAUSED
     count = repository._connection.execute(
@@ -325,5 +364,5 @@ def test_two_plans_on_one_wallet_both_survive(build_wallet, build_plan):
     repository.save(monthly)
     repository.save(weekly)
 
-    stored = repository.get_by_wallet_id(wallet.wallet_id)
+    stored = repository.get_by_wallet_id(wallet.wallet_id, wallet.user_id)
     assert {plan.schedule.cadence for plan in stored} == {Cadence.MONTHLY, Cadence.WEEKLY}

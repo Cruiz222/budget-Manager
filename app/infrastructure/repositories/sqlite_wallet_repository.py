@@ -108,14 +108,28 @@ class SqliteWalletRepository(WalletRepository):
                 ),
             )
 
-    def get_by_id(self, wallet_id) -> Wallet:
+    def get_owned(self, wallet_id, user_id) -> Wallet:
+        """Return this owner's wallet, or raise WalletNotFoundError.
+
+        The owner sits in the ``WHERE`` rather than being checked once the row
+        has come back, and that placement is the design rather than a style
+        choice. A fetch-then-compare loads a stranger's wallet into memory before
+        deciding not to hand it over - so the wrong wallet was briefly *read*,
+        and the only thing standing between it and a caller is a comparison that
+        some future path could forget. Filtering in SQL makes the wrong wallet
+        something this method is unable to produce, whatever the caller does.
+
+        "Not yours" and "not there" arrive at the same ``row is None`` and leave
+        by the same raise, with no branch between them - so from outside the two
+        are the same event. See the port for why that has to be true.
+        """
         row = self._connection.execute(
             """
             SELECT wallet_id, user_id, currency, status, available_balance
             FROM wallets
-            WHERE wallet_id = ?
+            WHERE wallet_id = ? AND user_id = ?
             """,
-            (uuid_to_text(wallet_id),),
+            (uuid_to_text(wallet_id), uuid_to_text(user_id)),
         ).fetchone()
         if row is None:
             raise WalletNotFoundError

@@ -1,0 +1,17 @@
+# Everything a development checkout needs: the runtime, plus the test suite's own
+# tools.
+#
+# Recreate the environment:
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#
+# This is the file to install for a checkout that will run the tests.
+# requirements.txt holds what the software needs to *run*, so a deployment does
+# not carry a test runner or an HTTP client.
+#
+# httpx is here rather than in requirements.txt because it exists for exactly one
+# reason: starlette's ``TestClient`` is built on it, which is how the API tests
+# drive a real application without opening a socket. Nothing shipped imports it.
+-r requirements.txt
+pytest==9.1.1
+httpx==0.28.1

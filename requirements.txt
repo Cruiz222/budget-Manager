@@ -1,5 +1,43 @@
-# Dev/test dependencies for Budget Manager.
+# What Budget Manager needs to *run*.
+#
 # Recreate the environment:
-#   python -m venv .venv
+#   python3 -m venv .venv
 #   .venv/bin/pip install -r requirements.txt
-pytest==9.1.1
+#
+# For a development checkout, install requirements-dev.txt instead - it includes
+# this file plus the test suite's own dependencies, so a production install does
+# not carry pytest and httpx.
+fastapi==0.115.6
+uvicorn==0.34.0
+
+# Passwords. A runtime dependency and not a development one: without it the
+# application can start, serve, and answer /health, and no account on it can ever
+# log in - ``Argon2PasswordHasher`` is the only adapter for the ``PasswordHasher``
+# port, and the composition root builds it. Nothing in the domain imports it,
+# which is why the whole of Phase 2a's domain half was written and reasoned about
+# before this line existed.
+#
+# Pinned to the version pip resolved on 2026-09-12, rather than to one chosen from
+# the changelog. Which version is right is a question about a hash format, not
+# about a preference: an encoded hash records the parameters it was made with, so
+# a version bump can only ever be *additive* to the hashes already in the
+# database - every old password keeps verifying against the parameters it was
+# written with. That is why this pin is safe to raise later and why raising it is
+# a deliberate act rather than a routine bump.
+#
+# What does *not* exist yet, and is worth knowing before relying on the paragraph
+# above: nothing re-hashes an old password when its parameters fall behind
+# ``argon2-cffi``'s defaults. ``PasswordHasher`` has ``hash`` and ``verify`` and no
+# third method, so the cost can be raised safely but the existing rows will not
+# move to the new one on their own. That is a real feature - re-hash on the next
+# successful login, which is the only moment the plaintext is in hand - and it is
+# deliberately not in Phase 2a, which is why it is written here rather than
+# assumed. Left unsaid, "the parameters are in the hash" reads as though the
+# migration were already handled.
+#
+# ``argon2-cffi-bindings`` is deliberately *not* listed. It is a transitive
+# dependency of the line below - pip resolved 26.1.0 alongside it - and pinning a
+# package this file does not choose by hand would be describing an environment
+# rather than declaring one. This file says what we depend on; ``pip freeze`` says
+# what that resolved to.
+argon2-cffi==25.1.0

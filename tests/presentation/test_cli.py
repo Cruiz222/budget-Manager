@@ -1,14 +1,44 @@
+import os
 import re
 from uuid import uuid4
 
 import pytest
 
 from app.presentation.cli import main
+from tests.conftest import session_path_for, signed_in
+
+
+@pytest.fixture(autouse=True)
+def signed_in_cli(tmp_path):
+    """Start every test in this file signed in as the suite's standard user.
+
+    **This is the precondition every command below now has.** They all act as
+    somebody, and that somebody is proved by a token rather than named by a flag,
+    so a test whose database holds no account and whose session file does not
+    exist fails with "not signed in" rather than with anything about wallets.
+
+    The token is written beside ``tmp_path/cli.db``, which is the database every
+    test in this file builds and the path ``run`` passes as ``--session`` - so the
+    two agree by construction rather than by two constants that have to be kept
+    equal.
+
+    A test that wants to be signed *out* deletes that file itself. That is one
+    line at the call site rather than a second fixture, and it is the right place
+    for it: the state a test depends on should be visible in the test.
+    """
+    return signed_in(str(tmp_path / "cli.db"))
 
 
 def run(db_path, *argv):
-    """Invoke the CLI in-process against the given database file."""
-    return main(["--db", db_path, *argv])
+    """Invoke the CLI in-process against the given database file.
+
+    ``--session`` is passed on every call, pointing at the token the fixture above
+    left beside that database. Threading it through here rather than adding it to a
+    hundred call sites is the whole reason this helper exists - and the two
+    arguments travel together because they are the two things an invocation is made
+    of: its storage, and its identity.
+    """
+    return main(["--db", db_path, "--session", session_path_for(db_path), *argv])
 
 
 def opened_wallet_id(db_path, capsys):

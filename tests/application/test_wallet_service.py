@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -25,8 +25,19 @@ from app.domain.notifications.notificationKind import NotificationKind
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
+from tests.conftest import TEST_USER_ID
 
 NGN = Currency.NGN
+
+#: The user every service in this file acts as.
+#:
+#: The same one ``build_wallet`` gives its wallets - which is what makes the
+#: fifty-odd tests below work unchanged: a wallet built by the fixture belongs to
+#: whoever the service acts as, so ``service.get_wallet(wallet.wallet_id)`` still
+#: finds it. A *different* id here would make every one of them raise
+#: ``WalletNotFoundError``, and the failure would be about this constant rather
+#: than about any behaviour under test.
+ACTOR = TEST_USER_ID
 
 #: Where a wallet receipt is addressed. Passed in rather than read from the
 #: environment, because ``WalletService`` takes its inputs as arguments -
@@ -49,7 +60,7 @@ DESTINATION = Destination(
 
 def build_service(tmp_path, recipient=None, name="wallet_service.db"):
     factory = SqliteUnitOfWorkFactory(str(tmp_path / name))
-    return WalletService(factory, recipient=recipient), factory
+    return WalletService(factory, recipient=recipient, actor=ACTOR), factory
 
 
 def seed(factory, wallet):
@@ -61,7 +72,7 @@ def seed(factory, wallet):
 def get_wallet(factory, wallet_id):
     uow = factory.start()
     try:
-        return uow.wallets.get_by_id(wallet_id)
+        return uow.wallets.get_owned(wallet_id, ACTOR)
     finally:
         uow.rollback()
 
@@ -315,12 +326,11 @@ def test_replaying_an_internal_reference_does_not_double_credit(tmp_path, build_
 
 def test_open_wallet_persists_an_empty_active_wallet(tmp_path):
     service, factory = build_service(tmp_path)
-    user_id = uuid4()
 
-    wallet = service.open_wallet(user_id, NGN)
+    wallet = service.open_wallet(NGN)
 
     stored = get_wallet(factory, wallet.wallet_id)
-    assert stored.user_id == user_id
+    assert stored.user_id == ACTOR
     assert stored.status is WalletStatus.ACTIVE
     assert stored.currency is NGN
     assert stored.available_balance == Money(Decimal("0"), NGN)
@@ -685,4 +695,89 @@ class TestTheReceiptForAWalletCommand:
         service.deposit(wallet.wallet_id, Money(Decimal("1000"), NGN), str(uuid4()))
 
         assert len(notifications_of(factory)) == 2
+
+
+# --- ownership --------------------------------------------------------------
+#
+# Every method that takes a wallet id, with a call that would do something
+# sensible if the wallet were the service's own. The table exists so the test
+# below can sweep the whole surface rather than sample it: a method added later
+# and wired to an unscoped read is the one mistake this phase most needs to
+# catch, and a hand-written list of calls cannot notice an omission. Adding the
+# method here is the tax - and it is a small one, because the entry has to exist
+# for the sweep to cover it.
+#
+# ``open_wallet`` is absent and cannot be here: it takes no wallet id, because a
+# service opens a wallet for its own actor and has no way to name anyone else.
+_REFERENCE = "ref-ownership"
+
+
+def _money(amount: str) -> Money:
+    return Money(Decimal(amount), NGN)
+
+
+_FOREIGN_CALLS = {
+    "deposit": lambda service, wallet_id: service.deposit(
+        wallet_id, _money("100"), _REFERENCE
+    ),
+    "withdraw": lambda service, wallet_id: service.withdraw(
+        wallet_id, _money("100"), _REFERENCE
+    ),
+    "payout_from_available": lambda service, wallet_id: service.payout_from_available(
+        wallet_id, _money("100"), _REFERENCE, DESTINATION
+    ),
+    "payout_from_locked": lambda service, wallet_id: service.payout_from_locked(
+        wallet_id, _money("100"), _REFERENCE, DESTINATION, MOMENT
+    ),
+    "open_fund": lambda service, wallet_id: service.open_fund(
+        wallet_id, "Holiday", FundKind.PERSONAL
+    ),
+    "extend_fund": lambda service, wallet_id: service.extend_fund(
+        wallet_id, "Holiday", date(2027, 1, 1), MOMENT
+    ),
+    "deposit_into_fund": lambda service, wallet_id: service.deposit_into_fund(
+        wallet_id, "Holiday", _money("100"), _REFERENCE, MOMENT
+    ),
+    "lock_into_fund": lambda service, wallet_id: service.lock_into_fund(
+        wallet_id, "Holiday", _money("100"), _REFERENCE, MOMENT
+    ),
+    "release_from_fund": lambda service, wallet_id: service.release_from_fund(
+        wallet_id, "Holiday", _money("100"), _REFERENCE, MOMENT
+    ),
+    "funds_for_wallet": lambda service, wallet_id: service.funds_for_wallet(wallet_id),
+    "get_wallet": lambda service, wallet_id: service.get_wallet(wallet_id),
+    "transactions_for_wallet": lambda service, wallet_id: (
+        service.transactions_for_wallet(wallet_id)
+    ),
+    "freeze_wallet": lambda service, wallet_id: service.freeze_wallet(wallet_id),
+    "unfreeze_wallet": lambda service, wallet_id: service.unfreeze_wallet(wallet_id),
+}
+
+
+@pytest.mark.parametrize("method", sorted(_FOREIGN_CALLS))
+def test_no_method_can_see_another_users_wallet(
+    method, tmp_path, build_wallet, stranger
+):
+    """Every method on the service, asked for a stranger's wallet, finds nothing.
+
+    Parametrised over the whole surface rather than written as one test per
+    method, and the reason is what the sweep is *for*: the failure this phase is
+    guarding against is a method that forgets to scope its read, and that failure
+    can only enter through a method that did not exist when this was written. A
+    new entry in ``_FOREIGN_CALLS`` is a visible omission; a new method with no
+    entry is caught by the reviewer reading the table against the class, which is
+    a far better place to notice it than in a green suite.
+
+    The wallet is real, seeded, and named by its correct id. What is missing is
+    that it belongs to somebody else - so every refusal here is
+    ``WalletNotFoundError``: not a permission denied, a wallet that cannot be
+    found by this service at all. See ``WalletRepository.get_owned`` for why
+    those two must be the same answer.
+    """
+    wallet = build_wallet(user_id=stranger)
+    service, factory = build_service(tmp_path)
+    seed(factory, wallet)
+
+    with pytest.raises(WalletNotFoundError):
+        _FOREIGN_CALLS[method](service, wallet.wallet_id)
 

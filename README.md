@@ -313,6 +313,51 @@ Transaction
     └── reversed_at
 
 
+## Signing in
+
+Every command except `signup`, `login`, `logout` and `plan tick` acts as somebody,
+and that somebody is proved by a token rather than named by a flag. So a fresh
+install starts here:
+
+```
+.venv/bin/python -m app.presentation.cli --db budget.db signup me@example.com
+.venv/bin/python -m app.presentation.cli --db budget.db login  me@example.com
+.venv/bin/python -m app.presentation.cli --db budget.db whoami
+```
+
+Three things about that are worth knowing:
+
+- **`signup` does not sign you in.** It creates the identity; `login` is what
+  proves you hold it, and it is the *only* command that writes the session file.
+  Keeping them apart is the whole point of the phase (decision 85) - a registration
+  that silently authenticated would mean the first token on a machine came from a
+  command that never checked the password.
+- **The password is typed, never passed.** There is no `--password` flag, because an
+  argument lands in the shell's history file, in the process table while the command
+  runs, and in whatever the terminal is recording. `signup` asks twice; `login`
+  asks once (decision 83). `getpass` reads the controlling terminal in preference to
+  stdin and falls back to it only when there is none, so the prompt cannot be fed
+  from a pipe either - a script that tries gets `echo … |` sitting unread while the
+  prompt waits at the terminal.
+- **The token lives at `--session`**, defaulting to `$BUDGET_SESSION` and then
+  `~/.config/budget/session`, created `0600`. `logout` ends the session on the
+  server first and deletes the file second, so a failure in between leaves a token
+  that still works rather than one that works with no copy of it anywhere
+  (decision 89).
+
+`logout` on a machine that was never signed in is not an error - it exits 0 and
+prints a note. The postcondition is "there is no usable session at this path", and
+it is already true.
+
+Three commands are worth knowing by name when something goes wrong. `whoami` says
+who the current token belongs to, which is the first question anybody debugging an
+authentication problem asks and which needs no database access to answer.
+`BUDGET_SESSION` overrides where the token is read from, so a second identity on one
+machine is a second file. And a session file that is corrupt or stale - a token from
+another installation, a database restored without its sessions - is refused as
+`InvalidSessionError` with exit 1, and signing in again overwrites it, because
+`login` is dispatched before anything reads the file.
+
 ## Running the scheduler
 
 The tick is one command that does one pass: it warns about plans that are nearly
@@ -324,7 +369,7 @@ calls it on a timer.
 */5 * * * * cd /path/to/budget-Manager && SMTP_HOST=smtp.example.com SMTP_USER=me@example.com SMTP_PASSWORD=... BUDGET_NOTIFY_TO=chinedu@example.com .venv/bin/python -m app.presentation.cli --db budget.db plan tick >> tick.log 2>&1
 ```
 
-Four things about that line are load-bearing:
+Five things about that line are load-bearing:
 
 - **The absolute path.** cron does not run in your shell: its `PATH` is minimal
   and its working directory is your home. Interpreter and database path are both
@@ -340,6 +385,14 @@ Four things about that line are load-bearing:
   `nothing due as of ...` is a healthy one. Delivery failures are the same: a dead
   mail server is recorded and retried, never raised, so a broken mailbox can never
   turn a working payout into a failed cron job (decision 24).
+- **No session, and it would not use one if there were.** The tick is not a user: it
+  runs every user's plans by acting as each plan's owner in turn (decision 56),
+  which is why `build_scheduler` takes no actor at all. Since Phase 2a the CLI's
+  `main` dispatches `plan tick` *above* the line that resolves an actor (decision
+  91), so a cron entry runs on a machine where nobody has ever logged in and no
+  session file exists. What this bullet used to say — that the first tick on a fresh
+  database wrote a `dev@localhost` row on its way past — is no longer true: there is
+  no default identity left for anything to create.
 
 The variables email delivery reads, and nothing else does:
 
@@ -1046,9 +1099,13 @@ correct - and it is recorded as decisions because the *order* is one, and so is
 everything being deliberately **not** built.
 
 **48. An HTTP API comes before authentication.** Not a preference - a
-dependency, and one worth checking before planning anything else.
-`requirements.txt` contains exactly one line, `pytest`; there is no web framework
-at all, and the whole presentation layer is 1,300 lines of argparse.
+dependency, and one worth checking before planning anything else. At the time
+this was written `requirements.txt` contained exactly one line, `pytest`; there
+was no web framework at all, and the whole presentation layer was 1,300 lines of
+argparse. (That single line was itself a mistake, since corrected: `pytest` is a
+*test* dependency, and the file now holds what the system needs to **run** -
+`fastapi` and `uvicorn` - with `requirements-dev.txt` adding `pytest` and `httpx`
+for a checkout. A production install should not carry the suite.)
 Authentication, session tokens, rate limiting and Google signup are all
 properties of an API, and there is no API for them to be properties of.
 
@@ -1105,7 +1162,963 @@ reverse proxy with TLS is the whole of what this needs - a deployment that can b
 understood in an afternoon, rather than an operational surface that would have to
 be learned before it could be used.
 
+**53. A user is an identity, not a credential.** `User` holds a `user_id`, an
+`email`, an optional Google subject id and a `created_at`. There is no password,
+no hash, no salt and no token, and the absence is the design rather than a stage
+of work. How a person proves they are this user is a question about transport and
+storage, and it changes with the transport - a password today, a Google subject
+tomorrow, a passkey the year after. The identity that survives all three is the
+one in that list, and it is the only part the domain has an opinion about.
+Credentials arrive with the adapter that can verify them, which is why argon2 is
+in Phase 2 and not here.
+
+Two smaller rules live inside the aggregate because nowhere else can enforce them.
+**The email is folded to lowercase and trimmed on construction**, because
+`Chinedu@Example.com` and `chinedu@example.com` are the same address and therefore
+the same account - which means a `UNIQUE` column only means what it looks like it
+means if one address has one spelling by the time it reaches the database. The
+fold is one module function shared by the aggregate and `find_by_email`, because
+that lookup runs *before* a `User` exists (deciding whether one exists is the
+question it is asking) and so cannot obtain the fold by constructing one; two
+implementations would be two chances to disagree, and the disagreement would
+surface as a person unable to log in to an account that plainly exists. And
+**`google_subject` refuses `''` while accepting `None`**: the column is `UNIQUE`,
+so every account that arrived without a Google identity would collide on the same
+empty string and the second signup would fail against the first. `None` is the
+honest value for "no Google identity", and SQLite permits any number of NULLs -
+so the two cases stay distinct.
+
+What is deliberately *not* on the aggregate is an `owns(wallet)` method.
+Ownership is answered by the store - a scoped read either returns the wallet or
+reports it absent - and a Python check beside that would be a second place for the
+same rule to live, free to disagree with the query that actually decides.
+
+**54. Ownership is enforced by the read, and there is no unscoped wallet read
+anywhere in the codebase.** `get_by_id` was **removed** from `WalletRepository`
+and `SavingsPlanRepository`, not deprecated, and replaced by
+`get_owned(id, user_id)`. That removal *is* the guarantee: a method with an
+owner-shaped hole in its signature is a method somebody eventually calls, and with
+no such method left to reach for, "read someone else's wallet" is not a mistake
+that can be made - only one that would have to be written, reviewed and committed.
+`grep -rn "get_by_id" app/domain/repositories/wallet_repository.py` returns only
+the docstring explaining why it is gone.
+
+The alternative, and the one most systems take, is to leave `get_by_id` and put a
+policy layer above it - a check in the service, a decorator, a middleware. That
+concentrates the rule in one readable place, which is its real appeal, but it
+leaves the unscoped read in the signature for anyone to call and it makes the
+question "is this read authorised?" something a reviewer has to reconstruct rather
+than something the type system answers. Here the port answers it: every call site
+of `get_owned` names an owner, so `grep` for it produces a complete audit of where
+money is read and on whose behalf. That audit is the point, and it is only
+complete because the unscoped alternative does not exist.
+
+The actor is bound at **service construction**, not passed per call
+(`WalletService(factory, actor=user_id)`), and it is a required keyword-only
+argument rather than defaulted. Required because there is no unscoped read left to
+fall back to - a `None` actor would fail closed, so the default would be safe, but
+making it required means every construction site *states* who it acts for instead
+of inheriting silence. Bound once rather than passed per method because there are
+248 existing service-method call sites and a per-call actor would have changed all
+of them to express something that never varies within a request. The one signature
+that did change is `open_wallet(currency)`, which no longer takes a `user_id`: a
+service must not be able to open a wallet for somebody else, and the owner now
+comes from the actor.
+
+**55. A wallet you do not own is not found.** `get_owned` raises the same
+`WalletNotFoundError`, with the same message, for a wallet that belongs to someone
+else and for one that does not exist. There is no branch between the two cases,
+so there is nothing to leak.
+
+This is a deliberate choice against the more "helpful" alternative of a distinct
+`NotAuthorisedError`. Telling a stranger "that wallet exists, it just isn't yours"
+answers a question they have no standing to ask, and turns a guessable id into a
+way to enumerate who banks here - a probe that costs one request and returns a
+boolean. Collapsing the two failures means a probe returns the same answer whether
+the id is real or not, and the information simply is not available. The cost is
+that a legitimate user with a typo gets a slightly less specific message, which is
+the trade being made on purpose.
+
+What this does *not* mean is that absence is unremarkable. A caller reaching this
+path in the ordinary case has a real wallet id in hand, so absence is still
+unexpected - which is why it raises rather than returning `None`. Same split as
+before the phase, now with a second way to arrive at it.
+
+**56. A plan carries its owner, so the scheduler is not a privileged actor.**
+`savings_plans.user_id` duplicates `wallets.user_id`, which looks redundant and is
+not. The tick serves every user in the installation, so it is the one caller that
+cannot be built for a single actor - and the tempting answer, the one most systems
+take, is to give it an authority of its own: a system user, a skipped check, a
+flag saying "this read is internal". Every one of those is a bypass, and a bypass
+is a thing that exists at runtime whether or not anyone currently calls it.
+
+So the design gives the tick no authority at all. `RunDuePlans` holds a **builder**
+rather than a built executor - `build_execute_plan_run: Callable[[UUID],
+ExecutePlanRun]` - and mints one per plan, acting as that plan's `user_id`:
+
+```python
+for plan in self._due_plans(as_of):
+    executor = self._build_execute_plan_run(plan.user_id)
+    run = executor.execute(plan.plan_id, as_of)
+```
+
+Every read inside that execution is scoped like any other - `plan =
+uow.plans.get_owned(plan_id, self._actor)`, then `wallet =
+uow.wallets.get_owned(plan.wallet_id, self._actor)` - so the scheduler never names
+a wallet without naming whose it is. It is not an exception to decision 54, it is a
+loop over single-user executions. And the composition root's `build_scheduler`
+takes **no actor parameter**, which is the strongest statement available in that
+file: there is no actor to pass because the tick does not have one.
+
+`ExecutePlanRun` is the class that makes this true, which is why it takes an actor
+even though it is never called by a user directly. It also re-raises any exception
+after `uow.rollback()` rather than recording it as BLOCKED, so a mis-scoped read
+propagates loudly instead of being written down as a plan that could not be paid.
+
+The duplicate column is checked by the read rather than trusted: an executor built
+for a plan's owner reads the wallet scoped to *that* owner, so a plan whose
+`user_id` disagrees with its wallet's finds no wallet and raises. A duplicate can
+always disagree with its original, and the safe half is that no money moves and no
+run is recorded.
+
+**57. `list_by_status` is cross-owner *discovery*, not a bypass - and it has two
+callers, both installation-wide background jobs.** It is the one read in the
+codebase that crosses owners, and it earns that by three properties taken
+together: it returns plans **carrying their `user_id`** rather than wallets, every
+subsequent wallet read is scoped (decision 56), and **no user-facing code path can
+reach it**. `PlanService` - the service the API and CLI call - does not expose it.
+The two callers are `RunDuePlans` and `NotifyUpcomingRuns`, and both are jobs that
+must see every user's plans because that is what they are *for*: a tick that
+served one user would not be a scheduler, and a notifier that warned one user would
+not be a notifier.
+
+`NotifyUpcomingRuns` needs no actor and no ownership change, and it is worth
+stating why rather than leaving it as an omission: **it never loads a wallet.** It
+reads plans, writes notices and queues messages, and touches no money at all -
+which is also why `build_notifier` is the one builder in the composition root
+taking no actor. Discovery is a read of *intentions*; the money is only reachable
+one scoped hop later.
+
+The boundary worth watching is that the exception is bounded by its callers, not
+by its signature. A third caller would be a genuine hole if it were reachable from
+a request - so the test is not "who calls this" but "can a user reach it", and
+today the answer is no.
+
+**58. A `NOT NULL` column added by migration carries `DEFAULT ''`, and nothing
+reaches that default.** `ALTER TABLE` cannot add a `NOT NULL` column without one,
+so a migrated database ends up with `DEFAULT ''` on `savings_plans.user_id` where
+a fresh one has none - a real asymmetry, and the same corner
+`_migrate_add_plan_name_column` was pushed into before. On such a database an
+`INSERT` that forgot the owner would write an empty string and produce a plan that
+**no actor can ever be scoped to find**: a row present in the table and invisible
+to every query the application can make, which looks exactly like a plan that was
+deleted.
+
+It is unreachable through the application for two reasons, and both are tested
+rather than asserted. `SavingsPlan` refuses a plan with no owner at construction,
+and the repository always writes the column - so the only way to hit the default is
+to write SQL by hand. The tests are
+`test_a_plan_written_after_the_migration_still_carries_an_owner`, which runs
+against a deliberately *migrated* database because that is the only shape where
+the claim means anything, and
+`test_the_owner_backfill_leaves_no_plan_orphaned`, which asserts no row has an
+empty owner and re-opens the database twice so the backfill is pinned as
+re-runnable.
+
+**The backfill is derived, not invented.** Every existing plan already has an
+owner - it is on the wallet the plan draws on - so the migration copies a recorded
+fact rather than guessing one:
+
+```sql
+ALTER TABLE savings_plans ADD COLUMN user_id TEXT NOT NULL DEFAULT ''
+UPDATE savings_plans SET user_id = (
+    SELECT wallets.user_id FROM wallets
+     WHERE wallets.wallet_id = savings_plans.wallet_id)
+```
+
+That subquery cannot come back empty: `savings_plans.wallet_id` references
+`wallets(wallet_id)` and `PRAGMA foreign_keys = ON` is set before it runs, so no
+plan can name a wallet that does not exist. **That totality is what makes `NOT
+NULL` safe here.** On a database where the reference could dangle, this `UPDATE`
+would have to tolerate NULLs and the column would have to accept them - and the
+honest design would then be a nullable column plus a scheduler that refused to run
+an ownerless plan, rather than a constraint that quietly failed. Contrast
+`_migrate_add_plan_fund_id_column`, which deliberately backfills nothing: there
+was no recorded fact to copy, only a choice somebody would have had to invent.
+
+The `users` table needs no migration at all: `CREATE TABLE IF NOT EXISTS` in
+`SCHEMA` already creates a missing table on an existing database, which is the
+comment the migration sequence already carries two lines up.
+
+**59. `wallets.user_id` has no foreign key to `users`, and that is a SQLite
+limitation rather than a preference.** The column predates the table, and SQLite
+cannot add a foreign key to an existing column without rebuilding the table -
+copying every row, dropping the original and renaming, with `PRAGMA
+foreign_keys` off for the duration. For a money table that is a genuinely risky
+operation to run on a database somebody's savings live in, and it buys an
+integrity guarantee the repository already provides: a wallet is only ever written
+with a `user_id` that came from a real `User`, and the new
+`savings_plans.user_id` follows the same precedent. `transactions.fund_id` makes
+the identical trade, so this is a pattern rather than a compromise invented here.
+A table rebuild is a candidate for a later phase, when there is a backup story
+worth trusting, not for the phase that first makes ownership matter.
+
+**60. Every identity rejection derives from `MoneyError`.** `IdentityError` hangs
+off `MoneyError` rather than off a fresh root, continuing the rule
+`app.domain.planning.exception` states and `app.domain.notifications.exception`
+repeats: **a new exception belongs under the existing root, or every catch site in
+the codebase has to be revisited.** The CLI catches `MoneyError` once, at the top
+of `main`, and turns it into `error: ...` with exit code 1.
+
+Identity is where that rule earns its keep rather than merely inheriting it. A user
+is rejected at the *boundary* - a malformed address at sign-up, a token that no
+longer resolves - which is exactly the point at which a human is watching and a
+traceback is least acceptable. A separate root would have made the most
+user-facing refusals in the codebase the only ones that escaped the handler. The
+package's own test walks its exceptions and asserts every one is a `MoneyError`, so
+a class added later without the right parent fails there rather than as a traceback
+in someone's terminal. The name `MoneyError` describes this least of all - there is
+no money in a malformed email address - which is why renaming it stays on the open
+list below.
+
+Phase 2a added the CLI's one exception to this, and it is the *presentation* that
+made it: `NotSignedInError` derives from `CliError` and not from `MoneyError`,
+because "there is no session file at this path" is not a fact about money or
+identity (decision 92).
+
+**61. Transactions keep an unscoped `get_by_id`, and it is not reachable from a
+service.** `TransactionRepository.get_by_id(transaction_id)` survived the phase
+untouched, which looks like an oversight next to decision 54 and is worth
+justifying explicitly. A transaction has no owner column: it belongs to a wallet,
+and the wallet is what ownership is checked against. The application reaches
+transactions through exactly one door - `transactions_for_wallet(wallet_id)` -
+and that method calls `self._wallet(uow, wallet_id)` **before** reading the ledger,
+so the ownership proof happens first and an unknown or foreign wallet raises
+`WalletNotFoundError` before a single transaction is loaded. The unscoped read is
+never reached with an id that has not already been authorised.
+
+That is a weaker guarantee than decision 54 and it should be described as what it
+is: a property of the call graph rather than of the signature. Nothing in
+`TransactionRepository` prevents a future method from calling `get_by_id`
+directly, and that would be a real hole. The mitigations are that no such method
+exists, that the port has exactly one application-level caller, and that the
+repository tests calling `get_by_id` directly are tests. If a second caller
+appears, the right fix is the one decision 54 already chose - scope the read, or
+remove it - rather than a policy check above it.
+
+### The API, before there is a session
+
+Phase 1a made ownership a fact. Every wallet read names its owner, a foreign
+wallet is indistinguishable from a missing one, and the actor is bound when a
+service is constructed rather than handed to each call. None of it was reachable
+except through 1,300 lines of argparse.
+
+Phase 1b exposes the same use cases over HTTP. It is a **presentation layer, not
+a redesign**, which is decision 48's ordering paying off rather than a claim about
+it: there is no new domain rule in this phase, and no use case was changed to suit
+a transport. The decisions that were worth taking are not about FastAPI. They are
+about what an API may expose when nobody has proved who they are, and where the
+answer to *who is asking?* is allowed to live.
+
+**62. The boundary is at balance changes, not at writes.** This is the decision
+the whole phase rests on, and it is the only thing that makes an API before
+authentication (48) something other than a hazard. With no sessions, an actor is
+an email in a request header: anyone who can reach the port can claim to be
+anyone. Under that, a *read* leaks the claimed user's own data and nothing else -
+a stranger naming somebody's address sees that person's wallets, which they could
+equally have seen by naming their own. A *write* is different in kind: it moves a
+person's money under a name they never proved, and no amount of care in the
+handler changes that.
+
+So the line is drawn at **balance changes**, and drawing it there rather than at
+"writes" is the part worth getting right. `POST /wallets` is a write and is
+exposed, because opening a wallet moves nothing. `POST /plans` is a write and is
+exposed, because creating a plan moves nothing either - a plan is a description of
+future intent, and the run that acts on it is the scheduler's, which has no actor
+and is not reachable from here (decision 56). Held until Phase 2 is every
+operation that changes a balance: `deposit`, `withdraw`, `payout_from_locked`,
+`payout_from_available`, `deposit_into_fund`, `lock_into_fund`,
+`release_from_fund`, `extend_fund`, `freeze_wallet`, `unfreeze_wallet` and the
+close transition. Also held, for a different reason with the same consequence:
+`plan tick` and `notify deliver`, which are installation-wide jobs. An endpoint
+that ran the tick would have to be told who it acts as, and the tick does not have
+an actor by design - making one reachable over HTTP would undo decision 56.
+
+**The consequence, stated rather than discovered:** no money can enter the system
+through this API. A pot can be opened and named, but nothing can fill it; a wallet
+can be opened, but it stays at zero; and a plan can be created against a balance
+that will never be there, so its first run blocks for insufficient funds. That
+last part is not a break, and it is worth saying why because the first draft of
+this phase said the opposite. `PlanService.create_plan` deliberately does not
+check whether a pot holds enough or whether it has matured - a savings plan's
+whole purpose is to *become* affordable, and checking at creation would mean a
+plan could not exist before it was affordable. So a locked-source plan **is**
+creatable here, against an empty pot, and that is the existing rule working rather
+than an exception to it. Clients in this phase can build a *shape* and not a
+balance, and the alternative - exposing a deposit so the shape looks complete -
+would hand over the one operation the phase exists to withhold.
+
+**63. The actor is `X-User-Email`, and it is a shim with a named deletion date.**
+It resolves or creates a user by address, exactly as the CLI's `--user` does, and
+it proves nothing whatsoever. It is safe only because of decision 62: with no
+endpoint that moves a balance, the worst a forged header achieves is reading the
+data of the account it names - data the forger could have had by asking for their
+own.
+
+> **Gone, in Phase 2a.** The header and `--user` were deleted together, in one
+> commit, as this entry promised. The actor is now the account an
+> `Authorization: Bearer <token>` was issued to, resolved by
+> `ResolveActorFromSession` (decisions 80 and 89). The reasoning below is kept
+> because it is the argument for *why the shim was tolerable for a phase*, which is
+> the part worth remembering - not because any of it still describes the API.
+
+**A missing header is a 400, not a 401**, and the choice is about honesty rather
+than semantics. A 401 says "authenticate and come back", which implies there is an
+authentication scheme to satisfy; there is not one yet, and pointing a client at a
+non-existent challenge would be a lie in a status code. A 400 says "this request
+is missing something it must carry", which is exactly true. The status changes to
+401 in Phase 2, along with the header that replaces this one - and the two
+deletions are the same commit, because they are one decision.
+
+> **And it did.** `MissingActorHeaderError` is now `MissingCredentialsError` with
+> `status_code = 401`, which is what its own docstring had promised; the invalid
+> token cases joined it in `UNAUTHORIZED` (decision 87).
+
+Nothing about the header's *contents* is this layer's business. An address with no
+`@` is refused by `User.__post_init__` and arrives at the client through the same
+handler as every other domain rejection, so there is exactly one rule about what
+an address is and it belongs to the aggregate. A presentation that validated,
+lowercased or trimmed the header itself would be a second implementation, free to
+disagree with the fold decision 53 exists to guarantee.
+
+> **The principle outlived the header.** The token is passed through untouched for
+> the same reason: `current_actor` does not decide what a token means, it hands it
+> to `ResolveActorFromSession`, and the rule about which hash and what counts as
+> expired lives in the domain behind that (decision 80).
+
+**64. Resolving an actor is a use case, because the API needs the identical
+thing.** `ResolveUserByEmail` moved out of `app/presentation/cli.py` into
+`app/application/identity/`, and the move is the decision rather than a tidy-up.
+The function's own docstring claimed it was *"the one place in the codebase that
+acts before it is told who is acting"* and that this was safe because there was
+exactly one of it. A second presentation needing the same behaviour is precisely
+the moment that claim stops being true - and the tempting answer, a copy in
+`dependencies.py`, would have made the docstring false while leaving it on screen
+for the next reader.
+
+It is a use case and not a domain rule: finding an account by address is a
+question about the store, and creating one when it is missing is a decision about
+onboarding rather than about identity. What stays in the domain is what a user
+*is* - the fold, the optional Google subject, the refusal of a blank address.
+
+> **The location survived; the class did not.** Phase 2a deleted
+> `ResolveUserByEmail` and put `ResolveActorFromSession` in its place, in the same
+> module (decision 80). The argument above is *why* there is one place at all - and
+> it is the argument that decided where the new class went, since two presentations
+> resolve a token now rather than one.
+
+**65. One service per request, built for the resolved actor.** A FastAPI
+dependency constructs `WalletService` and `PlanService` per request with
+`actor=user_id` taken from the header. This is the payoff of binding the actor at
+construction rather than passing it per method (decision 54), and it is worth
+being explicit about what the alternative would have been: one long-lived service
+with a settable actor, mutated at the start of each request. That object is shared
+mutable state on a threadpool, and a request that failed to set it would act as
+whoever set it last - the bypass Phase 1a removed, reintroduced by a server that
+happens to be long-running. A service is a factory and a UUID, so building one per
+request costs a function call, and the actor cannot leak because it is never
+stored anywhere shared.
+
+**66. A foreign wallet is a 404, and its body is the one a typo gets.** Decision
+55 collapsed the foreign case into the missing one inside the domain. A
+presentation layer is exactly where that gets undone, because a handler's whole
+job is turning one thing into another and "that wallet belongs to someone else"
+is a helpful-sounding sentence that would restore the enumeration oracle in one
+line. So the handler has nothing to distinguish: it prints the exception's class
+name and message, both of which are identical for the two cases because the
+domain never made them different.
+
+The test is stronger than a 404 assertion, and it has to be. `test_isolation.py`
+asks for a stranger's wallet and for a UUID that does not exist, and asserts the
+two responses are *identical* - status and body. A 404 with a different body is a
+404 that tells an attacker the wallet is real.
+
+**67. Refusals are graded by what kind of question was refused.** The CLI collapses
+the whole exception tree into one `error: ...` line, which is right for a terminal
+with one person watching. HTTP has to be more precise, because the status code is
+what a client acts on:
+
+    404  the resource is not there *for this actor*
+    409  it is there, and its current state refuses this
+    400  a value in the request is not acceptable
+    422  the request did not have the shape the endpoint declares
+    500  a bug
+
+Three of those five are defaults rather than lists. `NOT_FOUND` and `CONFLICT` are
+the exceptions worth naming, and **everything else under `MoneyError` is a 400** -
+which is the safe direction to be wrong in, because a refusal this module has
+never heard of is far likelier to be about a value than about a resource's state.
+Nothing new has to be registered for a new domain exception to be graded sensibly;
+only a genuinely state-shaped refusal has to be added to `CONFLICT`, and forgetting
+to is a milder failure than the alternative.
+
+Keeping domain rejections at 400 and schema validation at 422 is deliberate: they
+are different layers, and a client that gets one should not have to guess which.
+Which layer owns a refusal is therefore a real question with a visible answer -
+`CreatePlanIn.instructions` has no `min_length`, so an empty plan comes back as a
+400 in the domain's own words rather than a 422 in pydantic's, because
+`SavingsPlan` already refuses a plan with no lines and a second rule at the edge
+would give one question two answers.
+
+The 500 says nothing at all about what went wrong. Every other handler echoes the
+domain's sentence, which is written for a user and names a pot or an amount; an
+unexpected exception is written for whoever is debugging it and can carry a file
+path, a SQL fragment, or a value out of somebody else's row. So the response is a
+constant and the exception goes to the log.
+
+**68. Money is a string on the wire, in both directions.**
+`{"amount": "2500.00", "currency": "NGN"}`, never a JSON number. `Money` refuses a
+float at its centre because binary floats are not exact - and a request that
+accepted `0.1` would hand the domain a value that had already lost the argument
+before any check could see it. Reading the string with `Decimal` is exact, and it
+is the same direction the CLI already reads bare amounts in, so neither
+presentation has a rounding story of its own.
+
+The format spec is `f"{money.amount:.2f}"`, which is what `Money.__str__` uses - so
+a person reading `8000.00 NGN` at a terminal and a client reading `"8000.00"` are
+looking at the same number written the same way. The `:.2f` is doing real work
+rather than tidying: `Decimal` keeps the exponent it was built with, so `"8000"`
+and `"8000.00"` are the same money that format differently, and a wire format that
+varied with how a value happened to be constructed is one no client could rely on.
+It is formatted in exactly one function, which is what stops one endpoint sending
+`"8000"` and another `"8000.0"`.
+
+**69. Enums travel as their `.value`, which is the spelling the CLI already
+accepts.** `"NGN"`, `"locked"`, `"monthly"`, `"months"` - the same strings
+argparse's `choices` lists, so a value read out of a response can be pasted
+straight into a command, and the two presentations cannot drift into two
+vocabularies for the same concept.
+
+There is a trap underneath this one and it is worth writing down, because it is
+invisible until it fires. `PlanSource("banana")` raises a plain `ValueError`,
+which is *not* a `MoneyError`, so it would fall through every handler in `errors`
+and come back as a 500 - telling a client the server is broken when they sent a
+typo. The CLI never has this problem because argparse checks `choices` before any
+of this code runs. HTTP has no argparse, so the check is written once, in
+`translate._member`, which turns an unknown member into the error the domain
+already has for that concept. `money_in` is the same trap in the one other place a
+string becomes a domain object, and catches `InvalidOperation` for the same
+reason.
+
+**70. The endpoints are synchronous, and the handlers are not.** Every endpoint is
+a plain `def`, so FastAPI runs it in its threadpool; every exception handler is
+`async def`. This is the correct execution model for this codebase rather than a
+style, and the two halves have the same justification: SQLite and every service
+are blocking, so a `def` endpoint gets a worker thread and a truthfully
+non-blocking `async def` would be decoration - while a handler does no I/O at all
+(formatting a string), so there is nothing to hand off and keeping it on the event
+loop costs nothing. An `async def` endpoint that then called blocking SQLite would
+be the one arrangement that is actually wrong: it would block the loop for every
+other request while looking like it never does.
+
+**71. `email_settings` generalised into `settings`, rather than a second module
+reading `os.environ`.** That module's docstring states **"This is the only module
+in the codebase that reads `os.environ`"**, and `cli.py` cites the promise back.
+The API needs a database path as well as the SMTP settings, and reading `BUDGET_DB`
+inside `app/presentation/api/app.py` would have made that sentence false in a way
+nothing would catch - the promise exists so there is *"exactly one place to look
+when a message does not arrive"*, and an environment read somewhere else is
+exactly what erodes it.
+
+So the module moved to `app/infrastructure/settings.py`, `EmailSettings` and
+`from_environment` unchanged, and gained `database_path(environ=None)` using the
+same injectable-`environ` signature the rest of the module already had - so it is
+testable without patching, like everything else in there. The invariant survives
+because the *reader* is still singular; only its name widened from
+"notifications" to "settings", which is what it had already become.
+
+The same constant, `DEFAULT_DATABASE_PATH`, is now the default for both the CLI's
+`--db` and the API's `create_app`, so the two presentations resolve to one file
+rather than to two identical string literals that could drift. `BUDGET_DB`
+overrides it, and the test suite clears that variable along with the mail settings
+- because a developer with it exported would otherwise have the API tests writing
+into a real database.
+
+### Sessions, and the death of both shims
+
+Phase 1b drew its boundary at *balance changes* and held every money-moving
+operation, because it could: an actor was an `X-User-Email` header, which says who
+is asking and proves nothing. Phase 2a is not a detour before the interesting work
+— it is **the lock those thirteen operations are held behind**. Nothing else in the
+roadmap can be released until a session proves who is asking: not the money
+endpoints, and not Paystack in Phase 3, where a webhook credits a balance and has
+to know whose.
+
+2a is the half with the hard property to prove — *an actor that can only be reached
+by proving you are it*. 2b spends it on the money endpoints. 2c is Google OIDC and
+rate limiting.
+
+The phase is also where the two shims die, together and in one commit, which is what
+the "Still open" list promised and why it insisted they were one change rather than
+two.
+
+**72. Email and password, with argon2id.** No third-party account needed, works
+offline, and there is a hash function designed for exactly this input. The
+alternative considered and rejected was starting with Google OIDC (deferred to 2c):
+it would have made the *first* identity in the system depend on a network round
+trip and a client secret, which is a lot of surface to get right before there is a
+single test that a user can be authenticated at all. Password reset is a later
+feature and not a blocker on the design — an account that cannot reset its password
+is inconvenient; an account that cannot exist is a non-starter.
+
+**73. The credential does not live on `User`, and the first reason is not the one
+people expect.** `app/domain/identity/user.py` already said *"This is an identity,
+not a credential"* as a design position rather than a stage of work, so the hash
+goes in its own table with its own aggregate. The second reason is sharper, and it
+is the one that decided it: `translate.user_out` **already** has to *deliberately*
+omit `google_subject` and explain why. A hash on the aggregate would need the same
+deliberate omission, and forgetting it returns a password hash to a client. A `User`
+that holds no hash cannot leak one — `user_out` stays correct as written, and no
+future edit can break it. See also decision 82.
+
+**74. argon2 for the password, SHA-256 for the session token, and the difference is
+the point.** A password is low-entropy and human, so an attacker who steals the
+table can guess billions of candidates offline — that is what a memory-hard hash is
+for, and the cost is paid once per login. A session token is 256 bits of CSPRNG
+output (`secrets.token_urlsafe(32)`): there is no dictionary to run, so
+memory-hardness buys nothing, while it would be paid on *every authenticated
+request*. Using the expensive function where the input is already unguessable is a
+common and costly misreading of the advice.
+
+Worth being precise about what the session hash buys, because it is less than the
+password hash buys: **the stored value is not a usable credential.** The server
+hashes whatever token arrives and looks *that* up, so presenting the stored hash
+hashes the hash and matches nothing. Somebody who reads the session table learns
+which sessions exist and cannot use a single one of them — which is exactly the
+property a password hash does *not* have, since there the stored value is what an
+offline attack is run against. `hash_session_token` is a pure function with exactly
+two callers, `LogIn` to store and `ResolveActorFromSession` to look up, which is
+`fold_email`'s arrangement: one rule, two callers, no way to drift.
+
+**75. The session token is returned once and there is no endpoint that reads one
+back.** A client that loses its token logs in again. That absence is what makes a
+leaked session table useless rather than catastrophic, and it is why
+`POST /sessions` is the only response in the API carrying a secret. It is a 201
+rather than a 200 — a session is a row with an id, an owner and an expiry, and this
+request is what brought it into being — and there is deliberately no `Location`
+header, because there is no URL at which a session can be fetched and pointing at
+one that does not exist would be worse than pointing nowhere.
+
+**76. Expiry is absolute, not sliding.** `SESSION_LIFETIME` is thirty days from the
+moment of issue. A sliding window — "extend it on every request" — means a session
+used daily never ends and one used monthly ends immediately, which is the opposite
+of what a person expects from "stay signed in". It also turns every authenticated
+*read* into a write and makes every request contend for SQLite's single writer. An
+absolute expiry makes the whole thing a comparison against a stored moment, and
+there is one write in a session's life: the one that creates it.
+
+**77. `Session.is_expired(as_of)` takes the clock, it does not read it.** The same
+rule as `Fund.is_matured(as_of)`, and for the same reason: a session that read
+`datetime.now()` itself would be untestable at its boundary, which is the only
+interesting place to test it. It uses `>=` and not `>` — a session is expired *at*
+the instant it expires, not a moment later; the alternative is a session that is
+valid for an instant its owner was never promised.
+
+The wall clock therefore enters the system at exactly two lines, both at a
+presentation boundary: `dependencies.current_actor` and `cli._current_actor`.
+Everything underneath — `is_expired`, `LogIn.execute`, `SignUp.execute`,
+`ResolveActorFromSession.execute` — is handed a moment.
+
+**78. Revocation is deletion, not a flag.** Decision 49, arriving at sessions. A
+`revoked_at` column leaves every query in the codebase obliged to remember to check
+it, and one that forgets is a session that never ended. A deleted row is a state
+that cannot be misread later. `LogOut` therefore deletes, `SessionRepository`
+exposes `delete_by_token_hash`, and `Session` has no transition methods at all —
+there is nothing to extend and nothing to revoke in place.
+
+**79. `LogOut` takes a token, not an actor — and it is the one operation authorised
+by the thing it destroys.** That is not a loophole; it is what makes the method
+correct. Every other use case takes an actor that has already been resolved and asks
+whether that actor may touch a resource. Here the caller presents a token and asks
+for *that token* to stop working, so proving you hold it and being entitled to end
+it are the same act. Giving it an actor would mean resolving the session first —
+which can only fail for a token that is expired or unknown, and those are precisely
+the tokens a client most needs to be able to discard. `DELETE /sessions/current`
+carries the same reasoning over HTTP: an expired token that `/users/me` refuses with
+a 401 is still accepted here, and the `logout` command works on a token the server
+would no longer resolve.
+
+It is idempotent, and it does not check that the session existed. The postcondition
+is "this token does not authenticate", and that is already true if the token was
+never valid, expired, or was signed out a moment ago. Reporting those as errors
+would make every caller handle a failure indistinguishable from success in every
+way that matters.
+
+**80. `ResolveUserByEmail` is deleted, and that deletion is the phase's thesis.**
+It answered "who is this?" from an *assertion*: it was handed an address, found or
+created the account holding it, and returned it. Its own docstring called it *"the
+one place in the codebase that acts before it is told who is acting"* — and the
+part that mattered was not the acting-before-being-told, it was the **deciding**.
+An unknown address produced a new account, which is how a shim turned an assertion
+into a user.
+
+`ResolveActorFromSession` replaces it and is still that one place, with a much
+smaller referent: it only looks up. It is handed a token and reports the identity
+the store already associates with it, or refuses. There is no branch in which it
+creates anything, so a caller who presents a token it made up gets a 401 and never
+an account. Its docstring claims this and `tests/application/identity/test_resolve_actor.py`
+asserts it from three directions, including that a refused token leaves the user
+table exactly as it found it.
+
+It lives in the application layer rather than in a presentation because **two**
+presentations resolve a token now — the API from an `Authorization` header, the CLI
+from its session file — and two copies of a token-to-identity rule are two chances
+to disagree about what counts as expired or which hash turns a token into a lookup
+key. Such a disagreement has no visible symptom until somebody is signed in on one
+surface and not the other.
+
+**81. `LogIn` raises `InvalidCredentialsError` for both an unknown address and a
+wrong password.** Decision 55 — a foreign wallet reporting as a missing one —
+applied to the thing that hands out identities. Distinguishing them lets anyone with
+a list of addresses learn which ones are registered without ever guessing a
+password, and there is nothing a legitimate client would do differently with the two
+answers, since both mean "check what you typed". The class name and the message are
+both identical, which is what the pair of assertions in
+`tests/application/identity/test_log_in.py` checks rather than either one alone —
+the class is what the API sends as `error` and the message is its `detail`, so
+either one differing is the leak.
+
+`DuplicateEmailError` at sign-up is the deliberate exception: it *does* confirm an
+account exists, and that is unavoidable, since the alternative is letting two people
+register one address and discover it at the login form.
+
+**The protection is on the words, not on the clock, and the gap is real.** An
+unknown address returns without hashing anything, so it answers in microseconds
+where a wrong password takes tens of milliseconds, and the difference is measurable
+from outside. The fix — verify against a dummy hash when no credential is found — is
+four lines, and it belongs in 2c with rate limiting, which addresses the same threat
+directly and also covers the sign-up path this cannot. Stated here rather than
+discovered in an incident.
+
+**82. `PasswordCredential` is its own aggregate, and the hash is redacted in its
+repr.** It is `(user_id, password_hash, updated_at)` with `user_id` as the primary
+key — an account has one password at a time, so "the credential for this user" is a
+single-valued fact and the schema says so. A surrogate key would allow two rows and
+leave every reader to pick one.
+
+The redacted `__repr__` is not decoration, for the same reason `PlainPassword`'s is
+not: a dataclass reprs its fields, so a credential reaching a traceback or a log
+line writes a value that is exactly what an offline attack is run against into a
+place it was never protected in. The exception handler that prints `str(exc)` is
+*already in this codebase* (`errors._detail`, `cli._describe`).
+
+**83. `PlainPassword` owns the whole password policy, and it is not stripped.** At
+least eight characters, at most 1024, non-empty, and a value of the wrong type is
+refused as *malformed* rather than as *weak* — the split `User` already makes
+between a value of the wrong kind and one of the wrong shape. A three-character
+password refused at login comes back as `WeakPasswordError` (a 400) rather than as
+`InvalidCredentialsError` (a 401), and it leaks nothing: the length policy is public
+and every stored password satisfies it, so a password failing it was never
+anybody's. Collapsing the two would send somebody to reset a password they had typed
+correctly.
+
+The no-strip rule is the one worth marking. `"hunter2 "` and `"hunter2"` are
+different passwords, so a password is compared against nothing but itself — no trim,
+no case fold, unlike the address, which is folded precisely because it is a handle
+people retype. `SignUpIn` and `LogInIn` carry **no** length rule, so a bad password
+arrives as a 400 in the domain's vocabulary rather than as a 422 in pydantic's, and
+there is no second copy of the policy free to disagree with `PlainPassword`.
+
+The password is read with `getpass` and never as a positional argument: `--password
+hunter2` lands in the shell's history file, in the process table while the command
+runs, and in whatever the terminal is recording. `signup` asks twice and `login`
+once, and the asymmetry is deliberate — a mistyped password at sign-up creates an
+account whose password nobody knows, including its owner; a mistyped one at login
+simply does not match, which is a refusal the user understands immediately.
+
+**84. Sign-up writes the user and the credential in one unit of work.** The pairing
+argument `unit_of_work.py` already makes for notices and receipts. A user with no
+credential is an account nobody can ever log into, and it would be **invisible** —
+the sign-up would have reported success, the address would already be taken, and the
+person could neither log in nor try again. The `identity` group on `UnitOfWork` is
+correctness, not convenience, and says so where the others do.
+
+Note what the *database* does not do here: `password_credentials.user_id` is a
+primary key and **not** a foreign key into `users`, and `sessions` has no foreign
+key either. Identity-table integrity is guaranteed by the single unit of work, not
+by the schema — a real constraint belongs with the `wallets` foreign-key rebuild the
+roadmap already carries, and
+`test_sqlite_password_credential_repository.py` asserts the current behaviour rather
+than leaving a reader to assume the database is doing work it is not.
+
+**85. `SignUp` does not sign anybody in.** The password is in hand and a session
+could be minted immediately, which is exactly why the separation is worth stating:
+creating an identity and *proving* you hold it are different acts. A `signup` that
+also wrote a session file would mean the first token on a machine came from a
+command that never checked the password it had just been given. `POST /users`
+returns the account and no token, for the same reason and with the same
+consequence: a client that wants both makes both requests, and the second one is the
+one that could have failed — which is the distinction worth keeping, because "the
+address was free" and "the password works" are different facts.
+
+**86. `POST /users` and `POST /sessions` are the only unauthenticated writes in the
+API.** That is inherent to being the way in, and it is why rate limiting is a real
+2c item rather than a nicety. Every other endpoint resolves an actor.
+
+**87. The grade table gains a 401, and `MissingActorHeaderError` becomes
+`MissingCredentialsError`.** Its own docstring had already promised exactly this —
+*"The status changes to 401 in Phase 2, along with the header that replaces this
+one."* `UNAUTHORIZED = (InvalidSessionError, InvalidCredentialsError)`, which are
+one class for three situations (unknown token, expired token, orphaned session) and
+one class for two (unknown address, wrong password) respectively. `DuplicateEmailError`
+joins `CONFLICT`.
+
+An orphaned session — a valid token whose user row is gone — is the interesting one:
+`get_by_id` raises `UserNotFoundError`, which would reach a client as a **404**, a
+different answer to a question with one answer. `ResolveActorFromSession` catches it
+and re-raises `InvalidSessionError` `from None`, and
+`test_resolve_actor.py` asserts the two are indistinguishable in class *and* message
+rather than only that the right one is raised.
+
+**88. Endpoints stay `def`, and this is the phase that makes it matter.** FastAPI
+runs a synchronous endpoint in a threadpool, so argon2's verify — tens of
+milliseconds by design — blocks a worker thread rather than the event loop. It is
+the first genuinely slow call in this API, and moving the handlers to `async def`
+would be the change that turns a login into a stall for every other request in
+flight. Decision 70 said the endpoints were synchronous and the handlers were not;
+this is the reason that was not merely tidy.
+
+**89. `--user` and `DEV_USER_EMAIL` are deleted, together with the header.** The
+README already committed to the pairing, and 1b set it up so that there was **one**
+seam to change rather than two. What replaced them is `--session PATH`, defaulting
+to `$BUDGET_SESSION` and then `~/.config/budget/session`, mirroring how `--db`
+defaults to `DEFAULT_DATABASE_PATH` — both read in `settings.py`, which stays the
+one reader of `os.environ`.
+
+Where `DEV_USER_EMAIL` used to be there is now a comment explaining why there is no
+default: *leaving a default here would have been the whole bypass in one line.*
+
+`signup`, `login` and `logout` are the new commands. `login` is **the only command
+that writes the session file**, which is worth knowing when something goes wrong
+with the CLI's identity: there is exactly one place a token can come from, and it is
+a password typed at a prompt. `logout` calls the server **first and then** deletes
+the file, and the order is the whole of the safety — deleting the file first would
+mean a failure in between leaves a token that still works with no copy of it
+anywhere, so the session is not ended and the user cannot end it, because the thing
+that names it is gone.
+
+**90. The token file is created `0600` by `os.open`, not written and then
+`chmod`ed.** The two-step version leaves a window between the `open` and the
+`chmod` in which the file exists with whatever the umask allows, and a token that is
+world-readable for ten milliseconds on a shared machine is a token that was
+world-readable. `os.open(path, O_CREAT|O_WRONLY|O_TRUNC, 0o600)` takes the mode as an
+argument, so the file is born private. The mode is subject to the umask, which can
+only ever *remove* bits — so the result is at most `0600` and possibly stricter, and
+that asymmetry is the reason this is the safe direction to be wrong in. The test
+asserts "no group or other access" rather than equality with `0o600`, for the same
+reason.
+
+The file holds the token and nothing else, with a trailing newline. There is no
+format to parse, deliberately: a file with fields in it invites a reader to trust
+one of them, and the only field worth trusting here is the token, which is the one
+thing that cannot be checked locally anyway.
+
+**91. `main` resolves the actor only for the commands that need one.** Today it
+resolved before dispatch, unconditionally, and the README's "Still open" list
+already carried the complaint. `signup`, `login`, `logout` and `plan tick` are now
+dispatched **above** the line that resolves an actor, and `plan tick` is the one
+that made it required rather than tidy: it is the only command that runs as nobody,
+serving every user with a plan, and a scheduler that needed an actor would need a
+privileged account to run under — which is exactly the seat this arrangement
+removes. It works on a machine where nobody has ever logged in.
+
+The three identity commands run there for a different reason: they are how a session
+comes to exist or cease to, so none of them can require one. It also means a corrupt
+session file cannot stop somebody signing *in* over it, which is the ordinary repair.
+
+**92. `NotSignedInError` is a `CliError`, not a `MoneyError`.** "There is no file at
+this path" is not a fact about money or identity; it is a fact about this
+presentation's storage, and it belongs to the CLI's own root — which is why the CLI
+catches two roots where the API catches `MoneyError` and `ApiError`. Both render at
+the same line of output with the same exit code, because from a terminal they are
+the same event: the command did not do the thing, and here is why.
+
+The message names the path and the fix (*"not signed in: no session at
+/… - run 'login' first"*), because a wrong `--session` and never having logged in
+are different mistakes and the fix for each is different.
+
+**93. The test suite injects `FakePasswordHasher`, and argon2 really runs in exactly
+two files.** Argon2 is *designed* to be slow, and the suite has roughly two hundred
+sign-up and login operations across it — at tens of milliseconds each, that is
+twenty to thirty seconds of wall clock spent proving that arithmetic works. The fake
+is injected at the two seams the composition root exposes:
+`create_app(password_hasher=...)` for the API and `build_sign_up` /
+`build_log_in` for the CLI helpers.
+
+The trade is only honest if the thing being skipped is tested somewhere, and
+`tests/infrastructure/security/test_argon2_password_hasher.py` is where: that a hash
+is not the password, that two hashes of one password differ (so `LogIn` can never be
+written to compare hashes rather than call `verify`), that verify is false for the
+wrong one, that the variant is `argon2id` and the parameters travel inside the
+encoded string, and that a value which is not a hash at all *raises* rather than
+returning false — because swallowing that as a false would present database
+corruption as a user who cannot remember their password.
+
+That last claim turned out to have **two shapes, and they share no ancestor**.
+`argon2.exceptions` puts `VerifyMismatchError` under `VerificationError` under
+`Argon2Error`, but `InvalidHashError` — the one raised when the *header* is not
+recognised, before the library is even called — descends from `ValueError`. Both
+propagate through `verify` untouched, which is the behaviour that was wanted, but a
+single `except` can never name both, and the first version of this test asserted
+`VerificationError` for the `InvalidHashError` case and failed. There is now one test
+per shape, and the adapter's docstring says why the net is drawn where it is:
+`VerifyMismatchError` is the only class that means "the password was wrong".
+
+`tests/presentation/test_cli_identity.py` is the one presentation file that uses the
+real adapter, because `signup` and `login` are the two commands whose entire job is
+a password, and a fake here would mean nothing in the suite ever proved the CLI can
+verify a password the CLI wrote.
+
+**One API test uses it too, and only because it crosses between the two doors.**
+`test_actor.py::test_the_cli_and_the_api_resolve_one_address_to_one_account`
+registers through the CLI — which builds its own composition root, so it hashes with
+argon2 — and then signs in over HTTP through a client that by default verifies with
+the fake. Both sides are individually correct and the pair cannot work, and the
+failure presents as `InvalidCredentialsError` for a password that was typed
+correctly, which is the one thing that test exists to rule out. It therefore asks for
+a new `argon2_client` fixture instead of the standard one. This is worth recording
+rather than quietly fixing: the fake is invisible when a test stays on one side of
+it, so **any test that straddles the CLI and the API needs the real hasher**, and the
+symptom of forgetting looks exactly like the bug being tested for.
+
+**94. `as_user(email)` kept its signature, and that was the goal.** The API fixture
+used to return `{"X-User-Email": email}`; it now registers the address, logs in, and
+returns `{"Authorization": "Bearer …"}` — and roughly two hundred call sites across
+nine files were left alone. The reason it could be is that the fixture was already
+the right *shape*, a function from an address to headers, and only its contents were
+a lie. What changed is everything the contents mean: `as_user(BOB)` used to *assert*
+the caller was Bob and now has to **prove** it.
+
+Two things deliberately do not happen in it. The address is not folded before being
+used as a cache key, because folding is the application's rule and a fixture that
+did it would hide the one place it can be got wrong. And the header is spelled out
+rather than imported from `dependencies`, because a fixture built from the server's
+own constant would pass every test even if that constant were wrong — both sides
+would be wrong together.
+
+**95. `no_settings_environment` clears `BUDGET_SESSION` as well as `BUDGET_DB`.** A
+developer with it exported has a token in that file, and the suite would otherwise
+authenticate as them against a `tmp_path` database. The existing comment already
+described this failure mode for the database; this is the same hazard arriving
+through a second variable.
+
+**96. The loopback bind kept its conclusion and lost its reason.** `__main__.py`
+justified binding `127.0.0.1` by the shim: the header named a user and proved
+nothing, so a process listening on every interface was one anyone on the network
+could act as anyone through. Phase 2a deleted the header and the sentence outlived
+it. The bind is still right, and for the opposite kind of reason - this API speaks
+plain HTTP, so a wider bind now means passwords and session tokens crossing the
+network in the clear. Rewritten rather than deleted, because a stale rationale is
+worse than none: the next reader takes "the shim's blast radius" as a constraint
+that has lifted, and concludes the default is free to widen.
+
+#### The manual verification, against a real server
+
+The plan's six checks were then run against a **real uvicorn process on a socket**
+rather than starlette's in-process `TestClient`, which is a genuinely different
+claim: the client the suite uses skips the socket, the ASGI server and the process
+boundary. The script built its own database in a temp directory and deleted it on
+exit, so it could not touch `budget.db` or a developer's real session file.
+
+Three results are worth keeping:
+
+- `X-User-Email: whoever@example.com` answers **401**, as does a fabricated bearer
+  token - the same answer a missing token gets. The endpoint cannot be asked which
+  tokens are real, which is decision 55 arriving in the authentication layer.
+- Bob's 404 on alice's wallet is **byte-identical** to a random UUID's 404 *after
+  both crossed uvicorn, the serializer and a socket*. The suite compares two bodies
+  it built in-process; this compares two that went over the wire.
+- `plan tick` exits 0 with **no session file at all**, which is decision 91's claim
+  that the scheduler is not a privileged actor. The token file came out mode `0600`
+  (decision 90).
+
+One check needed a human, and it is a property of the design rather than a defect:
+**`getpass` prefers `/dev/tty` to stdin**, falling back to stdin only when there is
+no controlling terminal. A script that pipes the password in does not work - the
+prompt ignores the pipe and waits at the terminal, which is what happened on the
+first attempt. That is decision 83's refusal seen from the other side: the password
+cannot be smuggled in through an argument, and it cannot be smuggled in through a
+file descriptor either. Driving the CLI non-interactively therefore means taking the
+controlling terminal away first, and nothing in this project does. The suite never
+noticed the distinction and could not have: it answers the prompt through a
+monkeypatched `getpass` (`typed_password` in `tests/conftest.py`), which substitutes
+for the reading rather than performing it - so the one place the terminal's
+preference matters is the one place no test stands in for.
+
+A second thing that attempt surfaced, and it was a mistake in the harness rather
+than in the code: the API has no module-level `app` to point uvicorn at. The
+correct target is the factory, `app.presentation.api.app:create_app --factory`, as
+`__main__.py` documents. A module-level `app = create_app()` would build the whole
+composition root at *import* time against whatever the environment held at that
+moment, and hand a live application to anything that imported the module for
+another reason.
+
 ### Still open
+
+- **Rebuilding `wallets` to carry a foreign key to `users`** (decision 59). A
+  SQLite table rebuild with `PRAGMA foreign_keys` off, on a table holding real
+  balances, which wants a backup story worth trusting before it is attempted. The
+  repository provides the integrity in the meantime.
+- ~~**Removing the CLI's `--user` shim and the API's `X-User-Email` header** once
+  there are real sessions.~~ **Done, in Phase 2a** - both deleted in one commit, as
+  this entry said they would be, along with `ResolveUserByEmail` and
+  `DEV_USER_EMAIL`. The reasoning is kept because it is the argument for why they
+  had to go *together*: deleting `--user` while the API still resolved an actor from
+  an unverified header would have removed the honest, obviously-development door and
+  kept the one that looks like a real one. The single seam the entry predicted -
+  "`ResolveUserByEmail` is the single thing both doors call, so that commit has one
+  place to change and not two" - is exactly how it went. See decisions 80 and 89.
+- **Rate limiting on `POST /users` and `POST /sessions`** (decision 86). They are
+  the only unauthenticated writes in the API, which is inherent to being the way in
+  - and it makes them the only endpoints where an unauthenticated caller can spend
+  server resources. Two things ride on this: the argon2 work a login costs, and
+  **the timing gap decision 81 documents**, where an unknown address returns without
+  hashing anything and so answers measurably faster than a wrong password. The fix
+  for the second is four lines - verify against a dummy hash when no credential is
+  found - and it belongs here rather than on its own, because rate limiting
+  addresses the same threat directly *and* covers the sign-up path, which the dummy
+  hash cannot.
+- **Rebuilding the identity tables to carry foreign keys** (decision 84).
+  `password_credentials.user_id` and `sessions.user_id` are plain columns, so the
+  pairing between an account and its credential is guaranteed by `SignUp` writing
+  both rows in one unit rather than by the schema. Same shape as the `wallets`
+  rebuild above, same blocker, and worth doing in the same pass.
+- **Re-hashing a password whose parameters have fallen behind.** Found while pinning
+  `argon2-cffi`, and it is a gap rather than a detail. Every encoded hash carries the
+  cost parameters it was made with, which is what makes raising the cost *safe* — old
+  passwords keep verifying. But `PasswordHasher` is a two-method port, `hash` and
+  `verify`, and neither re-hashes, so a password set under an old cost stays at that
+  old cost until its owner changes it. The migration is re-hash-on-next-successful-login,
+  which is the only moment the plaintext is in hand — a third port method, or a third
+  return value from `verify`, and either one is a change to a port rather than a line
+  in the adapter. Not urgent: nothing has raised the cost yet, and the pin in
+  `requirements.txt` is what makes that true on purpose. Also written into the
+  `Argon2PasswordHasher` docstring, because "the parameters travel inside the hash" is
+  otherwise very easy to read as "the upgrade is handled".
+- **A second caller of `list_by_status` is a hole if it is user-reachable**
+  (decision 57). Today the two callers are both installation-wide background jobs
+  and `PlanService` does not expose it. That boundary is enforced by convention
+  rather than by a signature, so it is worth re-reading when a third caller appears.
+- ~~**`main` resolves the development user for every command, including the ones
+  that do not act as anybody.**~~ **Done, in Phase 2a** (decision 91). The identity
+  commands and `plan tick` are now dispatched above the line that resolves an actor,
+  so a fresh database no longer grows a `dev@localhost` row on the way past a tick -
+  there is no default identity left for anything to create.
+- **Password reset and email verification.** Neither blocks the design: an account
+  that cannot reset its password is inconvenient, an account that cannot exist is a
+  non-starter. But a password that is forgotten today is an account that is gone,
+  and the confirmation mail is also what would make an address *verified* rather
+  than merely claimed.
 
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
   reads "salary" instead of a bare internal reference.
@@ -1146,27 +2159,110 @@ usually missing and the half that decides whether the other half ships.
 
 ### Phase 1 - Identity and the HTTP API
 
-The foundation, and nothing else on this list works before it.
+The foundation, and nothing else on this list works before it. Split in two,
+because the two halves have different risks and the first one is done.
+
+**Phase 1a - ownership in the domain and the store. Complete.** The question this
+answered was never "is there a `users` table", it was "can any code read a wallet
+without naming whose it is" - because the answer used to be yes, and it would have
+stayed yes under an API that merely *passed* a user id around. What shipped:
 
 - A `User` aggregate and a `users` table, so `wallets.user_id` finally points at
-  something. Email, a Google subject id, a created-at moment.
-- **Authorization, not just authentication**: every wallet read and write checked
-  against the calling user. Today the field exists and is never consulted, which
-  is the largest actual hole in the system.
-- A FastAPI application exposing what the CLI already exposes. This is a *new
-  presentation layer*, not a rewrite: `WalletService` and `PlanService` are the
-  seam, and the API calls the same use cases the CLI does.
-- A health endpoint, because a VPS deploy without one cannot be checked.
+  something: an email folded to one spelling, an optional Google subject id, a
+  created-at moment, and no credential of any kind (decision 53).
+- **Authorization by construction rather than by policy.** `get_by_id` is gone
+  from the wallet and plan ports and `get_owned(id, user_id)` replaced it, so there
+  is no unscoped wallet read left to call and "read someone else's wallet" is not a
+  reachable mistake (decision 54).
+- A foreign wallet reports as *not found*, indistinguishable from a nonexistent
+  one, so a guessable id is not an enumeration oracle (decision 55).
+- Plans carry their owner, which is what lets the tick run every user's plans
+  without being granted authority over any of them (decision 56).
+- The service's actor bound at construction, so the 248 existing call sites kept
+  their signatures and a request cannot change who it acts as halfway through.
+
+`tests/application/planning/test_run_due_plans.py::TestTheSchedulerIsNotAPrivilegedActor`
+is the load-bearing test: two users, both plans due, one tick, each run reading its
+own wallet as its own owner.
+
+**Phase 1b - the FastAPI application. Complete.** It had nothing left to invent,
+which is the whole reason 1a came first: the API calls the same use cases the CLI
+does, and every one of them already knows who is asking. What shipped:
+
+- A FastAPI application under `app/presentation/api/`, a sibling of `cli.py`, with
+  `create_app(unit_of_work_factory=..., settings=..., database_path=...)` following
+  the composition root's existing optional-injection pattern. `WalletService` and
+  `PlanService` are the seam, untouched (decision 48).
+- **The boundary is at balance changes, not at writes** (decision 62) - reads,
+  wallet and pot creation, and plan steering. Every operation that moves money,
+  plus the two installation-wide jobs, is held until Phase 2.
+- The actor is an `X-User-Email` header (decision 63), resolved through the same
+  `ResolveUserByEmail` use case the CLI's `--user` calls (decision 64). One
+  service is built per request, for that actor (decision 65).
+- A foreign wallet is a 404 with the body a typo gets, asserted by asking for both
+  and comparing (decision 66).
+- Refusals graded 404 / 409 / 400 / 422 / 500 by what kind of question was refused
+  (decision 67), money as a string on the wire (68), enums as their `.value` (69).
+- `GET /health`, which needs no actor and says nothing about the installation's
+  contents.
+
+The CLI's `--user EMAIL` is a **development shim**, not a design - and so is the
+header, which is the same shim by another transport rather than a replacement for
+it. The earlier claim that `--user` "must not survive into the API" is corrected
+above: both survive until the real actor arrives from an authenticated session in
+Phase 2, and both are deleted in that commit. Deleting the CLI's half early would
+have removed the honestly-labelled development door and kept the one that looks
+like production.
+
+**That is exactly what happened, one phase later** (decisions 80 and 89): both went
+together, in the commit that introduced sessions.
 
 ### Phase 2 - Authentication
 
-Everything here is a property of the API built in Phase 1.
+The phase that turns Phase 1b's honest shim into a real actor. Split in two,
+because the first half is the one with the hard property to prove and the second is
+the one that spends it.
 
-- Opaque session tokens, hashed at rest, revocable by deletion (decision 49).
-- Password hashing with argon2, if email and password signup is wanted at all.
-- Google OIDC signup, matching on the Google subject id rather than the email.
+**Phase 2a - sessions, and the death of both shims. Complete.** The lock the
+thirteen money endpoints are held behind, and the half of Phase 2 with the hard
+property to prove: an actor that can only be reached by proving you are it. What
+shipped:
+
+- Email and password with argon2id (decision 72), the credential in its own table
+  rather than on `User` (73), SHA-256 for the session token and the difference from
+  argon2 stated rather than assumed (74).
+- An opaque session token, returned once and never readable again (75), expiring
+  absolutely thirty days out (76), checked rather than self-reading its clock (77),
+  revocable by **deletion** rather than a flag (78).
+- `LogOut` taking a token instead of an actor (79), `ResolveUserByEmail` deleted and
+  replaced by `ResolveActorFromSession` (80), and one refusal for both an unknown
+  address and a wrong password (81).
+- `POST /users`, `POST /sessions` and `DELETE /sessions/current`; the 401 row in the
+  grade table; `MissingActorHeaderError` becoming `MissingCredentialsError` (87).
+- `signup`, `login` and `logout` in the CLI, `--user` and `DEV_USER_EMAIL` deleted,
+  a `0600` session file created with `os.open` rather than `chmod`ed (89, 90), and
+  `main` resolving an actor only for the commands that need one (91).
+
+The load-bearing tests are
+`tests/presentation/api/test_actor.py::TestTheShimIsDead` (the header that used to
+work now achieves nothing, and neither does a token shaped like an address) and
+`tests/application/identity/test_log_in.py::TestTheSameRefusalForBoth` (the
+account-enumeration oracle, closed).
+
+**Phase 2b - the money endpoints.** Every operation held by decision 62, now that
+there is an actor worth spending a session on.
+
+**Phase 2c - the rest of it:**
+
+- Google OIDC signup, matching on the Google subject id rather than the email. This
+  is why `User` carries an optional `google_subject` and why `LogIn` already has a
+  branch for an account with no password credential.
 - Rate limiting on the auth endpoints first - login and signup are the ones worth
-  brute-forcing - then on the API generally.
+  brute-forcing - then on the API generally. It also carries the timing fix
+  decision 81 documents.
+- Password reset and email verification.
+- Session listing and per-device revocation. The store already supports it, since a
+  session is a row and revocation is a deletion; what is missing is the endpoints.
 - TLS. Non-negotiable, and the reason a reverse proxy sits in Phase 4.
 
 ### Phase 3 - Paystack

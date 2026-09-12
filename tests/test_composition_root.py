@@ -14,12 +14,21 @@ from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
-from app.infrastructure.notifications.email_settings import EmailSettings
+from app.infrastructure.settings import EmailSettings
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
+from tests.conftest import TEST_USER_ID
 
 NGN = Currency.NGN
+
+#: The user every service built in this file acts as.
+#:
+#: A file about *wiring* still has to answer "who?", because every builder now
+#: requires it. That is the point of the parameter being required rather than
+#: defaulted: the composition root is where a wrong answer would be most
+#: expensive and least visible, so it is the place least able to inherit silence.
+ACTOR = TEST_USER_ID
 
 
 def test_two_service_instances_share_state_over_one_database(tmp_path, build_wallet):
@@ -31,7 +40,7 @@ def test_two_service_instances_share_state_over_one_database(tmp_path, build_wal
     seed.wallets.save(wallet)
     seed.commit()
 
-    service_one = build_wallet_service(unit_of_work_factory=factory)
+    service_one = build_wallet_service(unit_of_work_factory=factory, actor=ACTOR)
     service_one.deposit(
         wallet.wallet_id,
         Money(Decimal("5000"), NGN),
@@ -40,7 +49,7 @@ def test_two_service_instances_share_state_over_one_database(tmp_path, build_wal
 
     # A second, independently-constructed service reads the committed deposit
     # and withdraws from it - state persisted across instances.
-    service_two = build_wallet_service(unit_of_work_factory=factory)
+    service_two = build_wallet_service(unit_of_work_factory=factory, actor=ACTOR)
     service_two.withdraw(
         wallet.wallet_id,
         Money(Decimal("3000"), NGN),
@@ -49,7 +58,7 @@ def test_two_service_instances_share_state_over_one_database(tmp_path, build_wal
 
     read = factory.start()
     try:
-        stored = read.wallets.get_by_id(wallet.wallet_id)
+        stored = read.wallets.get_owned(wallet.wallet_id, wallet.user_id)
     finally:
         read.rollback()
     assert stored.available_balance == Money(Decimal("12000"), NGN)
@@ -297,6 +306,7 @@ def test_build_wallet_service_addresses_receipts_to_the_configured_recipient(
     seed.commit()
     service = build_wallet_service(
         unit_of_work_factory=factory,
+        actor=ACTOR,
         settings=EmailSettings(
             host="smtp.example.com",
             port=587,
@@ -328,7 +338,9 @@ def test_build_wallet_service_without_settings_is_silent_and_still_pays(
     seed = factory.start()
     seed.wallets.save(wallet)
     seed.commit()
-    service = build_wallet_service(unit_of_work_factory=factory, settings=None)
+    service = build_wallet_service(
+        unit_of_work_factory=factory, settings=None, actor=ACTOR
+    )
 
     service.deposit(
         wallet.wallet_id,
@@ -339,7 +351,7 @@ def test_build_wallet_service_without_settings_is_silent_and_still_pays(
     read = factory.start()
     try:
         assert read.notifications.pending() == []
-        stored = read.wallets.get_by_id(wallet.wallet_id)
+        stored = read.wallets.get_owned(wallet.wallet_id, wallet.user_id)
     finally:
         read.rollback()
     assert stored.available_balance == Money(Decimal("15000"), NGN)
@@ -383,4 +395,42 @@ def test_build_scheduler_addresses_run_receipts_to_the_configured_recipient(
     assert len(queued) == 1
     assert queued[0].recipient == "chinedu@example.com"
     assert queued[0].subject_id == plan.plan_id
+
+
+def test_build_scheduler_runs_a_plan_whose_owner_it_was_never_told(
+    tmp_path, build_wallet, build_plan, stranger
+):
+    """The wiring claim behind "the scheduler is not a privileged actor".
+
+    ``build_scheduler`` is the one builder here that takes no ``actor``, and this
+    is what its absence has to mean in practice: the tick runs a plan belonging
+    to a user nothing in this file ever named, because it learns the owner from
+    the plan and builds an executor for that owner. If the builder instead held
+    one executor - or passed a fixed actor - the run would fail to find the plan
+    or the wallet, and it would fail here.
+
+    Note this is a *wiring* test and not a repeat of the scheduler's own suite:
+    what it pins is that the composition root passes a builder rather than a
+    built object. That distinction is invisible in ``RunDuePlans`` itself once the
+    lambda is in place, which is exactly why it is worth an assertion where the
+    lambda is written.
+    """
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
+    wallet = build_wallet(locked="10000", user_id=stranger)
+    plan = build_plan(wallet_id=wallet.wallet_id, user_id=stranger)
+    seed = factory.start()
+    seed.wallets.save(wallet)
+    seed.plans.save(plan)
+    seed.commit()
+    scheduler = build_scheduler(unit_of_work_factory=factory)
+
+    runs = scheduler.execute(datetime(2026, 1, 1))
+
+    assert [run.status.value for run in runs] == ["succeeded"]
+    read = factory.start()
+    try:
+        stored = read.wallets.get_owned(wallet.wallet_id, stranger)
+    finally:
+        read.rollback()
+    assert stored.locked_balance == Money(Decimal("8000"), NGN)
 

@@ -175,7 +175,7 @@ def test_rollback_discards_a_wallet_and_its_transaction(tmp_path, build_wallet):
     # A fresh unit - a new connection - must see neither write.
     fresh = factory.start()
     with pytest.raises(WalletNotFoundError):
-        fresh.wallets.get_by_id(wallet.wallet_id)
+        fresh.wallets.get_owned(wallet.wallet_id, wallet.user_id)
     assert fresh.transactions.get_by_internal_reference(internal_reference) is None
     fresh.rollback()
 
@@ -192,7 +192,7 @@ def test_commit_persists_wallet_and_transaction_together(tmp_path, build_wallet)
     uow.commit()
 
     fresh = factory.start()
-    stored_wallet = fresh.wallets.get_by_id(wallet.wallet_id)
+    stored_wallet = fresh.wallets.get_owned(wallet.wallet_id, wallet.user_id)
     assert stored_wallet.available_balance == Money(Decimal("15000"), NGN)
     stored_transaction = fresh.transactions.get_by_internal_reference(
         internal_reference
@@ -212,14 +212,14 @@ def test_rollback_keeps_the_prior_committed_balance(tmp_path, build_wallet):
 
     # Second unit: a deposit that is then abandoned mid-operation.
     second = factory.start()
-    stored = second.wallets.get_by_id(wallet.wallet_id)
+    stored = second.wallets.get_owned(wallet.wallet_id, wallet.user_id)
     stored.apply_deposit(Money(Decimal("5000"), NGN))
     second.wallets.save(stored)
     second.rollback()
 
     fresh = factory.start()
     assert (
-        fresh.wallets.get_by_id(wallet.wallet_id).available_balance
+        fresh.wallets.get_owned(wallet.wallet_id, wallet.user_id).available_balance
         == Money(Decimal("10000"), NGN)
     )
     fresh.rollback()
@@ -231,6 +231,17 @@ def test_rollback_keeps_the_prior_committed_balance(tmp_path, build_wallet):
 WALLET_ID = "11111111-1111-1111-1111-111111111111"
 OTHER_WALLET_ID = "22222222-2222-2222-2222-222222222222"
 USER_ID = "33333333-3333-3333-3333-333333333333"
+
+#: ``USER_ID`` as the repository wants it: a ``uuid.UUID``, not the text the
+#: legacy row is written with.
+#:
+#: The two forms are not interchangeable and the reason is the layering rather
+#: than a quirk: ``get_owned`` takes the domain's type, while the hand-written
+#: legacy row holds the stored form. A test that passes the string gets a
+#: ``WalletNotFoundError`` - correctly, since no column could match it - and the
+#: failure would look like a scoping bug rather than a type mistake. Naming the
+#: conversion here is what keeps that from being re-derived at each call site.
+LEGACY_USER_ID = UUID(USER_ID)
 
 
 def legacy_wallet_row(wallet_id, locked, available="10000.00"):
@@ -273,7 +284,7 @@ def test_a_locked_balance_is_migrated_into_a_pot(tmp_path):
 
     stored = SqliteUnitOfWorkFactory(db_path).start()
     try:
-        wallet = stored.wallets.get_by_id(WALLET_ID)
+        wallet = stored.wallets.get_owned(WALLET_ID, LEGACY_USER_ID)
         assert wallet.locked_balance == Money(Decimal("4000.00"), NGN)
         assert wallet.available_balance == Money(Decimal("10000.00"), NGN)
         assert wallet.fund_by_name("Locked").is_open
@@ -296,7 +307,9 @@ def test_a_wallet_that_never_locked_anything_gains_no_pot(tmp_path):
 
     stored = SqliteUnitOfWorkFactory(db_path).start()
     try:
-        assert stored.wallets.get_by_id(WALLET_ID).funds == ()
+        assert (
+            stored.wallets.get_owned(WALLET_ID, LEGACY_USER_ID).funds == ()
+        )
     finally:
         stored.rollback()
 
@@ -321,8 +334,8 @@ def test_each_wallet_gets_its_own_pot(tmp_path):
 
     stored = SqliteUnitOfWorkFactory(db_path).start()
     try:
-        first = stored.wallets.get_by_id(WALLET_ID)
-        second = stored.wallets.get_by_id(OTHER_WALLET_ID)
+        first = stored.wallets.get_owned(WALLET_ID, LEGACY_USER_ID)
+        second = stored.wallets.get_owned(OTHER_WALLET_ID, LEGACY_USER_ID)
         assert first.locked_balance == Money(Decimal("4000.00"), NGN)
         assert second.locked_balance == Money(Decimal("1750.50"), NGN)
         assert first.funds[0].fund_id != second.funds[0].fund_id
@@ -575,6 +588,32 @@ def legacy_pot_row(fund_id, wallet_id, name, balance, kind="PERSONAL"):
     )
 
 
+def legacy_plan_row(plan):
+    """A plan row in the shape a release before ``user_id`` would have written.
+
+    Written with the real serializers rather than hand-typed JSON, for the reason
+    every legacy row in this module is: a hand-typed string would test the
+    migration against a shape no release ever produced. The column order matches
+    ``LEGACY_POTS_SCHEMA``'s ``savings_plans``, which is the whole point of the
+    helper - the migration's job is to reconcile *that* order with the current
+    one, so the row has to be in that order.
+    """
+    return (
+        uuid_to_text(plan.plan_id),
+        uuid_to_text(plan.wallet_id),
+        plan.name,
+        enum_to_text(plan.source),
+        schedule_to_text(plan.schedule),
+        instructions_to_text(plan.instructions),
+        enum_to_text(plan.status),
+        plan.completed_runs,
+        # ends_on: left out of these rows because the tests about the owner do not
+        # vary it, and a NULL there is what most plans carry anyway.
+        None,
+        datetime_to_text(plan.created_at),
+    )
+
+
 def build_pre_phase_b_database(db_path, pots, plans=()):
     """A database written by the release before a plan could name a pot.
 
@@ -632,6 +671,122 @@ def test_a_pots_commitment_columns_arrive_on_an_old_database(tmp_path):
 
     assert {"sealed_at", "first_funded_at"} <= funds
     assert "fund_id" in plans
+
+
+def test_a_plans_owner_arrives_by_backfill_from_its_wallet(tmp_path, build_plan):
+    """The new owner column on a database that already holds plans.
+
+    This is the one migration in the phase that cannot be tested from a fresh
+    fixture, and the one whose failure mode is quiet. A plan whose ``user_id``
+    came out empty is not an error anywhere - it is a plan that no actor can
+    find, because every read is scoped to an owner and ``''`` belongs to nobody.
+    It would look exactly like a plan that had been deleted.
+
+    So the assertion is about the *value*: the owner is copied from the wallet the
+    plan already drew on, which is the only place it was ever recorded. Nothing
+    is invented here - ``wallets.user_id`` was always the truth, and this column
+    is the duplicate that lets the scheduler read a wallet without a bypass.
+    """
+    db_path = str(tmp_path / "legacy_owner.db")
+    plan = build_plan(wallet_id=UUID(WALLET_ID))
+    build_pre_phase_b_database(db_path, [], plans=[legacy_plan_row(plan)])
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT user_id FROM savings_plans"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    assert [row["user_id"] for row in rows] == [USER_ID]
+
+
+def test_the_owner_backfill_leaves_no_plan_orphaned(tmp_path, build_plan):
+    """``''`` is the one answer that would be worse than a wrong one.
+
+    The column is ``NOT NULL``, and SQLite allows adding such a column only with
+    a default - which is why a migrated database carries ``DEFAULT ''`` where a
+    fresh one carries none. That asymmetry is the risk this test prices: an
+    ``INSERT`` that forgets the owner would write an empty string on a migrated
+    database and a hard error on a fresh one, so the two would disagree about
+    whether forgetting is possible.
+
+    Asserted as a count rather than as "every row has an owner", because that is
+    the form the claim takes: **no row is reachable by nobody**. Re-opening the
+    database runs the migration a second time as well, so this also pins that the
+    backfill is re-runnable - an ``UPDATE`` that only worked once would leave the
+    second open with nothing to do and, if it had appended or reset anything, no
+    row left untouched to notice with.
+    """
+    db_path = str(tmp_path / "legacy_orphans.db")
+    plans = [
+        build_plan(wallet_id=UUID(WALLET_ID)),
+        build_plan(wallet_id=UUID(WALLET_ID), name="rent"),
+    ]
+    build_pre_phase_b_database(db_path, [], plans=[legacy_plan_row(plan) for plan in plans])
+
+    for _ in range(2):  # every connection runs the migrations
+        connection = open_sqlite_connection(db_path)
+        try:
+            orphans = connection.execute(
+                "SELECT count(*) FROM savings_plans WHERE user_id = ''"
+            ).fetchone()[0]
+            total = connection.execute(
+                "SELECT count(*) FROM savings_plans"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        assert orphans == 0
+        assert total == len(plans)
+
+
+def test_a_plan_written_after_the_migration_still_carries_an_owner(tmp_path, build_plan):
+    """The other half of the ``DEFAULT ''`` asymmetry: the hole is unreachable.
+
+    A *fresh* database has no default on ``user_id``, so a write that forgot the
+    owner would fail loudly and this test would be proving very little. A
+    *migrated* one has ``DEFAULT ''``, and there a forgotten owner is written
+    silently - a plan in the table that no actor can be scoped to find, which
+    looks exactly like a plan that was deleted.
+
+    So the database here is a migrated one, deliberately: that is the only shape
+    where the claim is worth anything. Then a plan goes in through the real
+    repository, and the assertion is that the owner arrived. What makes that true
+    is not the schema - the schema permits the opposite - but the aggregate
+    refusing a plan with no owner and the repository always writing the column.
+
+    Written against the repository rather than the service on purpose: the
+    service is a second door with its own scoping, and the claim here is about
+    the *store*. The wallet row is the one ``build_pre_phase_b_database`` already
+    inserted, so nothing needs saving first - and saving a wallet of our own
+    would put a second one in the table and make the fixture say less than it
+    looks like it does.
+    """
+    db_path = str(tmp_path / "migrated_owner.db")
+    build_pre_phase_b_database(db_path, [])
+    factory = SqliteUnitOfWorkFactory(db_path)
+    plan = build_plan(wallet_id=UUID(WALLET_ID), user_id=UUID(USER_ID))
+
+    uow = factory.start()
+    try:
+        uow.plans.save(plan)
+        uow.commit()
+    except BaseException:
+        uow.rollback()
+        raise
+
+    connection = sqlite3.connect(db_path)
+    try:
+        stored = connection.execute(
+            "SELECT user_id FROM savings_plans"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert stored == USER_ID
+    assert stored != ""
 
 
 def test_the_backfill_keeps_an_empty_pot_unfunded(tmp_path):
@@ -762,31 +917,22 @@ def test_a_plan_saved_before_pots_could_be_named_still_hydrates(
     uuid because the row below is supposed to belong to the wallet the legacy
     database already holds - a plan pointing at a wallet that does not exist
     would be a database no release could have written.
+
+    The owner is ``LEGACY_USER_ID`` for that same reason, and it is worth being
+    explicit because it is the one thing here the *test* has to get right rather
+    than observe. The legacy wallet is owned by ``USER_ID``, so the backfill
+    copies ``USER_ID`` onto the plan - and a plan object built with the suite's
+    default owner would then be read back as a stranger's plan and come back
+    not-found. That is the scoping working, not a bug: it is the same answer a
+    real caller would get for a wallet that is not theirs.
     """
     db_path = str(tmp_path / "legacy_plan.db")
-    plan = build_plan(wallet_id=UUID(WALLET_ID))
-    build_pre_phase_b_database(
-        db_path,
-        [],
-        plans=[
-            (
-                uuid_to_text(plan.plan_id),
-                uuid_to_text(plan.wallet_id),
-                plan.name,
-                enum_to_text(plan.source),
-                schedule_to_text(plan.schedule),
-                instructions_to_text(plan.instructions),
-                enum_to_text(plan.status),
-                plan.completed_runs,
-                None,
-                datetime_to_text(plan.created_at),
-            )
-        ],
-    )
+    plan = build_plan(wallet_id=UUID(WALLET_ID), user_id=LEGACY_USER_ID)
+    build_pre_phase_b_database(db_path, [], plans=[legacy_plan_row(plan)])
 
     fresh = SqliteUnitOfWorkFactory(db_path).start()
     try:
-        stored = fresh.plans.get_by_id(plan.plan_id)
+        stored = fresh.plans.get_owned(plan.plan_id, plan.user_id)
         assert stored.fund_id is None
         assert stored.instructions == plan.instructions
         assert stored.source is plan.source
@@ -812,7 +958,9 @@ def test_a_pot_round_trips_its_two_moments(tmp_path, build_wallet):
 
     fresh = factory.start()
     try:
-        stored = fresh.wallets.get_by_id(wallet.wallet_id).fund_by_name("Locked")
+        stored = fresh.wallets.get_owned(
+            wallet.wallet_id, wallet.user_id
+        ).fund_by_name("Locked")
         assert stored.sealed_at == pot.sealed_at
         assert stored.first_funded_at == pot.first_funded_at
         assert stored.first_funded_at is not None
@@ -838,7 +986,9 @@ def test_an_empty_pot_round_trips_as_never_funded(tmp_path, build_wallet):
 
     fresh = factory.start()
     try:
-        stored = fresh.wallets.get_by_id(wallet.wallet_id).fund_by_name("Supplier")
+        stored = fresh.wallets.get_owned(
+            wallet.wallet_id, wallet.user_id
+        ).fund_by_name("Supplier")
         assert stored.first_funded_at is None
         assert stored.balance == Money(Decimal("0"), NGN)
     finally:
@@ -866,7 +1016,7 @@ def test_a_plans_pot_round_trips(tmp_path, build_wallet, build_plan):
 
     fresh = factory.start()
     try:
-        stored = fresh.plans.get_by_id(plan.plan_id)
+        stored = fresh.plans.get_owned(plan.plan_id, plan.user_id)
         assert stored.fund_id == pot_id
     finally:
         fresh.rollback()
@@ -890,6 +1040,6 @@ def test_a_legacy_plans_pot_round_trips_as_none(tmp_path, build_wallet, build_pl
 
     fresh = factory.start()
     try:
-        assert fresh.plans.get_by_id(plan.plan_id).fund_id is None
+        assert fresh.plans.get_owned(plan.plan_id, plan.user_id).fund_id is None
     finally:
         fresh.rollback()
