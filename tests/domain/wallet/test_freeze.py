@@ -6,7 +6,7 @@ from app.domain.money.currency import Currency
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.money.exception import (
     WalletAlreadyFrozenError,
-    WalletAlreadyClosedError
+    WalletClosedError
 )
 
 def test_freeze_wallet():
@@ -45,8 +45,8 @@ def test_freezing_closed_wallet_raises_error():
         _available_balance=Money(10000, Currency.NGN)
     )
 
-    with pytest.raises(WalletAlreadyClosedError):
-        wallet.freeze()   
+    with pytest.raises(WalletClosedError):
+        wallet.freeze()
 
 
 

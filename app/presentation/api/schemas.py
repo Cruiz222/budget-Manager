@@ -116,6 +116,70 @@ class TransactionOut(BaseModel):
     reversed_at: datetime | None = None
 
 
+class ConfirmationOut(BaseModel):
+    """A recorded request to move money out. **Nothing has moved.**
+
+    This is what the three money routes answer with now, and the change of shape
+    is the feature: a withdrawal request no longer returns a transaction, because
+    no transaction exists yet. A client holding one of these holds a question, and
+    the answer is a separate call.
+
+    **``status`` is not simply the stored column.** A request past its window
+    still *stores* ``awaiting`` - nothing sweeps, and expiry is derived - so the
+    server reports ``expired`` for it through ``Confirmation.status_as_of``. A
+    client must not reconstruct this from ``expires_at`` against its own clock:
+    the window is judged by the server's, and a response that let the two
+    disagree would tell a client its request was live when the next call refuses
+    it. See ``ConfirmationStatus.EXPIRED``.
+
+    ``amount`` and ``destination`` are absent for a ``close``, which moves no
+    money and names no account - the same asymmetry ``ConfirmedOperationOut``
+    carries one level up, and the same one ``FundOut.maturity_date`` handles by
+    sending the *reason* for the null alongside it. Here the reason is ``kind``:
+    a client that sees ``close`` should expect both to be absent.
+    """
+
+    confirmation_id: UUID
+    kind: str = Field(examples=["payout_from_locked"])
+    status: str = Field(examples=["awaiting"])
+    wallet_id: UUID
+    amount: MoneyOut | None = None
+    destination: DestinationOut | None = None
+    fund_name: str | None = None
+    internal_reference: str
+    created_at: datetime
+    #: When the window closes. Sent as a moment rather than a duration, like
+    #: ``SessionOut.expires_at``: a client that knows when its request dies can
+    #: answer it before it does, which is the difference between a prompt and an
+    #: error.
+    expires_at: datetime
+
+
+class ConfirmedOperationOut(BaseModel):
+    """What answering a confirmation produced: the request, the row, the wallet.
+
+    Three things, and the third is sometimes absent on purpose - ``transaction``
+    is ``None`` for a ``close``, which moves no money and so writes no ledger row.
+    ``None`` here means *this operation writes no row*, not *the row is unknown*
+    and not *the row is still being made*: a payout's row is PENDING, which is a
+    different thing entirely and is why the status travels inside it.
+
+    ``confirmation`` is the request **as it was persisted**, re-read after the
+    movement committed rather than assembled from the request that was sent. So
+    its ``status`` is ``confirmed``, and its window has stopped mattering.
+
+    ``wallet`` comes back because it is what a person actually asks next, and
+    this is the only place it can come from: the balance after the movement
+    exists only inside the unit that made it. A client that had the transaction
+    and not the wallet would have to make a second read to learn what the
+    operation did to the balance it just spent.
+    """
+
+    confirmation: ConfirmationOut
+    transaction: TransactionOut | None = None
+    wallet: WalletOut
+
+
 class ScheduleOut(BaseModel):
     """When a plan repeats.
 
@@ -372,3 +436,108 @@ class LogInIn(BaseModel):
 
     email: str = Field(examples=["ada@example.com"])
     password: str = Field(repr=False, examples=["a long phrase you will remember"])
+
+
+# --- moving money -----------------------------------------------------------
+
+
+class MovementIn(BaseModel):
+    """A bare amount against a wallet, and the key that makes a retry safe.
+
+    ``amount`` is a string read in the wallet's own currency, exactly as the CLI
+    reads a bare ``5000`` and for the reason ``InstructionIn.amount`` gives: the
+    currency is a property of the wallet, not of the number typed.
+
+    **``ref`` is an idempotency key, and sending one twice is safe by design.**
+    Two requests carrying the same key do not move money twice: the second finds
+    the first's request and returns it unchanged.
+
+    **The key now names the request rather than the ledger row**, and that is a
+    promotion rather than a change of meaning. It used to key the transaction
+    directly; it now keys the record that will produce one, and the key travels
+    down to that row still namespaced to the wallet, exactly as before. What it
+    buys is a chain: one reference -> at most one request -> at most one
+    execution attempt. A second request under a spent key is impossible, which is
+    what keeps a retry from ever being handed back an old FAILED row.
+
+    **The answer echoes the key you sent, not the one the ledger will hold.** The
+    transaction underneath still stores ``"<wallet uuid>:<your key>"`` - see
+    ``WalletService._scoped_reference`` - so a client that sent ``"abc"`` sees
+    ``"abc"`` back here and would see ``"<wallet uuid>:abc"`` on the transaction
+    it becomes. Sending the *transaction's* form back as a new ``ref`` would be a
+    new key and, for a withdrawal, a second one. Generate the key once, per
+    operation, and keep it for the retry.
+
+    Namespacing is why a key is not a way into anybody else's ledger. The server
+    prefixes what you send with a wallet id it has already resolved for you, so
+    two callers choosing the same word do not collide - each gets their own row.
+    """
+
+    amount: str = Field(examples=["5000.00"])
+    ref: str | None = Field(
+        default=None,
+        examples=["withdrawal-2026-09-12"],
+        description="Idempotency key. Auto-generated when omitted.",
+    )
+
+
+class PayoutIn(MovementIn):
+    """Send money out to an external account, from either balance.
+
+    ``source`` is what decides which balance funds it, and it is a closed
+    vocabulary in the *request shape* rather than a value handed to an aggregate
+    that could refuse it - which is why this is a ``Literal`` where
+    ``InstructionIn.action`` is a plain ``str``. An action travels to the domain,
+    which has its own answer for a word it does not know; a source is what this
+    route branches on to pick a method, so an unknown one has no owner left to
+    refuse it and would otherwise fall through to nothing.
+
+    ``fund_name`` names the pot a locked payout draws on. Leaving it out is not
+    the same command with a default - it is a different act, the pooled draw that
+    spends matured pots oldest first, and it exists for a plan saved before pots
+    could be named. It is refused for an available-source payout, because there
+    is no pot involved in spending the available balance.
+    """
+
+    destination: DestinationIn
+    source: Literal["available", "locked"] = Field(
+        default="available",
+        description="available spends the unlocked balance; locked spends a pot.",
+    )
+    fund_name: str | None = Field(
+        default=None,
+        description="The pot a locked payout draws on. Not allowed for available.",
+    )
+
+    @model_validator(mode="after")
+    def _a_pot_needs_a_locked_source(self):
+        """``fund_name`` only means something with ``source="locked"``.
+
+        The same refusal at the same kind of moment as
+        ``CreatePlanIn._one_way_to_end``: the request contradicts itself before
+        any wallet is loaded, so it is a 422 from the schema rather than a 400
+        from the domain. Leaving it to the domain would be worse than late - the
+        available-source payout has no use for a pot name at all, so nothing
+        would refuse it, and the field would be silently ignored. A caller who
+        named a pot and was charged from the available balance instead would have
+        been told nothing.
+        """
+        if self.fund_name is not None and self.source != "locked":
+            raise ValueError("fund_name requires source='locked'")
+        return self
+
+
+class ExtendFundIn(BaseModel):
+    """Push a pot's maturity date later. There is no way to pull it earlier.
+
+    No ``ref``: extending moves no money, so there is no ledger row to
+    deduplicate and nothing a retry could double.
+
+    A whole date rather than a term, because a maturity date *is* the term - it
+    is what the pot stores, and it is what "has this come due" is asked against.
+    Sending "three more months" would mean this layer resolving a duration into a
+    date, which is the same conversion ``CreatePlanIn.term`` deliberately leaves
+    to the domain.
+    """
+
+    new_date: date = Field(examples=["2027-03-02"])

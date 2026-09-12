@@ -83,7 +83,14 @@ class TestTheMoneyMoves:
 
 class TestTheLedgerEntry:
     def test_recorded_as_payout_not_withdrawal(self, build_wallet):
-        """The destination is what makes it a PAYOUT. That is the whole widening."""
+        """The destination is what makes it a PAYOUT. That is the whole widening.
+
+        The status assertion below is the *other* widening, and it belongs here
+        because this class is about what the row says rather than what the wallet
+        did. Both halves of a payout's identity are on one line: a destination is
+        recorded, and the row stops at PENDING, because a destination is exactly
+        the thing this system cannot follow the money to.
+        """
         wallet = build_wallet(available="5000")
         repository = InMemoryTransactionRepository()
 
@@ -91,7 +98,7 @@ class TestTheLedgerEntry:
 
         stored = repository.get_by_id(transaction.transaction_id)
         assert stored.type is TransactionType.PAYOUT
-        assert stored.status is TransactionStatus.SUCCESSFUL
+        assert stored.status is TransactionStatus.PENDING
 
     def test_the_destination_is_recorded(self, build_wallet):
         wallet = build_wallet(available="5000")

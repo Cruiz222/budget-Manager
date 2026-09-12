@@ -30,7 +30,15 @@ from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHas
 from app.infrastructure.settings import database_path as configured_database_path
 from app.infrastructure.settings import from_environment
 from app.presentation.api import errors
-from app.presentation.api.routes import funds, health, plans, sessions, users, wallets
+from app.presentation.api.routes import (
+    confirmations,
+    funds,
+    health,
+    plans,
+    sessions,
+    users,
+    wallets,
+)
 
 
 def create_app(
@@ -101,7 +109,7 @@ def create_app(
     )
 
     errors.install(application)
-    for module in (health, users, sessions, wallets, funds, plans):
+    for module in (health, users, sessions, wallets, funds, plans, confirmations):
         application.include_router(module.router)
 
     return application

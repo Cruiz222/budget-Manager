@@ -24,6 +24,9 @@ from app.infrastructure.persistence.serialization import (
 from app.infrastructure.repositories.sqlite_plan_notice_repository import (
     SqlitePlanNoticeRepository,
 )
+from app.infrastructure.repositories.sqlite_confirmation_repository import (
+    SqliteConfirmationRepository,
+)
 from app.infrastructure.repositories.sqlite_notification_repository import (
     SqliteNotificationRepository,
 )
@@ -297,6 +300,67 @@ CREATE TABLE IF NOT EXISTS notifications (
     -- creates a missing table on an existing database for free. Only a change to
     -- a table already on disk is a migration.
     PRIMARY KEY (event_key)
+);
+
+-- A recorded request to move money out of a wallet, waiting to be answered.
+-- This is the second-level confirmation: nothing has been done when a row here
+-- is written, which is the opposite of a PENDING transaction one table up - that
+-- is a movement that *has* happened, whose wallet is already debited, and which
+-- cannot yet be called finished because the far end has not confirmed it. The
+-- two words are kept apart deliberately; see ``Confirmation``.
+--
+-- There is no migration function for this table, for the reason recorded against
+-- ``plan_notices``, ``outbound_messages``, ``users``, ``password_credentials``,
+-- ``sessions`` and ``notifications`` above: CREATE TABLE IF NOT EXISTS creates a
+-- missing table on a database already in the wild for free. Adding a table is
+-- not a migration; changing a table that is already on disk is.
+CREATE TABLE IF NOT EXISTS confirmations (
+    confirmation_id    TEXT PRIMARY KEY,
+    -- Who asked. The same person who owns ``wallet_id``, recorded here as well
+    -- and for the same reason ``savings_plans.user_id`` is: every read of a
+    -- confirmation is scoped to its requester, and this is the column that scope
+    -- reads. No REFERENCES users(user_id), matching that column's note.
+    user_id            TEXT NOT NULL,
+    wallet_id          TEXT NOT NULL REFERENCES wallets(wallet_id),
+    kind               TEXT NOT NULL,   -- enum name: WITHDRAWAL / PAYOUT_* / CLOSE
+    -- The amount, as text, and its currency beside it. Both are NULL for a
+    -- CLOSE, which moves no money and so has no figure to record - a real answer
+    -- rather than missing data, and the aggregate refuses a CLOSE that carries
+    -- one. The currency travels with the amount because a Money is meaningless
+    -- without it; see ``SqliteConfirmationRepository._values``.
+    amount             TEXT,
+    currency           TEXT,
+    destination        TEXT,            -- JSON, payouts only; NULL otherwise
+    fund_name          TEXT,            -- locked payouts only; NULL = pooled draw
+    -- The caller's idempotency key, or one minted when they sent none. This is
+    -- the key that will be handed to the ledger row underneath, namespaced with
+    -- the wallet by ``WalletService._scoped_reference`` exactly as it always was.
+    internal_reference TEXT NOT NULL,
+    -- AWAITING or CONFIRMED. There is deliberately no stored EXPIRED: expiry is
+    -- *checked*, not swept, and the API reports an awaiting request past its
+    -- window as expired from ``expires_at`` alone - so nothing has to write on a
+    -- read. See ``Confirmation.status_as_of``.
+    status             TEXT NOT NULL,
+    created_at         TEXT NOT NULL,   -- ISO moment
+    expires_at         TEXT NOT NULL,   -- ISO moment; absolute, never extended
+    -- Audit: the ledger row this request produced. NULL for a CLOSE (which writes
+    -- none) and NULL for a request that was never answered.
+    transaction_id     TEXT,
+    -- The reference chain, and it is load-bearing rather than tidiness:
+    -- one reference -> at most one confirmation -> at most one execution attempt.
+    --
+    -- Without it, a client retrying a request it never saw the response to would
+    -- record a second request under the same key, and the *second* confirm would
+    -- reach ``WalletOperation.execute`` holding a reference the first attempt had
+    -- already spent. That lookup is global and returns the row whatever its
+    -- status - including FAILED - so the retry would be handed the old row, move
+    -- nothing, and report success. The constraint is what makes that unreachable:
+    -- a new attempt must be a new request, and a new request must be a new key.
+    --
+    -- It is also what makes ``find`` safe to scope to the wallet alone, and what
+    -- lets a client's own key be handed back to them without leaking anything:
+    -- the key cannot name a request on somebody else's wallet.
+    UNIQUE (wallet_id, internal_reference)
 );
 """
 
@@ -777,6 +841,10 @@ class SqliteUnitOfWork(UnitOfWork):
         self.users = SqliteUserRepository(connection)
         self.password_credentials = SqlitePasswordCredentialRepository(connection)
         self.sessions = SqliteSessionRepository(connection)
+        # Correctness, not convenience: the claim that spends a confirmation and
+        # the ledger row it authorises must land in one transaction. See the
+        # attribute's declaration on ``UnitOfWork``.
+        self.confirmations = SqliteConfirmationRepository(connection)
 
     def commit(self) -> None:
         self._connection.commit()

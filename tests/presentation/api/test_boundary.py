@@ -1,14 +1,19 @@
 """What this API does not do, asserted as loudly as what it does.
 
-Phase 1b is safe to exist before authentication for exactly one reason: it
-exposes nothing that changes a balance. That reason is a property of the *set of
-routes*, and a property of a set is not something a docstring can hold - it is
-one ``@router.post`` away from being false, and the commit that makes it false
-will look like an ordinary feature.
+Through Phase 1b this API was safe to exist before authentication for exactly one
+reason: it exposed nothing that changes a balance. Phase 2a built the lock and
+Phase 2b spent it, so **that reason is gone and the property is now different.**
+Money moves through this API, and what keeps that honest is no longer "nothing
+changes" but three separate claims, each written down here:
 
-So it is written down twice here. ``TestTheRouteTableIsExactlyThis`` pins the
-whole surface as a literal, and ``TestHeldOperationsAreNotRouted`` names the
-endpoints that must stay absent and asks for each of them by a *real* id.
+    the exposed set    ``TestTheRouteTableIsExactlyThis``
+    the held set       routes that a later phase will add, with the phase named
+    the never set      routes this API will not grow, with the reason named
+
+The first is a property of a *set of routes*, and a property of a set is not
+something a docstring can hold - it is one ``@router.post`` away from being
+false, and the commit that makes it false will look like an ordinary feature. So
+``EXPECTED_OPERATIONS`` pins the whole surface as a literal.
 
 **The honest limitation, stated rather than glossed:** an unrouted path returning
 404 is not evidence of a decision - it is what any typo returns. These tests
@@ -56,38 +61,89 @@ EXPECTED_OPERATIONS = {
     ("post", "/plans/{plan_id}/resume"),
     ("post", "/plans/{plan_id}/cancel"),
     ("put", "/plans/{plan_id}/instructions"),
-}
-
-#: The operations that are held until Phase 2b, each one because it changes a
-#: balance. Named as the routes they would plausibly take, so the day somebody
-#: adds one of them this list is what says "that was a decision, and here is where
-#: it was written down".
-#:
-#: **These are still held after 2a, and that is the point of splitting the phase.**
-#: 2a built the lock - an actor that can only be reached by proving you are it -
-#: and deliberately spent it on nothing. Phase 1b's reason for holding a balance
-#: change was that the actor was an assertion; that reason is now gone, so what
-#: remains is only the work of releasing thirteen endpoints one at a time, which is
-#: 2b. Nothing here is waiting on a design question any more.
-#:
-#: ``tick`` and ``deliver`` are held for a different reason and are listed with
-#: the rest anyway, because the consequence is the same: a background job that
-#: runs for the whole installation has no actor, and an endpoint that runs it
-#: would have to be told one - which would make the scheduler reachable by
-#: whoever could reach the port. Sessions did not change that: the CLI now proves
-#: who it is for every command that needs a person, and these two still take
-#: nobody, because there is nobody they could be.
-HELD_OPERATIONS = [
-    ("post", "/wallets/{wallet_id}/deposits"),
+    # --- the money, added in 2b -------------------------------------------
+    #
+    # The five wallet operations, and the split between them is settlement
+    # rather than safety: freeze, unfreeze and close change no balance at all,
+    # while a withdrawal and a payout *debit* one and leave the row PENDING,
+    # because the far end is a bank account nothing here has contacted. A
+    # client must not read the 201 as "the money arrived"; the body says
+    # ``pending`` and there is nothing in this phase to wait on.
+    #
+    # The last three of these do not move money any more. Since the second-level
+    # confirmation, ``withdrawals``, ``payouts`` and ``close`` record a *request*
+    # and answer with it; the money moves at ``/confirmations/{id}/confirm``
+    # below, which is the only route in this API that spends what one of these
+    # recorded. The paths and the 201 are unchanged, which is deliberate: the
+    # resource a client addresses is still "a withdrawal from this wallet" - what
+    # changed is that creating one is now a question rather than a movement.
     ("post", "/wallets/{wallet_id}/withdrawals"),
     ("post", "/wallets/{wallet_id}/payouts"),
     ("post", "/wallets/{wallet_id}/freeze"),
     ("post", "/wallets/{wallet_id}/unfreeze"),
     ("post", "/wallets/{wallet_id}/close"),
-    ("post", "/wallets/{wallet_id}/funds/{fund_name}/deposits"),
+    # --- answering one, added with the confirmation -------------------------
+    #
+    # Two routes, and they are the second half of the three above. ``confirm`` is
+    # the only operation in this API that carries out a decision somebody made
+    # earlier rather than one they are making now - and it takes no body, because
+    # everything about the movement is already on the request it names. See
+    # ``routes/confirmations.py``.
+    #
+    # ``GET`` is here rather than held because a request that cannot be read back
+    # is a request a client cannot debug: an ``expired`` answer is the only way
+    # to find out that a prompt was left sitting too long, and it costs no write
+    # to give - expiry is derived, so looking at a request does not spend it.
+    ("post", "/confirmations/{confirmation_id}/confirm"),
+    ("get", "/confirmations/{confirmation_id}"),
+    # The three pot operations, which settle immediately - a lock and a release
+    # move money between the wallet's own balances, so there is nothing left to
+    # confirm and the row comes back SUCCESSFUL.
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/lock"),
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/release"),
     ("post", "/wallets/{wallet_id}/funds/{fund_name}/extend"),
+}
+
+#: Balance changes that are still held, each one because the movement's far end
+#: is *outside* this system and nothing here can yet authorise it.
+#:
+#: **These two are the whole list as of 2b**, down from thirteen, and the single
+#: reason they share is worth stating precisely, because it is not "we ran out of
+#: time". A deposit is money arriving from outside, and the only party that can
+#: honestly say money arrived is the one that sent it - Paystack, in Phase 3,
+#: proving itself with a signature. Exposed now, ``POST /wallets/{id}/deposits``
+#: would let any authenticated caller credit their own wallet for free, which is
+#: not a boundary this API can draw with a session token: the caller *is*
+#: authorised, and the request is still a lie about where money came from.
+#:
+#: The CLI keeps its ``deposit`` command for the same reason it always had it. A
+#: developer's tool operating on their own database is not a wire protocol, and
+#: nothing it does is reachable by anybody else.
+HELD_OPERATIONS = [
+    ("post", "/wallets/{wallet_id}/deposits"),
+    ("post", "/wallets/{wallet_id}/funds/{fund_name}/deposits"),
+]
+
+#: Operations this API will not grow, which is a stronger statement than "not
+#: yet" and is why they live in their own list rather than among the held ones.
+#:
+#: ``tick`` and ``deliver`` are installation-wide background jobs with no actor -
+#: they run from cron, over every plan in the database, and the CLI proves who it
+#: is for every command that *needs* a person while these two still take nobody,
+#: because there is nobody they could be. An endpoint that ran them would have to
+#: be told an actor, and the only actor that could mean anything is "whoever
+#: holds the token" - which would make the scheduler reachable by anyone who
+#: could reach the port. Sessions did not change that; they are what makes it
+#: answerable.
+#:
+#: ``POST /plans/{id}/run`` is the same shape of answer for a different reason.
+#: It is not actorless - a plan has an owner, and decision 56 gives the scheduler
+#: no privilege by minting one ``ExecutePlanRun`` per plan acting as that plan's
+#: user. It is simply not a request anybody makes: a plan fires when a clock says
+#: so, and letting a client name the moment would let it pay itself early, run an
+#: occurrence twice, or drive a schedule the user set up and forgot about. The
+#: scheduler is the only caller, and it is not on the wire.
+NEVER_ROUTED_OPERATIONS = [
     ("post", "/plans/{plan_id}/run"),
     ("post", "/tick"),
     ("post", "/notifications/deliver"),
@@ -145,9 +201,23 @@ class TestTheRouteTableIsExactlyThis:
         assert not removed, f"listed but not exposed: {sorted(removed)}"
 
 
-class TestHeldOperationsAreNotRouted:
+class TestTheAbsentOperationsAreStillAbsent:
+    """Both absent lists, checked the same way and kept apart in the report.
+
+    One test body over the union rather than two, because the question asked of
+    every entry is identical - "can this be called?" - and duplicating the
+    request would only give two places for the harness to rot. What differs
+    between the lists is the *reason*, and a reason is not something this test
+    can check; it is what the list-level docstrings above are for. The ids in the
+    parametrize keep the two groups distinguishable in the output, so a failure
+    says which kind of promise was broken.
+    """
+
     @pytest.mark.parametrize(
-        "method, template", HELD_OPERATIONS, ids=[f"{m} {p}" for m, p in HELD_OPERATIONS]
+        "method, template",
+        HELD_OPERATIONS + NEVER_ROUTED_OPERATIONS,
+        ids=[f"held {m} {p}" for m, p in HELD_OPERATIONS]
+        + [f"never {m} {p}" for m, p in NEVER_ROUTED_OPERATIONS],
     )
     def test_it_is_not_there(self, client, as_user, real_ids, method, template):
         """404 or 405, and the difference between them is not worth asserting.
@@ -164,17 +234,21 @@ class TestHeldOperationsAreNotRouted:
 
         assert response.status_code in (404, 405), (
             f"{method.upper()} {path} answered {response.status_code} - "
-            "a held operation appears to have been exposed"
+            "an absent operation appears to have been exposed"
         )
 
-    def test_the_held_list_is_not_vacuous(self, client, as_user, real_ids):
-        """One of the held paths, asked the same way, *does* answer.
+    def test_the_absent_list_is_not_vacuous(self, client, as_user, real_ids):
+        """One of the absent paths, asked the same way, *does* answer.
 
         Without this, the whole parametrized test above would still pass if
         ``client.request`` were silently failing - which is not a hypothetical: a
         typo in the HTTP verb name or a client that was never entered as a context
         manager produces exactly the same 404s. This pins the harness down by
         showing it can distinguish a routed path from an unrouted one.
+
+        It is the same check it has always been, and it matters more now than it
+        did in 1b: the parametrize list has shrunk from fifteen entries to five,
+        so a broken harness would hide less and less.
         """
         routed = client.get(f"/wallets/{real_ids['wallet_id']}", headers=as_user())
 

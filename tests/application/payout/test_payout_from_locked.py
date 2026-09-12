@@ -42,9 +42,24 @@ DESTINATION = Destination(
 )
 
 
-# --- Successful payout ---
+# --- A payout debits the pot and holds the money ---
 
-def test_successful_payout_spends_locked_and_persists_successful_transaction(build_wallet):
+def test_a_payout_spends_locked_and_leaves_the_row_pending(build_wallet):
+    """It was ``test_successful_payout_...`` until Phase 2b, and the rename is
+    the change rather than tidying around it.
+
+    What the pot does is unambiguous and this file still asserts it: 3000 leaves
+    the locked balance and the pot is 2000 lighter, so the money is out of
+    reach - a second payout of the same amount is refused against what is left.
+    What is *not* unambiguous is where the 3000 went. It is bound for a bank
+    account, and nothing in this process has spoken to a bank. So the row says
+    PENDING and carries no ``completed_at``, because the only party who could
+    supply one is the one that has not answered yet.
+
+    ``completed_at is None`` is not a detail of the row's construction - the
+    domain refuses a PENDING transaction a completion moment outright, so this
+    line fails if the row was built wrongly rather than merely left unfinished.
+    """
     wallet = build_wallet(available="1000", locked="5000")
     repository = InMemoryTransactionRepository()
 
@@ -58,10 +73,10 @@ def test_successful_payout_spends_locked_and_persists_successful_transaction(bui
     assert wallet.available_balance == Money(Decimal("1000"), NGN)
 
     stored = repository.get_by_id(transaction.transaction_id)
-    assert stored.status is TransactionStatus.SUCCESSFUL
+    assert stored.status is TransactionStatus.PENDING
     assert stored.wallet_id == wallet.wallet_id
     assert stored.type is TransactionType.PAYOUT
-    assert stored.completed_at is not None
+    assert stored.completed_at is None
 
 
 def test_the_destination_is_recorded_on_the_ledger_entry(build_wallet):
@@ -81,6 +96,21 @@ def test_the_destination_is_recorded_on_the_ledger_entry(build_wallet):
 def test_payout_is_persisted_as_pending_before_wallet_is_touched(
     build_wallet, recording_transactions
 ):
+    """The name still holds and only the expectation moved.
+
+    A payout is genuinely written to the ledger as PENDING *before* the pot is
+    debited, and that ordering is the whole point of the step: a crash between
+    the two leaves a record of an attempt rather than a pot that lost money with
+    nothing to explain it. What changed in 2b is the second save. There used to
+    be one - the row rewritten SUCCESSFUL once the wallet had moved - and now
+    there is nothing further to write, because a payout has no state this system
+    can reach on its own. That is the pending intent visible in a single line.
+
+    One asymmetry worth noticing: a *rejected* payout still saves twice
+    (``test_rejected_payout_is_persisted_as_pending_then_failed`` below). Failure
+    is a fact this system can establish by itself, so a refusal does reach a
+    conclusion - it just is not the one the money is waiting for.
+    """
     wallet = build_wallet(locked="5000")
 
     PayoutFromLocked(wallet, recording_transactions, MOMENT).execute(
@@ -89,10 +119,7 @@ def test_payout_is_persisted_as_pending_before_wallet_is_touched(
         destination=DESTINATION,
     )
 
-    assert recording_transactions.saved_statuses == [
-        TransactionStatus.PENDING,
-        TransactionStatus.SUCCESSFUL,
-    ]
+    assert recording_transactions.saved_statuses == [TransactionStatus.PENDING]
 
 
 # --- A payout must say where the money went ---

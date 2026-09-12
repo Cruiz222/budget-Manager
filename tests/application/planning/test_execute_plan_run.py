@@ -9,6 +9,7 @@ from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
+from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notificationKind import NotificationKind
@@ -56,6 +57,25 @@ def release(amount: str, label: str = "emergency") -> Instruction:
         amount=Money(Decimal(amount), NGN),
         label=label,
     )
+
+
+#: When every release plan in this file ends, and the reason it has to say.
+#:
+#: ``SavingsPlan`` refuses a plan that releases locked funds and names no end
+#: date, and the rule is derived rather than chosen: a release is irreversible,
+#: so "irreversible until the set date" only means something if there is a set
+#: date. Without one the plan would be both uncancellable and endless - locked
+#: money with no way out at all, which is strictly worse than the temptation
+#: locking exists to prevent. A payout plan needs nothing, because a payout can
+#: simply be cancelled.
+#:
+#: **Far beyond every moment these tests execute at** - the latest is April 2026 -
+#: and that margin is the whole reason this is one shared constant rather than a
+#: literal chosen per test. An end date picked to look tidy, like `date(2026, 6, 1)`,
+#: would silently terminate a plan partway through a test that ran past it, and the
+#: failure would surface as a missing receipt - pointing at the code under test
+#: rather than at the fixture. A date that no test can reach cannot do that.
+RELEASE_ENDS_ON = date(2027, 1, 1)
 
 
 # --- harness ---------------------------------------------------------------
@@ -950,14 +970,24 @@ class TestTheBusinessPotCommitment:
         assert [row.type for row in rows] == [TransactionType.PAYOUT]
         assert rows[0].fund_id == pot.fund_id
 
-    def test_the_receipt_says_which_pot_paid(
+    def test_a_payout_from_a_named_pot_is_still_silent(
         self, build_wallet, build_plan, tmp_path
     ):
-        """The words a user reads, which is where "which pot?" is actually asked.
+        """It was ``test_the_receipt_says_which_pot_paid``, and it says so nowhere now.
 
-        The ledger answers it for a database; the receipt has to answer it for a
-        person, or a wallet with three business pots produces three identical
-        emails.
+        The sentence it was written for - *"Drawn from the pot 'Supplier'."* - is
+        still composed, and its own test lives in ``test_compose`` now. It cannot
+        be reached from here, and the reason is the phase rather than an
+        oversight: this plan pays *out*, the payment's far end is a bank account
+        nothing here has contacted, so the run's row stops at PENDING and
+        ``_record_success`` composes nothing. A pot being named does not change
+        that, which is the other half of what this test now pins - the guard on
+        the receipt is settlement, not the presence of a pot.
+
+        What is still worth checking at this level is that the pot genuinely was
+        the one spent. The ledger says so even when no email does, and the run is
+        recorded as succeeded - so this is a real payout that happened and was
+        not announced, rather than a run that quietly declined to run.
         """
         wallet = build_wallet(available="0")
         pot = self.a_business_pot(wallet)
@@ -972,11 +1002,15 @@ class TestTheBusinessPotCommitment:
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
-        executor.execute(plan.plan_id, EARLY)
+        run = executor.execute(plan.plan_id, EARLY)
 
-        queued = notifications_of(factory)
-        assert len(queued) == 1
-        assert "Supplier" in queued[0].body
+        assert run.status is RunStatus.SUCCEEDED
+        assert notifications_of(factory) == []
+        rows = ledger_of(factory, wallet.wallet_id)
+        assert [row.fund_id for row in rows] == [pot.fund_id]
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("3000"), NGN
+        )
 
 
 class TestCatchingUp:
@@ -1159,13 +1193,36 @@ class TestTheRunQueuesItsReceipt:
     - all inside one transaction, before a single ``commit()``. This class is
     about that fourth write: that it happens on both outcomes, that it is silent
     when there is nowhere to send, and that a run cannot land without it.
+
+    **Phase 2b split the "it happens" half in two, and the split is the phase.**
+    A run that *settles* here queues its receipt, and a **release plan** is what
+    demonstrates it now - the money moves between the wallet's own two balances,
+    so nothing is left outstanding. A run that pays *out* does not, because its
+    ledger rows stop at PENDING: the money is bound for a bank account nothing in
+    this process has contacted, and ``compose`` would close the message with
+    *"The money has already moved"*. ``test_a_payout_run_queues_nothing`` is the
+    test that says so, and it is why the receipt tests above it run releases.
+
+    The blocked path is untouched by any of this, which is why the two tests
+    about a refusal still use payout plans: a run that did not happen has nothing
+    pending about it.
     """
 
-    def test_a_successful_run_queues_a_receipt(
+    def test_a_run_that_settles_here_queues_a_receipt(
         self, build_wallet, build_plan, tmp_path
     ):
+        """It was ``test_a_successful_run_queues_a_receipt``, on a payout plan.
+
+        The queuing claim is unchanged - one row, of the receipt kind, addressed
+        to the configured recipient and keyed on the plan. Only the plan moved:
+        see the class docstring for why a payout can no longer stand in for it.
+        """
         wallet = build_wallet(locked="10000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
@@ -1177,11 +1234,62 @@ class TestTheRunQueuesItsReceipt:
         assert queued[0].subject_id == plan.plan_id
         assert queued[0].recipient == RECIPIENT
 
+    def test_a_payout_run_queues_nothing(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The negative the class above is written around, asserted on its own.
+
+        Everything the receipt would say is false at this moment.
+        ``payout_succeeded``'s subject is *"Plan 'salary': 2000.00 NGN moved"* and
+        its body ends *"The money has already moved. This is a receipt, not a
+        request"* - written in the past tense because a receipt reports something
+        that happened. Nothing has happened: the pot is 2000 lighter and the
+        ledger row is PENDING, because the other end of this transfer is a bank
+        account nothing here can see.
+
+        The two assertions after the silence are what stop this from passing when
+        the run does nothing at all. The run reports SUCCEEDED - it did what a run
+        does - and the money really left the pot on disk and is recorded as
+        PENDING. The suppression is a decision about what to *say*, and this test
+        is the one that keeps it from becoming a way of quietly not paying.
+
+        It is deliberately the mirror of ``test_a_run_that_settles_here...``:
+        same wallet, same amount, same anchor, one word different in the
+        instruction - and a different answer about the mail.
+        """
+        wallet = build_wallet(locked="10000")
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert notifications_of(factory) == []
+        assert run.status is RunStatus.SUCCEEDED
+        assert wallet_after(factory, wallet.wallet_id).locked_balance == Money(
+            Decimal("8000"), NGN
+        )
+        rows = ledger_of(factory, wallet.wallet_id)
+        assert [row.status for row in rows] == [TransactionStatus.PENDING]
+
     def test_the_receipt_says_what_moved_and_where(
         self, build_wallet, build_plan, tmp_path
     ):
+        """The body carries the amount and where it went.
+
+        ``where`` reads differently for a release than for a payout - *"to
+        available balance"* rather than a named account - because that is where
+        the money went. It is worth checking at this level as well as in
+        ``test_compose``: the sentence is rendered from the plan's own
+        instructions, and a run that lost its instructions on the way to the
+        composer would still queue a receipt, just an empty one.
+        """
         wallet = build_wallet(locked="10000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
@@ -1189,21 +1297,25 @@ class TestTheRunQueuesItsReceipt:
 
         body = notifications_of(factory)[0].body
         assert "2000.00 NGN" in body
-        assert "Chinedu Okafor" in body
+        assert "to available balance" in body
 
-    def test_the_receipt_names_the_occurrence_it_paid(
+    def test_the_receipt_names_the_occurrence_it_settled(
         self, build_wallet, build_plan, tmp_path
     ):
-        """The body says *which* occurrence, which is not the same as *when* it was paid.
+        """The body says *which* occurrence, which is not the same as *when* it ran.
 
-        A backlog run in April pays January, and both facts are true and both
+        A backlog run in April settles January, and both facts are true and both
         matter: the message is stamped with the moment the run was recorded, and
         the body names the occurrence it settled. A receipt that only carried the
-        clock would let a user read a two-month-old payment as today's, with
+        clock would let a user read a two-month-old movement as today's, with
         nothing to tell it apart from February's.
         """
         wallet = build_wallet(locked="100000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
@@ -1226,7 +1338,11 @@ class TestTheRunQueuesItsReceipt:
         somewhere far away.
         """
         wallet = build_wallet(locked="10000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
@@ -1245,6 +1361,11 @@ class TestTheRunQueuesItsReceipt:
         exists. Without this the only trace is a ``plan_runs`` row nobody reads
         unless the plan is already known to be stuck - and it is not, because
         this is how they would find out.
+
+        A payout plan, unchanged, and that is now load-bearing rather than
+        incidental: a blocked run is silent about the money for its own reason -
+        nothing was even attempted - so it keeps announcing on the plans that a
+        successful run has stopped announcing on.
         """
         wallet = build_wallet(locked="500")
         plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
@@ -1266,9 +1387,18 @@ class TestTheRunQueuesItsReceipt:
         Nothing is composed, so there is nothing to defer and no line to print -
         and the money still moves. A missing mail address is a reason to be
         silent, never a reason to refuse a payment.
+
+        The release plan is what keeps this test about the *recipient*. On a
+        payout plan it would pass for the wrong reason from now on: a payout run
+        queues nothing whether or not an address is configured, so this would be
+        asserting the settlement guard and calling it the missing address.
         """
         wallet = build_wallet(locked="10000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=None)
         seed(factory, wallet, plan)
 
@@ -1296,7 +1426,7 @@ class TestTheRunQueuesItsReceipt:
     def test_one_run_is_one_receipt_however_many_instructions(
         self, build_wallet, build_plan, tmp_path
     ):
-        """Five payroll lines, one message - see decision 29.
+        """Five lines, one message - see decision 29.
 
         A run is one thing that happened to the person reading the mail, and five
         emails arriving together would have to be reassembled by hand to answer
@@ -1305,7 +1435,8 @@ class TestTheRunQueuesItsReceipt:
         wallet = build_wallet(locked="100000")
         plan = build_plan(
             wallet_id=wallet.wallet_id,
-            instructions=tuple(payout("20000", f"salary {n}") for n in range(5)),
+            instructions=tuple(release("20000", f"salary {n}") for n in range(5)),
+            ends_on=RELEASE_ENDS_ON,
         )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
@@ -1314,26 +1445,35 @@ class TestTheRunQueuesItsReceipt:
 
         queued = notifications_of(factory)
         assert len(queued) == 1
-        # Five lines, each naming the account it pays - one for every instruction.
+        # Five lines, each naming the pot line it releases - one per instruction.
         assert queued[0].body.count("  salary") == 5
         assert "Total moved: 100000.00 NGN." in queued[0].body
 
 
 class TestOneOccurrenceCanBeTwoEvents:
-    """Blocked at noon, paid in April: two outcomes, one ``plan_runs`` row, two receipts.
+    """Blocked at noon, settled in April: two outcomes, one ``plan_runs`` row, two receipts.
 
     The counterpart of ``test_a_topped_up_and_resumed_plan_rewrites_its_blocked_row``
     above, which says the *row* is rewritten rather than appended. The receipt
     table makes the opposite demand, and both are right: the run is one fact, and
     the two things that happened to the user are two. The kind in the derived key
     is what lets one table hold both.
+
+    The two plans below are releases, and Phase 2b is why: the pair this class is
+    about needs a run that *queues* something on the second attempt, or the
+    "both receipts" it counts would be one. A payout run's second attempt is
+    silent, so it could only ever show the blocked half.
     """
 
     def test_a_blocked_run_that_is_later_paid_queues_both_receipts(
         self, build_wallet, build_plan, tmp_path
     ):
         wallet = build_wallet(locked="500")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
@@ -1376,7 +1516,11 @@ class TestOneOccurrenceCanBeTwoEvents:
     ):
         """The occurrence is in the key, so January does not suppress February."""
         wallet = build_wallet(locked="100000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         executor, factory = build_executor(tmp_path, recipient=RECIPIENT)
         seed(factory, wallet, plan)
 
@@ -1398,6 +1542,15 @@ class TestNoPayoutWithoutAReceipt:
     rolls back with it, so the next tick derives the same occurrence and pays
     then. Fail-loud costs one tick and buys a run that can never commit without
     the message that says so.
+
+    **The successful runs below are releases, and Phase 2b made that necessary
+    rather than tidy.** The claim is that the receipt and the run are one write,
+    and the way to check it is to break the commit and show the receipt is absent
+    - which only proves anything if the receipt *would* have been there. A payout
+    run queues nothing now, so a payout plan would leave ``notifications_of``
+    empty whether the rollback worked or not: the test would pass on a broken
+    transaction. The blocked paths are untouched by the phase and keep their
+    payout plans.
     """
 
     def test_a_failed_commit_leaves_neither_the_run_nor_its_receipt(
@@ -1405,7 +1558,11 @@ class TestNoPayoutWithoutAReceipt:
     ):
         """Four writes, one transaction - so all four are missing, not three."""
         wallet = build_wallet(locked="10000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         factory = SqliteUnitOfWorkFactory(str(tmp_path / "exploding.db"))
         seed(factory, wallet, plan)
         executor = ExecutePlanRun(
@@ -1454,10 +1611,14 @@ class TestNoPayoutWithoutAReceipt:
         """Which is what makes the rollback survivable rather than merely safe.
 
         The failed commit above cost one tick, not one payment: the counter never
-        advanced, so the next attempt derives the same occurrence and pays it.
+        advanced, so the next attempt derives the same occurrence and settles it.
         """
         wallet = build_wallet(locked="10000")
-        plan = build_plan(wallet_id=wallet.wallet_id, instructions=(payout("2000"),))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release("2000"),),
+            ends_on=RELEASE_ENDS_ON,
+        )
         factory = SqliteUnitOfWorkFactory(str(tmp_path / "recovered.db"))
         seed(factory, wallet, plan)
         broken = ExecutePlanRun(

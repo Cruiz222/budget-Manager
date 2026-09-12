@@ -193,6 +193,57 @@ def create_salary_plan(db_path, wallet_id, start="2026-01-01", *extra, pot="Savi
     )
 
 
+def create_release_plan(
+    db_path, wallet_id, start="2026-01-01", *extra, pot="Savings", until="2027-01-01"
+):
+    """The other shape of plan, and the one a receipt can still be written about.
+
+    A **release** moves money from a pot back to the wallet's own available
+    balance. Nothing leaves the wallet, so the operation settles the moment it
+    runs and its run is one a receipt may honestly describe - which is why the
+    receipt tests below are written against this plan rather than a salary one.
+
+    Locked source and a named pot, for the reason ``create_salary_plan`` gives:
+    the aggregate refuses an AVAILABLE-source plan containing a release, so a
+    helper that left either out would be testing a refusal.
+
+    **``until`` is required by the domain, not by this helper.** ``SavingsPlan``
+    refuses a plan that releases locked funds and names no end date: a release is
+    irreversible, so "irreversible until the set date" only means something if
+    there is a set date, and without one the plan would be both uncancellable and
+    endless. A *salary* plan needs no such thing, which is why ``create_salary_plan``
+    has no ``--until`` to pass and this one cannot omit it.
+
+    The default is far past every moment these tests run at, so it cannot end a
+    plan partway through a test and turn a receipt assertion into a report about a
+    plan that had already finished. A caller that wants a different date passes
+    one; nothing here does.
+
+    ``*extra`` is where the ``--release`` lines go, and there is no default set
+    of them: every caller is asserting something about the lines it chose.
+    """
+    return run(
+        db_path,
+        "plan",
+        "create",
+        "--wallet",
+        wallet_id,
+        "--name",
+        "Matured savings",
+        "--source",
+        "locked",
+        "--from-fund",
+        pot,
+        "--every",
+        "monthly",
+        "--from",
+        start,
+        "--until",
+        until,
+        *extra,
+    )
+
+
 def plan_id_from(db_path, wallet_id, capsys):
     assert run(db_path, "plan", "list", wallet_id) == 0
     out = capsys.readouterr().out
@@ -1022,29 +1073,51 @@ class TestTheReceiptAfterThePayout:
     courtesy that a missed tick can forfeit entirely, while the receipt is the
     record of something that happened. There is no window it can miss and no
     tick that can be too late for it.
+
+    **Phase 2b split this class along the line the phase is about.** A run queues
+    its receipt inside the transaction that moved the money, and "moved" turned
+    out to mean two things. A release moves money between the wallet's own two
+    balances, so it completes here and its receipt goes out - the two tests below
+    that run a release plan, which are the retargeted halves of what used to be
+    payout tests. A payout is bound for a bank account nothing here has contacted,
+    so its ledger row stops at PENDING and its receipt is not composed at all;
+    ``test_a_payout_run_sends_no_receipt_yet`` is the test that says so, and it is
+    the reason the other two had to move rather than the reason they were deleted.
+
+    What these tests are really about is unchanged: the run writes the receipt and
+    the tick sends it, in that order, inside one invocation. What moved is which
+    plan can still demonstrate it.
     """
 
     NOON = "2026-03-02T12:00"
 
-    def test_a_payout_emails_its_receipt_in_the_same_tick(
+    def test_a_release_run_emails_its_receipt_in_the_same_tick(
         self, tmp_path, capsys, monkeypatch, build_channel
     ):
-        """The headline of this phase: at noon the run, and the mail, happen.
+        """It was ``..._a_payout_emails_its_receipt_in_the_same_tick``.
+
+        The claim is the same and the plan had to change to keep it honest. This
+        tick runs a release plan, the run's money settles where this system can
+        see it, and the mail leaves in the same invocation that moved it.
 
         Note the two are one invocation but not one transaction. The run commits
         its own receipt *inside* the transaction that moves the money (see
         ``ExecutePlanRun``); this drain is what puts it on the wire afterwards, and
         it runs last in ``_plan_tick`` for exactly this reason - a receipt drained
         before the runs would describe nothing.
+
+        The subject asserts the amount rather than the pot, because the pot's name
+        travels in the body: see ``compose.payout_succeeded`` for why the receipt
+        says the one thing the plan cannot.
         """
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
         monkeypatch.setenv("SMTP_USER", "me@example.com")
         monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
         db = str(tmp_path / "cli.db")
         # Funded first, so that the deposit's own receipt goes to the default
-        # channel and what this test counts is the payout alone.
+        # channel and what this test counts is the run's receipt alone.
         wallet_id = funded_locked_wallet(db, capsys)
-        create_salary_plan(db, wallet_id)
+        create_release_plan(db, wallet_id, "2026-01-01", "--release", "20000", "rent")
         receipts = build_channel()
         install_notification_deliverer(monkeypatch, receipts)
         capsys.readouterr()
@@ -1065,24 +1138,29 @@ class TestTheReceiptAfterThePayout:
     def test_the_receipt_is_one_message_for_the_whole_run(
         self, tmp_path, capsys, monkeypatch, build_channel
     ):
-        """A payroll to three accounts is one email, not three.
+        """A run with three lines is one email, not three.
 
         The decision is about the reader, not the mailbox: three messages arriving
         together would have to be reassembled by hand to answer "did the run
         happen?". The instructions are listed in the body instead, which is the
         same information in the order it was executed.
+
+        The two release lines are told apart by their labels here rather than by
+        their destinations - a release has no destination, because it sends money
+        nowhere outside the wallet - and both labels appearing in one body is what
+        proves both lines were rendered into the one message.
         """
         monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
         monkeypatch.setenv("SMTP_USER", "me@example.com")
         monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
         db = str(tmp_path / "cli.db")
         wallet_id = funded_locked_wallet(db, capsys, "500000")
-        run(
-            db, "plan", "create", "--wallet", wallet_id, "--name", "split",
-            "--source", "locked", "--from-fund", "Savings",
-            "--every", "monthly", "--from", "2026-01-01",
-            "--pay", "20000", "0123456789", "058", "Chinedu Okafor", "salary",
-            "--pay", "15000", "0987654321", "058", "Ada Nwosu", "rent",
+        create_release_plan(
+            db,
+            wallet_id,
+            "2026-01-01",
+            "--release", "20000", "tuition",
+            "--release", "15000", "rent",
         )
         receipts = build_channel()
         install_notification_deliverer(monkeypatch, receipts)
@@ -1092,8 +1170,52 @@ class TestTheReceiptAfterThePayout:
 
         assert len(receipts.sent) == 1
         body = receipts.sent[0].body
-        assert "Chinedu Okafor" in body
-        assert "Ada Nwosu" in body
+        assert "tuition" in body
+        assert "rent" in body
+
+    def test_a_payout_run_sends_no_receipt_yet(
+        self, tmp_path, capsys, monkeypatch, build_channel
+    ):
+        """The payout, and the difference between "not yet" and "never".
+
+        Every word of a run receipt would be false here. ``compose`` closes each
+        one with ``"The money has already moved. This is a receipt, not a
+        request"``, and a payout's money has not moved - it has been taken out of
+        the pot's reach and left PENDING, because the far end is a bank account
+        this process has never contacted. ``payout_succeeded``'s subject is
+        ``"Plan X: 20000.00 NGN moved"``, in the past tense and specific about the
+        amount. So the run is recorded, the pot is debited, and nothing is queued.
+
+        The two assertions after the silence are what keep this from being a test
+        that passes when the tick does nothing at all. The run reports ``succeeded``
+        - the run did what a run does - and the pot is 20000 lighter on disk. The
+        suppression is a decision about what to *say*, not a way of quietly not
+        paying.
+
+        This is a receipt that is owed and not yet written, which is why
+        ``payout_succeeded`` was not deleted and the guard went into
+        ``_record_success`` instead: Phase 3 settles the row, and the moment a row
+        can say SUCCESSFUL is the moment this message becomes true.
+        """
+        monkeypatch.setenv("SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("SMTP_USER", "me@example.com")
+        monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
+        db = str(tmp_path / "cli.db")
+        wallet_id = funded_locked_wallet(db, capsys)
+        create_salary_plan(db, wallet_id)
+        receipts = build_channel()
+        install_notification_deliverer(monkeypatch, receipts)
+        capsys.readouterr()
+
+        assert run(db, "plan", "tick", "--as-of", self.NOON) == 0
+        out = capsys.readouterr().out
+
+        assert "succeeded" in out
+        assert "emailed" not in out
+        assert receipts.sent == []
+
+        assert run(db, "balance", wallet_id) == 0
+        assert "locked: 80000.00 NGN" in capsys.readouterr().out
 
     def test_a_blocked_run_emails_why_it_could_not_pay(
         self, tmp_path, capsys, monkeypatch, build_channel

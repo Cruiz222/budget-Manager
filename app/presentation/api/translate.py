@@ -22,11 +22,13 @@ Money, in particular, is formatted in exactly one function - which is what keeps
 ``"8000.00"`` from being ``"8000"`` in one endpoint and ``"8000.0"`` in another.
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from app.application.identity.log_in import LoggedIn
+from app.application.wallet_service import ConfirmedOperation
 from app.domain.identity.user import User
+from app.domain.money.confirmation import Confirmation
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
@@ -172,6 +174,74 @@ def transaction_out(transaction: Transaction) -> schemas.TransactionOut:
         created_at=transaction.created_at,
         completed_at=transaction.completed_at,
         reversed_at=transaction.reversed_at,
+    )
+
+
+def confirmation_out(
+    confirmation: Confirmation, as_of: datetime | None = None
+) -> schemas.ConfirmationOut:
+    """A recorded request, with the status the caller would be answered with now.
+
+    ``as_of`` defaults to *no moment given*, which reports the stored status
+    unchanged - and that is the right default rather than a lazy one, because a
+    translation that read the clock would make every response depend on when it
+    was rendered, and two calls rendering the same row would disagree for a
+    reason no reader could see. The routes pass ``datetime.now()`` explicitly,
+    at the same moment they hand the same instant to the service, so the status
+    in the body and the status the next call would act on are the same answer.
+
+    ``status_as_of`` is called even when nothing has expired: the derived status
+    is the *only* thing this API reports, so ``expired`` comes out of one method
+    rather than out of a comparison written here as well. A second comparison
+    would be a second definition of the window's last instant, free to disagree
+    with ``Confirmation.is_expired`` about the boundary - in the direction of
+    telling a client its request is live when confirming it would refuse.
+    """
+    return schemas.ConfirmationOut(
+        confirmation_id=confirmation.confirmation_id,
+        kind=confirmation.kind.value,
+        status=(
+            confirmation.status
+            if as_of is None
+            else confirmation.status_as_of(as_of)
+        ).value,
+        wallet_id=confirmation.wallet_id,
+        amount=(
+            money_out(confirmation.amount)
+            if confirmation.amount is not None
+            else None
+        ),
+        destination=destination_out(confirmation.destination),
+        fund_name=confirmation.fund_name,
+        internal_reference=confirmation.internal_reference,
+        created_at=confirmation.created_at,
+        expires_at=confirmation.expires_at,
+    )
+
+
+def confirmed_operation_out(
+    operation: ConfirmedOperation, as_of: datetime | None = None
+) -> schemas.ConfirmedOperationOut:
+    """What answering a confirmation produced.
+
+    ``as_of`` is threaded to ``confirmation_out`` and matters for exactly one
+    case: a ``CLOSE``, whose request the service reads back after the movement.
+    A confirmed request never derives to ``EXPIRED`` - ``status_as_of`` leaves a
+    spent request alone however long ago it was spent - so for the three money
+    operations the moment changes nothing. It is passed anyway so that the
+    answer does not depend on which kind happened to be asked about.
+
+    ``transaction`` is ``None`` for a close, and that is forwarded rather than
+    substituted: see ``ConfirmedOperationOut``.
+    """
+    return schemas.ConfirmedOperationOut(
+        confirmation=confirmation_out(operation.confirmation, as_of),
+        transaction=(
+            transaction_out(operation.transaction)
+            if operation.transaction is not None
+            else None
+        ),
+        wallet=wallet_out(operation.wallet),
     )
 
 

@@ -94,7 +94,7 @@ def test_withdraw_beyond_balance_fails_and_balance_is_unchanged(tmp_path, capsys
     run(db, "deposit", wallet_id, "1000")
     capsys.readouterr()
 
-    assert run(db, "withdraw", wallet_id, "5000") == 1
+    assert run(db, "withdraw", wallet_id, "5000", "--yes") == 1
     assert "error:" in capsys.readouterr().err
 
     assert run(db, "balance", wallet_id) == 0
@@ -144,7 +144,7 @@ def test_freeze_stops_withdrawals_but_not_deposits(tmp_path, capsys):
     capsys.readouterr()
 
     # A frozen wallet rejects the withdrawal ...
-    assert run(db, "withdraw", wallet_id, "300") == 1
+    assert run(db, "withdraw", wallet_id, "300", "--yes") == 1
     assert "error:" in capsys.readouterr().err
 
     # ... but the freeze was a status change only - no money moved.
@@ -194,6 +194,14 @@ def test_history_of_unknown_wallet_is_an_error(tmp_path, capsys):
 
 
 def test_payout_sends_locked_funds_to_a_bank_account(tmp_path, capsys):
+    """``--yes`` rather than an answered prompt, and every money test here is.
+
+    The prompt is the subject of ``test_cli_confirmation.py``, where it is
+    answered, declined and left unanswered; what these tests are about is what
+    happens to the balances. Making them all answer a prompt would put the same
+    three lines in a dozen places and make the money assertions harder to find -
+    and ``--yes`` is the flag a script would use for exactly this reason.
+    """
     db = str(tmp_path / "cli.db")
     wallet_id = opened_wallet_id(db, capsys)
     run(db, "deposit", wallet_id, "10000")
@@ -213,6 +221,7 @@ def test_payout_sends_locked_funds_to_a_bank_account(tmp_path, capsys):
         "058",
         "--name",
         "Chinedu Okafor",
+        "--yes",
     ) == 0
     out = capsys.readouterr().out
     assert "paid 2000.00 NGN to Chinedu Okafor (bank_account:0123456789)" in out
@@ -238,6 +247,7 @@ def test_payout_beyond_the_locked_balance_is_an_error(tmp_path, capsys):
         "058",
         "--name",
         "Chinedu Okafor",
+        "--yes",
     ) == 1
     assert "error:" in capsys.readouterr().err
 
@@ -264,6 +274,7 @@ def test_payout_appears_in_history(tmp_path, capsys):
         "058",
         "--name",
         "Chinedu Okafor",
+        "--yes",
     )
     capsys.readouterr()
 
@@ -318,7 +329,9 @@ def test_payout_can_name_the_pot_it_draws_on(tmp_path, capsys):
     capsys.readouterr()
     funded_pot(db, capsys, wallet_id, "Rent", "6000")
 
-    assert run(db, "payout", wallet_id, "2000", "--fund", "Rent", *TO_BANK) == 0
+    assert run(
+        db, "payout", wallet_id, "2000", "--fund", "Rent", *TO_BANK, "--yes"
+    ) == 0
     out = capsys.readouterr().out
     assert "paid 2000.00 NGN to Chinedu Okafor" in out
     assert "locked 4000.00 NGN" in out
@@ -340,7 +353,9 @@ def test_a_named_payout_may_not_reach_into_another_pot(tmp_path, capsys):
     funded_pot(db, capsys, wallet_id, "Travel", "1000")
     funded_pot(db, capsys, wallet_id, "Rent", "5000")
 
-    assert run(db, "payout", wallet_id, "2000", "--fund", "Travel", *TO_BANK) == 1
+    assert run(
+        db, "payout", wallet_id, "2000", "--fund", "Travel", *TO_BANK, "--yes"
+    ) == 1
     assert "error:" in capsys.readouterr().err
 
     assert run(db, "balance", wallet_id) == 0
@@ -354,7 +369,9 @@ def test_a_payout_naming_an_unknown_pot_is_an_error(tmp_path, capsys):
     capsys.readouterr()
     funded_pot(db, capsys, wallet_id, "Rent", "6000")
 
-    assert run(db, "payout", wallet_id, "2000", "--fund", "Travel", *TO_BANK) == 1
+    assert run(
+        db, "payout", wallet_id, "2000", "--fund", "Travel", *TO_BANK, "--yes"
+    ) == 1
     assert "error:" in capsys.readouterr().err
 
 
@@ -379,7 +396,9 @@ def test_an_adhoc_payout_will_not_spend_a_business_pot_early(tmp_path, capsys):
         kind="business", matures="2030-01-01",
     )
 
-    assert run(db, "payout", wallet_id, "2000", "--fund", "Supplier", *TO_BANK) == 1
+    assert run(
+        db, "payout", wallet_id, "2000", "--fund", "Supplier", *TO_BANK, "--yes"
+    ) == 1
     assert "error:" in capsys.readouterr().err
 
     # And the money is still where it was, which is the part that matters.

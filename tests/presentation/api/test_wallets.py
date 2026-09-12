@@ -99,10 +99,19 @@ class TestReadingAWallet:
     def test_a_new_wallet_has_no_movements(self, client, as_user, open_wallet):
         """An empty list, not a 404 - and the difference is the whole point.
 
-        Nothing can put money into a wallet in this phase, so this is what every
-        ledger looks like: a wallet with no history rather than a wallet whose
-        history could not be found. See ``routes.wallets.list_transactions`` for
-        why the two are worth distinguishing.
+        A *new* wallet has no history, and this is what that looks like: an empty
+        list rather than a 404, because "there is nothing here" and "there is no
+        such wallet" are different answers and only the second is an error. See
+        ``routes.wallets.list_transactions`` for why the two are worth
+        distinguishing.
+
+        **This used to read "nothing can put money into a wallet in this phase,
+        so this is what every ledger looks like", and Phase 2b made that false.**
+        A withdrawal, a payout, a lock and a release all write rows now, and the
+        wallet this test opens is empty only because it is new. The test did not
+        need to change - the wallet it builds genuinely has no movements - but
+        the reason it passes did, and a docstring explaining the wrong reason is
+        how a later reader learns the wrong thing about their own ledger.
         """
         headers = as_user()
         wallet_id = open_wallet(headers)

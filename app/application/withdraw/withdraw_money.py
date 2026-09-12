@@ -9,9 +9,22 @@ from app.domain.money.transactionType import TransactionType
 
 
 class WithdrawMoney(WalletOperation):
-    """Withdraw money from the wallet's available balance."""
+    """Move money out of the wallet's available balance, towards the owner.
+
+    **It does not settle here**, which is the surprising part of a class this
+    short. The wallet is debited - the money leaves the owner's reach, and a
+    second withdrawal of the same amount is refused against the reduced balance -
+    but the transaction is left PENDING, because the far end of a withdrawal is a
+    bank account this code has never spoken to. What has happened is that the
+    owner's money is held; what has not happened is a transfer.
+
+    So this is the type ``Transaction`` refuses to give a ``destination``: a
+    withdrawal says money left, and a payout says money left *and here is where it
+    went*. Neither can say it arrived. See ``settles_immediately``.
+    """
 
     transaction_type = TransactionType.WITHDRAWAL
+    settles_immediately = False
 
     def _validate_amount(self, amount):
         # The Wallet distinguishes a zero withdrawal from a negative one, so

@@ -56,6 +56,9 @@ from app.domain.identity.exception import (
     UserNotFoundError,
 )
 from app.domain.money.exception import (
+    ConfirmationAlreadyUsedError,
+    ConfirmationExpiredError,
+    ConfirmationNotFoundError,
     DuplicateFundNameError,
     FundNotFoundError,
     FundNotMaturedError,
@@ -68,6 +71,8 @@ from app.domain.money.exception import (
     WalletAlreadyFrozenError,
     WalletClosedError,
     WalletFrozenError,
+    WalletHasActivePlansError,
+    WalletNotEmptyError,
     WalletNotFoundError,
 )
 from app.domain.planning.exception import (
@@ -100,12 +105,20 @@ UNAUTHORIZED = (InvalidSessionError, InvalidCredentialsError)
 
 #: The resource is not there for the actor asking. One status, one body, whatever
 #: the reason - see the module docstring.
+#:
+#: ``ConfirmationNotFoundError`` is the newest member and it carries two meanings
+#: at once, on purpose: no such request, *or* one belonging to another account.
+#: The domain keeps those one refusal for the reason ``WalletRepository.get_owned``
+#: gives - telling a stranger that a request exists and is not theirs answers a
+#: question they have no standing to ask - so this list could not split them even
+#: if it wanted to.
 NOT_FOUND = (
     WalletNotFoundError,
     TransactionNotFoundError,
     FundNotFoundError,
     UserNotFoundError,
     SavingsPlanNotFoundError,
+    ConfirmationNotFoundError,
 )
 
 #: The resource is there and its current state refuses this. Note every one of
@@ -121,6 +134,23 @@ NOT_FOUND = (
 #: address, and the state of the world is what refuses it. 400 would blame the
 #: caller for a value that is fine; the alternative of reporting success would
 #: leave them unable to log in and unsure why.
+#:
+#: ``WalletNotEmptyError`` and ``WalletHasActivePlansError`` are close's two
+#: refusals, and they are the plainest members of this list: the wallet is
+#: exactly what the path names, it is there, and what it still holds is the whole
+#: reason. They stay two classes at one status because they have two remedies -
+#: move the money out, cancel the plan - and a caller that received one name for
+#: both would have to guess which.
+#:
+#: ``ConfirmationExpiredError`` and ``ConfirmationAlreadyUsedError`` are the two
+#: refusals a confirmation can make, and they are the same shape as the pair
+#: above: the request is exactly what the path names, it is there, and it is its
+#: own state that refuses. They are two classes rather than one because the
+#: remedies differ and the difference is real - a spent request means *ask
+#: again*, a lapsed one means *ask again, and answer it sooner* - and because
+#: collapsing them would make "already answered" indistinguishable from "never
+#: answered in time" in a log, which are the two facts worth telling apart when
+#: somebody reports that money did not move.
 CONFLICT = (
     InsufficientFundsError,
     WalletFrozenError,
@@ -128,6 +158,8 @@ CONFLICT = (
     WalletAlreadyFrozenError,
     WalletAlreadyClosedError,
     WalletAlreadyActiveError,
+    WalletNotEmptyError,
+    WalletHasActivePlansError,
     FundNotMaturedError,
     MaturityNotExtendedError,
     DuplicateFundNameError,
@@ -137,6 +169,8 @@ CONFLICT = (
     PlanAlreadyFinishedError,
     IrreversibleReleasePlanError,
     CommittedPayoutRemovalError,
+    ConfirmationExpiredError,
+    ConfirmationAlreadyUsedError,
 )
 
 

@@ -25,9 +25,17 @@ class WalletOperation(ABC):
     Concrete use cases supply only the things that differ:
       - transaction_type:  the TransactionType recorded on the ledger
       - _apply():          the wallet method that performs the operation
+      - settles_immediately: whether the last step above happens at all
 
     This is the Template Method pattern: the base class owns the algorithm and
     lets subclasses fill in the variable steps.
+
+    **The last step is conditional, and that is the newest thing here.** An
+    operation whose far end is outside this system cannot honestly report that it
+    succeeded, because nothing here has contacted that far end. Those operations
+    stop at PENDING with the wallet already debited - the money is *held* - and
+    the row they leave is a claim about an intention rather than about a fact.
+    See ``settles_immediately``.
 
     ``destination`` is passed straight through to the Transaction, which is
     where the rule about it lives: a payout must carry one, every other type
@@ -46,6 +54,33 @@ class WalletOperation(ABC):
 
     #: Transaction type recorded for this operation (set by each subclass).
     transaction_type: TransactionType
+
+    #: Whether this operation can call itself finished, or must wait for an
+    #: outside party to confirm it (set by each subclass; ``True`` for most).
+    #:
+    #: ``True`` means the movement completes here: both balances it touches are
+    #: inside this system, so the instant the wallet has moved the money the
+    #: operation is a fact, and the ledger says SUCCESSFUL.
+    #:
+    #: ``False`` means the movement crosses the system's edge. A withdrawal and a
+    #: payout both end at a bank account nobody here has contacted, so the most
+    #: this code can honestly record is that it *intends* to send the money and
+    #: has taken it out of the owner's reach in the meantime. The transaction
+    #: stays PENDING and the wallet is still debited - the funds are held, not
+    #: spent - and a later phase settles it against the provider's own word.
+    #:
+    #: **Why the debit happens anyway, rather than at settlement.** Reserving the
+    #: money at intent time is what stops it being spent twice: two payout
+    #: requests each checked against an untouched balance would both pass, and
+    #: the wallet would overdraw on money it had promised away. "Available" has
+    #: to keep meaning available, and this is the only reading of it that does.
+    #:
+    #: The default is ``True`` deliberately, so the safe-for-this-phase answer is
+    #: what a new operation inherits. A new operation that crosses the edge has
+    #: to say so; one that forgets is immediately wrong in the loud direction,
+    #: leaving a SUCCESSFUL row where a caller can see it, rather than silently
+    #: withholding money from a user who thinks it moved.
+    settles_immediately: bool = True
 
     def __init__(
         self,
@@ -96,9 +131,15 @@ class WalletOperation(ABC):
             self.transaction_repository.save(transaction)
             raise
 
-        # 4b. The operation succeeded - the transaction is complete.
-        transaction.mark_successful()
-        self.transaction_repository.save(transaction)
+        # 4b. The operation succeeded. For most operations that is the end of it
+        #     and the row becomes SUCCESSFUL. For one that crosses the system's
+        #     edge it is not, and the PENDING row written at step 3 is already the
+        #     finished record - see ``settles_immediately``. Note there is nothing
+        #     left to do in that case: the wallet was debited by ``_apply`` above,
+        #     so the row and the balance already agree with each other.
+        if self.settles_immediately:
+            transaction.mark_successful()
+            self.transaction_repository.save(transaction)
 
         return transaction
 

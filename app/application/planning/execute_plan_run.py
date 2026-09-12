@@ -12,6 +12,8 @@ from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.release.release_from_locked import ReleaseFromLocked
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
+from app.domain.money.transaction import Transaction
+from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notification import Notification
@@ -129,8 +131,8 @@ class ExecutePlanRun:
             if reason is not None:
                 return self._record_blocked(uow, plan, wallet, due_at, reason)
 
-            self._move_the_money(uow, plan, wallet, due_at, as_of)
-            return self._record_success(uow, plan, wallet, due_at)
+            transactions = self._move_the_money(uow, plan, wallet, due_at, as_of)
+            return self._record_success(uow, plan, wallet, due_at, transactions)
         except BaseException:
             uow.rollback()
             raise
@@ -266,7 +268,7 @@ class ExecutePlanRun:
         wallet: Wallet,
         due_at: datetime,
         as_of: datetime,
-    ) -> None:
+    ) -> list[Transaction]:
         """Apply every instruction, through the operation that owns its rules.
 
         Each instruction runs as a normal ``WalletOperation``, so the ledger
@@ -274,6 +276,17 @@ class ExecutePlanRun:
         all the ones a manual operation would get. Nothing here bypasses the
         wallet to edit a balance directly - if a run could do that, the plan
         would be a second, unchecked way to spend money.
+
+        **It returns the rows it produced**, which is new. They used to be
+        discarded because nothing downstream needed them: the run's own outcome
+        was the only answer anybody wanted. That stopped being true when a
+        movement that crosses the system's edge began settling as PENDING rather
+        than SUCCESSFUL - a run can now be *recorded* as succeeded while its
+        money is still only held, and the caller has to be able to tell. Reading
+        it off the rows rather than off the plan is deliberate: the row is what
+        happened, and a second derivation from the instructions could disagree
+        with it. ``compose.wallet_movement`` takes the same position one layer
+        down.
 
         Note which moment the operations are handed, because the two moments in
         this method are easy to confuse. The *reference* is keyed on ``due_at`` -
@@ -286,13 +299,17 @@ class ExecutePlanRun:
         ``as_of``, would have approved it. Pre-flight and execution must be
         answering the same question or the pre-flight is worth nothing.
         """
+        transactions = []
         for index, instruction in enumerate(plan.instructions):
             operation_cls, extra = self._operation_for(plan, instruction, as_of)
-            operation_cls(wallet, uow.transactions, **extra).execute(
-                amount=instruction.amount,
-                internal_reference=self._reference(plan.plan_id, due_at, index),
-                destination=instruction.destination,
+            transactions.append(
+                operation_cls(wallet, uow.transactions, **extra).execute(
+                    amount=instruction.amount,
+                    internal_reference=self._reference(plan.plan_id, due_at, index),
+                    destination=instruction.destination,
+                )
             )
+        return transactions
 
     @staticmethod
     def _operation_for(plan: SavingsPlan, instruction: Instruction, as_of: datetime):
@@ -411,6 +428,7 @@ class ExecutePlanRun:
         plan: SavingsPlan,
         wallet: Wallet,
         due_at: datetime,
+        transactions: list[Transaction],
     ) -> PlanRun:
         """Record the run, advance the counter, persist the wallet's new balances.
 
@@ -424,18 +442,46 @@ class ExecutePlanRun:
         describes a run that has already been fully recorded, and committed with
         them so that a message cannot exist for a run that rolled back, or fail to
         exist for one that did not.
+
+        **The receipt is skipped when a row it describes is still only held.**
+        "Succeeded" here means the run did what a run does - applied its
+        instructions, advanced its counter. It does not mean the money arrived
+        anywhere, and a payout's money cannot have arrived, because the far end
+        is a bank account this code has never contacted. The transaction is left
+        PENDING for exactly that reason, and ``payout_succeeded``'s words are
+        past tense and specific: *"Plan X: 5000.00 NGN moved"*, *"the plan ran"*.
+
+        So a run whose payout is pending records its success and sends nothing,
+        which is the same silence ``WalletService._announce`` keeps one layer
+        down and for the same reason: a receipt about money leaving is written
+        when the money leaves. It will be, in the phase that settles these - and
+        that phase fires the message, because that is the moment there is
+        something true to say.
+
+        A run of pure releases still announces, because a release genuinely
+        completes here: both of its balances are inside this system. That is what
+        ``all`` is doing rather than a blanket skip on the plan's source.
+
+        Note the vacuous-truth hazard this would have if an empty plan were
+        possible - ``all`` of nothing is True, so the receipt would fire for a
+        run that moved nothing. ``SavingsPlan`` refuses to exist with no
+        instructions, which is what makes the test safe to write this way.
         """
         run = PlanRun(plan_id=plan.plan_id, due_at=due_at, status=RunStatus.SUCCEEDED)
         uow.plan_runs.save(run)
         plan.record_run()
         uow.plans.save(plan)
         uow.wallets.save(wallet)
-        self._announce(
-            uow,
-            compose.payout_succeeded(
-                plan, run, self._recipient, self._pot_name(plan, wallet)
-            ),
-        )
+        if all(
+            transaction.status is TransactionStatus.SUCCESSFUL
+            for transaction in transactions
+        ):
+            self._announce(
+                uow,
+                compose.payout_succeeded(
+                    plan, run, self._recipient, self._pot_name(plan, wallet)
+                ),
+            )
         uow.commit()
         return run
 

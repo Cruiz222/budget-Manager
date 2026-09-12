@@ -51,6 +51,7 @@ class PayoutFromLocked(WalletOperation):
     """
 
     transaction_type = TransactionType.PAYOUT
+    settles_immediately = False
 
     def __init__(
         self,

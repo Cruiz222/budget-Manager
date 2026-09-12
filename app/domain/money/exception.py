@@ -30,6 +30,21 @@ class WalletAlreadyClosedError(MoneyError):
     pass
 class WalletAlreadyActiveError(MoneyError):
     pass
+
+# --- Closing a wallet -----------------------------------------------------
+# Two refusals that ``Wallet.close`` and ``WalletService.close_wallet`` can
+# produce, and they are separate names because they have separate remedies: one
+# is answered by moving money out, the other by cancelling a plan. Collapsing
+# them into one "cannot close" error would leave the caller to guess which.
+#
+# ``WalletAlreadyClosedError`` above is not one of these. It answers a second
+# ``close`` on a wallet that is already shut - nothing to remedy, the command
+# already happened - whereas both of these are about what is still inside.
+class WalletNotEmptyError(MoneyError):
+    pass
+class WalletHasActivePlansError(MoneyError):
+    pass
+
 class WalletNotFoundError(MoneyError):
     pass
 class NegativeAmountDepositError(MoneyError):
@@ -128,4 +143,64 @@ class FundNotMaturedError(MoneyError):
 class MaturityNotExtendedError(MoneyError):
     pass
 class InvalidWalletFundsError(MoneyError):
+    pass
+
+# --- Confirmations (second-level confirmation) ----------------------------
+# A confirmation is a recorded request that nothing has been done about, held
+# until its requester answers it. The vocabulary collision it was named around
+# is worth stating once here, because it is the reason this group exists under
+# this name at all: the README already says "the pending intent" for the PENDING
+# *transaction*, which is a movement that *has* happened and cannot yet be
+# called finished. A confirmation is the opposite - a request that has not
+# happened. Two opposite states must not share one word.
+#
+# The guards below split into three groups, and the split is the one every
+# aggregate here uses:
+#
+#   1. Construction guards - a malformed record. These can only fire from a bug
+#      or a hand-written row, never from a person using the system, and they are
+#      graded 400 with everything else that is a MoneyError.
+#   2. The pairing guards - a confirmation that names the wrong fields for its
+#      kind. ``Instruction`` enforces the same shape one aggregate over
+#      (a payout must carry a destination and nothing else may), and the reason
+#      it is written out again rather than shared is the same: coupling two
+#      aggregates to deduplicate four lines would trade a little repetition for
+#      a much harder-to-move boundary.
+#   3. The three that reach a caller - not found (404), expired (409) and
+#      already used (409). These are things a person can actually do.
+class InvalidConfirmationIDError(MoneyError):
+    pass
+class InvalidConfirmationUserIDError(MoneyError):
+    pass
+class InvalidConfirmationWalletIDError(MoneyError):
+    pass
+class InvalidConfirmationKindError(MoneyError):
+    pass
+class InvalidConfirmationStatusError(MoneyError):
+    pass
+class InvalidConfirmationReferenceError(MoneyError):
+    pass
+class InvalidConfirmationAmountError(MoneyError):
+    pass
+class InvalidConfirmationCreatedAtError(MoneyError):
+    pass
+class InvalidConfirmationExpiresAtError(MoneyError):
+    pass
+class InvalidConfirmationTransactionIDError(MoneyError):
+    pass
+class InvalidConfirmationWindowError(MoneyError):
+    pass
+class MissingConfirmationDestinationError(MoneyError):
+    pass
+class UnexpectedConfirmationDestinationError(MoneyError):
+    pass
+class UnexpectedConfirmationAmountError(MoneyError):
+    pass
+class UnexpectedConfirmationFundError(MoneyError):
+    pass
+class ConfirmationNotFoundError(MoneyError):
+    pass
+class ConfirmationExpiredError(MoneyError):
+    pass
+class ConfirmationAlreadyUsedError(MoneyError):
     pass

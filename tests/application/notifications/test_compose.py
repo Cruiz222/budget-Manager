@@ -223,6 +223,45 @@ class TestTheSuccessfulRun:
         assert "already moved" in notification.body
         assert "receipt, not a request" in notification.body
 
+    def test_it_names_the_pot_the_run_drew_on(self, build_noon_plan):
+        """The one fact the receipt can state that the plan cannot.
+
+        A plan holds a ``fund_id``, and an id in a human's inbox is noise - so
+        the name is passed in by the caller that has both aggregates and
+        translated here into a sentence. Without it, a wallet with three business
+        pots produces three identical emails, and the reader cannot tell which
+        commitment was honoured.
+
+        This test moved here from ``test_execute_plan_run`` in Phase 2b, and the
+        move is the point: the run-level test can no longer reach this sentence,
+        because a *payout* run is now pending and composes no receipt at all. The
+        rendering is checkable without a run behind it - these functions are pure
+        - so it is checked where it lives rather than through an executor that
+        has to settle first.
+        """
+        plan = build_noon_plan()
+
+        notification = compose.payout_succeeded(
+            plan, build_run(plan), "a@b.c", fund_name="Supplier"
+        )
+
+        assert "Drawn from the pot 'Supplier'." in notification.body
+
+    def test_a_plan_that_names_no_pot_adds_no_line(self, build_noon_plan):
+        """The legacy shape, and what saying nothing about it looks like.
+
+        A plan saved before pots could be named has one pot - the migration's
+        open ``"Locked"`` - and the reader never chose it. Naming it would raise
+        a question whose answer is "you can ignore this", so the sentence is
+        absent rather than explanatory. ``plan show`` prints ``(pooled)`` because
+        that command exists to say what a plan *is*; this one says what happened.
+        """
+        plan = build_noon_plan()
+
+        notification = compose.payout_succeeded(plan, build_run(plan), "a@b.c")
+
+        assert "Drawn from the pot" not in notification.body
+
     def test_its_key_is_the_one_the_domain_derives(self, build_noon_plan):
         """A second enqueue of the same event has to be a no-op, and the key is
         what decides that - so the composer must not invent its own."""

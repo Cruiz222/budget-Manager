@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+from app.domain.repositories.confirmation_repository import ConfirmationRepository
 from app.domain.repositories.notification_repository import NotificationRepository
 from app.domain.repositories.outbound_message_repository import (
     OutboundMessageRepository,
@@ -85,6 +86,21 @@ class UnitOfWork(ABC):
     #: is how they become known. Asking a session who it belongs to cannot
     #: require already knowing the answer. See ``SessionRepository``.
     sessions: SessionRepository
+    #: Correctness, not convenience, and the third member of that small group
+    #: after ``wallets``/``transactions``/``plan_runs`` and ``notifications``.
+    #:
+    #: A second-level confirmation makes two things true at once: the request was
+    #: answered, and the money moved. Those must land together, and a crash
+    #: between them is worse than either alone - a request recorded as carried
+    #: out with nothing to show for it, or money moved by a request that still
+    #: looks unanswerable. The pairing is what makes "this confirmation was
+    #: spent" imply "and here is the ledger row it bought".
+    #:
+    #: Note it is *not* here because the request has to be read in the same
+    #: snapshot - a confirmation's fields are immutable once written, so reading
+    #: one outside the money's transaction decides nothing. It is here for the
+    #: write, and the write is the spend. See ``ConfirmationRepository.claim``.
+    confirmations: ConfirmationRepository
 
     @abstractmethod
     def commit(self) -> None:

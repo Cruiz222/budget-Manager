@@ -1,8 +1,10 @@
+from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 
 from app.application.wallet_service import WalletService
+from app.domain.money.confirmationKind import ConfirmationKind
 from app.presentation.api import schemas, translate
 from app.presentation.api.dependencies import wallet_service
 
@@ -67,3 +69,211 @@ def list_transactions(
         translate.transaction_out(one)
         for one in service.transactions_for_wallet(wallet_id)
     ]
+
+
+# --- moving money out, and the status transitions ---------------------------
+#
+# What these five have in common is that they are the wallet's own operations:
+# no plan is involved, and every one of them acts on a wallet the caller has
+# already been proved to own. What separates them is settlement, and it is the
+# reason the three money routes look so different from the three status ones.
+#
+# **The three money routes no longer move money.** They record a request to, and
+# answer with that request. A second call - ``POST /confirmations/{id}/confirm``
+# - is what executes it. That is the whole feature, and it is why their responses
+# changed shape rather than gaining a field: a request is not a transaction, and
+# a body that looked like one would be read as one.
+#
+# What has *not* changed is the settlement story underneath. Once confirmed, a
+# withdrawal or a payout is still the only operation here that crosses the
+# system's edge - money leaves towards a bank account nothing here has contacted
+# - so the ledger row it produces is still **PENDING**, not SUCCESSFUL, with the
+# amount already debited from the wallet. The money is held, and the receipt is
+# deliberately not sent; see ``WalletOperation.settles_immediately`` and
+# ``WalletService._announce``. A client must not read the confirm's 201 as "the
+# money arrived", which is why the response carries the row's status rather than
+# leaving it implied.
+
+
+def _status_for(response: Response, created: bool) -> None:
+    """Say whether this call recorded a request or found one already there.
+
+    201 when the request is new, 200 when it is the one already on file - which
+    is the answer a client that retried a request whose response it never saw
+    needs, and cannot get any other way. The body is identical in both cases, on
+    purpose: it *is* the same request, and a client that only looked at the body
+    would have no reason to treat the second answer as a failure.
+
+    Set here rather than by returning a ``JSONResponse``, because the route's job
+    is to describe the resource and not to build an envelope around it; the
+    declared ``status_code=201`` remains the answer for the ordinary case, and
+    this only ever lowers it.
+
+    Nothing about this is a claim that money did not move. A request is inert
+    either way - see ``WalletService.request_confirmation`` - so a 200 and a 201
+    differ in what was recorded, not in what was spent.
+    """
+    if not created:
+        response.status_code = 200
+
+
+@router.post(
+    "/wallets/{wallet_id}/withdrawals",
+    response_model=schemas.ConfirmationOut,
+    status_code=201,
+)
+def withdraw(
+    wallet_id: UUID,
+    payload: schemas.MovementIn,
+    response: Response,
+    service: WalletService = Depends(wallet_service),
+) -> schemas.ConfirmationOut:
+    """Record a request to move money out of the available balance. **It moves nothing.**
+
+    The wallet is read first, and only to learn its currency - the amount arrives
+    as a bare string and has to be read in something. That is one extra read per
+    money request, and it is the same shape the CLI uses, because the alternative
+    is a currency in the request body that a caller could disagree with the
+    wallet about.
+
+    **The balance is not checked, here or in the service.** A request is not an
+    attempt: the balance that decides is the one at confirm time, so a check now
+    would be a second and weaker copy of the wallet's rule, free to disagree with
+    it. It also means a request made against an empty wallet still works once the
+    wallet is topped up before it is answered, which is what somebody about to be
+    paid would want.
+
+    Posting the same ``ref`` twice returns the *same* request - a 200 carrying the
+    id the first call returned. See ``_status_for``.
+    """
+    wallet = service.get_wallet(wallet_id)
+    amount = translate.money_in(payload.amount, wallet.currency)
+    now = datetime.now()
+    requested = service.request_confirmation(
+        wallet_id,
+        ConfirmationKind.WITHDRAWAL,
+        now,
+        internal_reference=payload.ref,
+        amount=amount,
+    )
+    _status_for(response, requested.created)
+    return translate.confirmation_out(requested.confirmation, now)
+
+
+@router.post(
+    "/wallets/{wallet_id}/payouts",
+    response_model=schemas.ConfirmationOut,
+    status_code=201,
+)
+def payout(
+    wallet_id: UUID,
+    payload: schemas.PayoutIn,
+    response: Response,
+    service: WalletService = Depends(wallet_service),
+) -> schemas.ConfirmationOut:
+    """Record a request to send money to an external account. **It moves nothing.**
+
+    Two kinds behind one route, because the source is what picks the balance and
+    both record the same ``PAYOUT``; the difference is which money funds it. The
+    dispatch is here rather than in the schema because it is not a rule about the
+    request - both branches are legitimate requests - it is a choice between two
+    operations, which is exactly what a route does. The choice is recorded on the
+    request as its ``kind``, so the confirm call does not have to be told it
+    again: a payout request cannot be answered as anything but a payout.
+
+    ``as_of`` is read here, at the adapter, and is deliberately *not* used for the
+    request - a request may name a pot that has not come due, and naming one is
+    not the same as spending it. The moment that decides whether a pot has matured
+    is read again at confirm time, for the reason ``cli._payout`` gives: a locked
+    payout may only spend pots that have come due, so the use case has to be told
+    when "now" is rather than reading it itself.
+
+    PENDING once confirmed, like a withdrawal, and for the same reason.
+    """
+    wallet = service.get_wallet(wallet_id)
+    amount = translate.money_in(payload.amount, wallet.currency)
+    destination = translate.destination_in(payload.destination)
+
+    now = datetime.now()
+    requested = service.request_confirmation(
+        wallet_id,
+        (
+            ConfirmationKind.PAYOUT_FROM_LOCKED
+            if payload.source == "locked"
+            else ConfirmationKind.PAYOUT_FROM_AVAILABLE
+        ),
+        now,
+        internal_reference=payload.ref,
+        amount=amount,
+        destination=destination,
+        fund_name=payload.fund_name,
+    )
+    _status_for(response, requested.created)
+    return translate.confirmation_out(requested.confirmation, now)
+
+
+@router.post("/wallets/{wallet_id}/freeze", response_model=schemas.WalletOut)
+def freeze_wallet(
+    wallet_id: UUID, service: WalletService = Depends(wallet_service)
+) -> schemas.WalletOut:
+    """Stop value leaving this wallet until it is unfrozen.
+
+    Returns the wallet rather than 204, because the caller's next question is
+    always what the balance is now - and freezing does not change it. A status
+    code would say the command landed; the body says what the wallet became.
+
+    No request body. A freeze takes no parameters, and a schema with no fields
+    would invite a client to send one and wonder why it was ignored.
+    """
+    return translate.wallet_out(service.freeze_wallet(wallet_id))
+
+
+@router.post("/wallets/{wallet_id}/unfreeze", response_model=schemas.WalletOut)
+def unfreeze_wallet(
+    wallet_id: UUID, service: WalletService = Depends(wallet_service)
+) -> schemas.WalletOut:
+    """Return a frozen wallet to its active state. Refused on a closed one."""
+    return translate.wallet_out(service.unfreeze_wallet(wallet_id))
+
+
+@router.post(
+    "/wallets/{wallet_id}/close",
+    response_model=schemas.ConfirmationOut,
+    status_code=201,
+)
+def close_wallet(
+    wallet_id: UUID,
+    response: Response,
+    service: WalletService = Depends(wallet_service),
+) -> schemas.ConfirmationOut:
+    """Record a request to close a wallet for good. **It closes nothing.**
+
+    There is no reopen, which is why this one is confirmed like the money
+    operations even though it moves nothing: it is the one transition in the API
+    with no way back.
+
+    **The two 409s moved to the confirm call, and that is a change in when a
+    caller learns, not in what they learn.** ``WalletNotEmptyError`` and
+    ``WalletHasActivePlansError`` are still the refusals, still 409, still naming
+    the different remedies they always named - but they now arrive when the
+    request is answered, because that is when the wallet and its plans are read
+    for the decision. Recording the request cannot refuse them: a request is not
+    an attempt, and the wallet it names may well be empty by the time somebody
+    answers it.
+
+    This is also the one operation whose request *survives a refusal*. A refused
+    close writes no ledger row, so there is nothing for a retry to be handed back
+    and nothing to spend the request against - the request stays answerable, and
+    emptying the wallet and confirming again is exactly what the refusal told the
+    caller to do. See ``WalletService._close_wallet``.
+
+    **This route has no CLI counterpart, today or after this.** ``close`` is
+    reachable only over HTTP, so its confirmation is API-only; adding a CLI verb
+    is separate work rather than something smuggled in beside this.
+    """
+    now = datetime.now()
+    requested = service.request_confirmation(
+        wallet_id, ConfirmationKind.CLOSE, now
+    )
+    _status_for(response, requested.created)
+    return translate.confirmation_out(requested.confirmation, now)

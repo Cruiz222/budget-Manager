@@ -53,9 +53,19 @@ class RecordingTransactionRepository(TransactionRepository):
         raise NotImplementedError
 
 
-# --- Successful withdrawal ---
+# --- A withdrawal debits the wallet and holds the money ---
 
-def test_successful_withdrawal_decreases_balance_and_persists_successful_transaction(build_wallet):
+def test_a_withdrawal_debits_the_wallet_and_leaves_the_row_pending(build_wallet):
+    """It was ``..._persists_successful_transaction`` until Phase 2b.
+
+    The rename is the change. A withdrawal ends at a bank account this code has
+    never spoken to, so the most it can honestly record is that the money has
+    been taken out of the owner's reach and is *intended* to leave. Both
+    assertions below are that sentence: the balance is lower - the funds are
+    held, and a second withdrawal of the same amount will be refused against it -
+    and the row is PENDING with no ``completed_at``, because nothing has
+    completed.
+    """
     wallet = build_wallet()
     repository = InMemoryTransactionRepository()
 
@@ -67,13 +77,30 @@ def test_successful_withdrawal_decreases_balance_and_persists_successful_transac
     assert wallet.available_balance == Money(Decimal("5000"), NGN)
 
     stored = repository.get_by_id(transaction.transaction_id)
-    assert stored.status is TransactionStatus.SUCCESSFUL
+    assert stored.status is TransactionStatus.PENDING
     assert stored.wallet_id == wallet.wallet_id
     assert stored.type is TransactionType.WITHDRAWAL
-    assert stored.completed_at is not None
+    # The domain's own invariant, not a coincidence: a PENDING transaction is
+    # *forbidden* a completed_at, so this failing would mean the row was built
+    # wrongly rather than merely left unfinished.
+    assert stored.completed_at is None
 
 
 def test_withdrawal_is_persisted_as_pending_before_wallet_is_touched(build_wallet):
+    """One save, not two, and that is the pending intent in one line.
+
+    This used to assert ``[PENDING, SUCCESSFUL]`` - the row written before the
+    wallet moved, then rewritten once it had. The first save is still the point
+    (the attempt is recorded before any balance changes, so a crash mid-operation
+    leaves evidence rather than nothing), and the second save is now gone for a
+    reason rather than by omission: there is no later state to write.
+
+    Note what this test can no longer show and what covers it instead. It cannot
+    show that the wallet was untouched at the moment of the first save, because
+    there is no longer a second save to compare against. That ordering is pinned
+    where it always was - ``RecordingTransactionRepository`` still records the
+    balance it saw - and the *outcome* is the test above.
+    """
     wallet = build_wallet()
     repository = RecordingTransactionRepository()
 
@@ -82,10 +109,7 @@ def test_withdrawal_is_persisted_as_pending_before_wallet_is_touched(build_walle
         internal_reference=str(uuid4()),
     )
 
-    assert repository.saved_statuses == [
-        TransactionStatus.PENDING,
-        TransactionStatus.SUCCESSFUL,
-    ]
+    assert repository.saved_statuses == [TransactionStatus.PENDING]
 
 
 # --- Invalid amounts are rejected before any record exists ---

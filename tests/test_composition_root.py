@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -10,10 +10,13 @@ from app.composition_root import (
     build_scheduler,
     build_wallet_service,
 )
+from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.planning.instruction import Instruction
+from app.domain.planning.plannedAction import PlannedAction
 from app.infrastructure.settings import EmailSettings
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
@@ -48,13 +51,23 @@ def test_two_service_instances_share_state_over_one_database(tmp_path, build_wal
     )
 
     # A second, independently-constructed service reads the committed deposit
-    # and withdraws from it - state persisted across instances.
+    # and takes 3000 out of it - state persisted across instances.
+    #
+    # It is two calls since the confirmation, and here they are split *between*
+    # the two instances on purpose: one records the request and the other answers
+    # it. That is a stronger version of what this test has always said. The
+    # request had to reach a table for a service that never saw it to be able to
+    # carry it out, which is exactly the claim the feature makes - the record
+    # lives in the database, not in the terminal that made it.
     service_two = build_wallet_service(unit_of_work_factory=factory, actor=ACTOR)
-    service_two.withdraw(
+    requested = service_one.request_confirmation(
         wallet.wallet_id,
-        Money(Decimal("3000"), NGN),
+        ConfirmationKind.WITHDRAWAL,
+        datetime.now(),
         internal_reference=str(uuid4()),
+        amount=Money(Decimal("3000"), NGN),
     )
+    service_two.confirm(requested.confirmation.confirmation_id, datetime.now())
 
     read = factory.start()
     try:
@@ -366,10 +379,36 @@ def test_build_scheduler_addresses_run_receipts_to_the_configured_recipient(
     transaction, so this is not just about the address: a scheduler built with a
     different factory would queue its receipts in a different database, and the
     money would move without them.
+
+    **The plan is a release plan, and Phase 2b is why.** This used the fixture's
+    default payout plan and counted one queued receipt. A payout's row is left
+    PENDING now, because its money is bound for a bank account nothing here has
+    contacted, and a run whose rows have not settled queues nothing - so the
+    default plan would count zero and this test would be asserting the silence
+    rather than the wiring it exists to check. A release settles where this
+    system can see it, so the receipt still fires and the wiring is still on
+    trial. The scheduler is not being told anything about settlement: this is a
+    property of the plan handed to it, not of the builder.
     """
     factory = SqliteUnitOfWorkFactory(str(tmp_path / "compose.db"))
     wallet = build_wallet(locked="10000")
-    plan = build_plan(wallet_id=wallet.wallet_id)
+    plan = build_plan(
+        wallet_id=wallet.wallet_id,
+        instructions=(
+            Instruction(
+                action=PlannedAction.RELEASE,
+                amount=Money(Decimal("2000"), NGN),
+                label="emergency",
+            ),
+        ),
+        # A release plan must name the date it ends - ``SavingsPlan`` refuses one
+        # without, because a release is irreversible and "irreversible until the
+        # set date" only means something if there is a set date. Note this is a
+        # property of the *plan*, not of the builder being tested here: the
+        # scheduler is told nothing about settlement, and this test's subject is
+        # the wiring, not the plan.
+        ends_on=date(2027, 1, 1),
+    )
     seed = factory.start()
     seed.wallets.save(wallet)
     seed.plans.save(plan)

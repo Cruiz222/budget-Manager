@@ -2063,6 +2063,482 @@ composition root at *import* time against whatever the environment held at that
 moment, and hand a live application to anything that imported the module for
 another reason.
 
+### The money endpoints, and the pending intent
+
+Phase 2b spends decision 62. `HELD_OPERATIONS` had thirteen entries, every balance
+change Phase 1b had refused to route, and its docstring said they were held "for a
+different reason" - not a design question but a missing actor. The actor arrived in
+2a, so 2b was supposed to be mechanical.
+
+It was not, because routing a withdrawal forced a question the ledger had never had
+to answer: **when a withdrawal is written down, has the money left?** The old code
+said yes, unconditionally, and it was wrong.
+
+**97. A deposit is still held, and the reason is not caution.** Deposits are the
+one operation that stay behind, and the shape of the argument is worth stating
+because "we did not get to it" is the wrong reason to keep something out. A deposit
+is an *inbound* boundary crossing: money arrives from outside, and the only party
+who can honestly say it arrived is the party that sent it - Paystack, in Phase 3,
+proving itself with an HMAC signature. Exposed now, `POST /wallets/{id}/deposits`
+would let any authenticated caller credit their own wallet for free. That is not a
+gap a session token can close, because the caller *is* authorised and the request
+is still a lie about where the money came from. Authorisation answers "who are
+you"; this needs "who sent the money", and no token carries that.
+
+The CLI keeps its `deposit` command. A developer's tool operating on their own
+database is not a wire protocol, and nothing it does is reachable by anybody else -
+which is the same distinction decision 91 drew for the commands that need no actor.
+
+**98. There were always two boundaries, and 2a drew the wrong one.** Decision 62
+put the line at *balance changes*: things that move money were held, things that do
+not were routed. The pending intent is what revealed that this was the wrong
+question, and the right one is **whether the movement has a far end outside this
+system**:
+
+| | crosses the edge? | settles | ledger |
+|---|---|---|---|
+| freeze, unfreeze, close | no | here, now | no row (a status change) |
+| lock, release, extend | no — inside the wallet | here, now | SUCCESSFUL immediately |
+| withdrawal, payout | **yes** | Phase 3's provider | **PENDING** |
+| deposit (held) | yes | Phase 3's webhook | — |
+
+So the rule is not "outbound is pending". It is: **a movement whose far end is
+outside this system cannot be called successful by this system.** A lock is
+finished the moment it happens - the money is in a pot, and nothing else needs to
+agree. A payout is a claim about a bank account nobody here has contacted, and
+writing SUCCESSFUL would be the ledger asserting a transfer that nothing performed.
+That is the one thing this codebase refuses everywhere else, and it was being done
+on the most consequential path it has.
+
+**99. `WalletOperation.settles_immediately`, one flag on the base class.** The
+three crossing operations (`WithdrawMoney`, `PayoutFromAvailable`,
+`PayoutFromLocked`) set it `False`; everything else inherits `True`. The change in
+`execute` is a branch where there used to be an unconditional call:
+
+```python
+if self.settles_immediately:
+    transaction.mark_successful()
+    self.transaction_repository.save(transaction)
+```
+
+Nothing else in the operation moved, and that restraint is the point. The row
+written at step 3 was *already* correct - `TransactionStatus.PENDING` is the
+constructor default, `completed_at` is absent, and "a pending transaction must not
+have `completed_at`" is already enforced. The domain had anticipated this state
+since before there was a caller for it; 2b is the first phase to reach it, not the
+first to describe it. The `except MoneyError` path is untouched and still correct,
+because `_apply`'s contract is to raise *before* mutating, so a rejected operation
+leaves no hold to unwind.
+
+**100. The wallet is debited when the intent is recorded, not when it settles.**
+The alternative was to leave the balance alone until the provider confirms, and it
+is wrong in a way that only shows up under a retry: the money is already spoken
+for, so a second withdrawal against an undebited balance would be approved, and the
+wallet would be overdrawn by the time both settled. Debiting at instruction time
+makes the hold real and makes "can this be spent?" answerable from the balance
+alone. The cost is that the money sits in a state with no name - gone from
+`available_balance`, not in any pot, not in a transaction that has finished - and
+decision 106 accepts that explicitly.
+
+**101. A pending movement sends no receipt, and this was a required change rather
+than a tidy-up.** `_run` calls `_announce` before the commit, and
+`compose.wallet_movement` builds its prose in the past tense - *"Withdrew
+{amount}"*, *"{amount} left the wallet."* - from `created_at=transaction.completed_at`.
+On a PENDING row that is `None` and the sentence is a lie, at the same time. Two
+failures, and the worse one is not the `None`: if `Notification` rejected it the
+raise would land in `_run`'s `except BaseException` and **roll the withdrawal
+back**, and if it did not, the user would get an email asserting a payment that has
+not happened.
+
+The fix is a guard in `_announce` that skips an operation whose transaction is
+still PENDING. The receipt for money leaving is written when the money leaves,
+which is Phase 3's settlement - and a real bank notification works the same way,
+arriving on settlement rather than on instruction. Every existing sentence stays
+true, so no wording changed and no new `NotificationKind` was added. The visible
+consequence in this phase is that **a withdrawal is silent**: it holds funds and
+says nothing, because nothing has happened yet.
+
+`ExecutePlanRun` needed the same guard on its own receipts, and there it takes a
+different form - it skips when not every row in the run is SUCCESSFUL, rather than
+screening one transaction. The two are consistent in what they mean and neither is
+derived from the other, which is worth knowing before somebody tries to unify them.
+
+**102. `Wallet.close()` refuses a wallet that is not empty, and "empty" means empty
+in full.** The available balance *and* every pot, including locked money in a pot
+that has not matured. `locked_balance` already sums the pots, so the whole rule is
+one expression.
+
+The rule exists because close is the only status change that is not reversible:
+every guarded operation refuses on a CLOSED wallet and no transition reopens one,
+so money left inside would be unreachable for good. That asymmetry is the entire
+argument, and it is worth separating from the convenience argument it resembles -
+"you probably meant to empty it first" would not justify refusing a command.
+
+The consequence is deliberate: **a wallet holding an active commitment cannot be
+closed until that commitment is honoured or its plan is cancelled.** That is
+coherent with the position this codebase takes everywhere else - the promise is the
+product - and the alternative strands the money.
+
+`freeze` does not block close, which surprises people because the two statuses feel
+similar from a distance. Freezing is a reversible hold; closing is not. A frozen
+wallet that is empty is still empty.
+
+**103. The plan check lives in the application layer, and it is the first use case
+that reads a second aggregate.** `Wallet.close` answers "is it empty?" from the
+wallet alone. It cannot answer "is anything still promised from it?" - the domain
+does not import planning, and it should not. So `WalletService.close_wallet` asks
+both:
+
+```python
+wallet = self._wallet(uow, wallet_id)          # the one door, actor-scoped
+self._refuse_close_if_committed(uow, wallet)   # uow.plans, same snapshot
+wallet.close()
+```
+
+A closed wallet with a live plan would fail on every tick for the rest of that
+plan's life, each failure recorded in a `plan_runs` row nobody reads. That is the
+failure this prevents, and it is a failure the domain is structurally unable to
+see.
+
+Two smaller decisions are inside that snippet. The check runs **inside the unit of
+work** rather than before it, so a plan created between the check and the close
+cannot slip through - evaluated outside, the window is real and would close a
+wallet with a live plan on it. And close is **not** routed through
+`_change_status`, because that helper writes a ledger row and a rejected close must
+not: a status change is not an operation, so there is no instruction to keep a
+record of. Note the contrast with the money operations, which *do* write a FAILED
+row when a wallet refuses them - that row is evidence about an instruction somebody
+issued, and a refusal to close is evidence about nothing.
+
+**104. PAUSED is not terminal.** `_refuse_close_if_committed` counts ACTIVE and
+PAUSED, and the second is the one worth defending. A paused plan is waiting for a
+human and can resume; a resume that found its wallet closed would be the same
+broken tick, arriving later and more confusingly. The check names the two live
+states rather than excluding the two dead ones, which is the version that stays
+correct if a fifth `PlanStatus` is ever added - a new state is live until somebody
+decides otherwise.
+
+**105. `WalletAlreadyClosedError` and `WalletClosedError` become two names for two
+situations, and until 2b they were one name for one.** `Wallet.freeze` raised
+`WalletAlreadyClosedError` for a CLOSED wallet while `Wallet.unfreeze` raised
+`WalletClosedError` for the same condition. Both graded 409, so nothing showed on
+the wire, and it did not matter because CLOSED was unreachable dead code - a state
+guarded in eleven places and never once set. 2b gives it a user, and the
+inconsistency became a real question.
+
+The answer: freezing a closed wallet is refused because *the wallet is closed*
+(`WalletClosedError`); **closing** one is refused because *it was already closed*
+(`WalletAlreadyClosedError`). The fact is "this wallet is closed" - the second name
+belongs to a second close, not to a freeze. This is the same class of cleanup as
+decision 96: a name that was harmless while it was unreachable, and wrong the
+moment something reached it.
+
+**106. A pending transaction has no exit, and that is accepted rather than
+discovered.** It cannot become SUCCESSFUL and it cannot be refunded, because both
+are triggered by a provider event that does not exist until Phase 3. In 2b a
+withdrawal's money is held indefinitely.
+
+This is the honest half of the change and it is why the work is split. The
+alternative - recording SUCCESSFUL - is a ledger asserting a transfer nothing
+performed. What must **not** happen is building the settlement path now, because
+its only caller would be a webhook that does not exist: that is `WalletStatus.CLOSED`
+again, a state guarded in eleven places and never once set. Phase 3's first item is
+therefore the settle-and-refund path, including two gaps that are already visible
+from here - `mark_failed()` does not credit the held funds back, and `reverse()`
+refuses anything that is not SUCCESSFUL, so a failed pending payout needs a
+transition that does not exist yet.
+
+**107. The idempotency key is namespaced to the wallet it is spent from.**
+`get_by_internal_reference` is a *global* lookup - a single `WHERE
+internal_reference = ?` against a globally UNIQUE column, with no wallet in the
+predicate - and `execute` returns whatever row it finds regardless of whose wallet
+it belongs to. Unreachable while the key was a server-minted `uuid4`. Behind a
+bearer token and a client-supplied key it is a cross-actor leak: actor B posts
+`ref="x"` and receives actor A's transaction in the body.
+
+```python
+def _scoped_reference(self, wallet, internal_reference: str) -> str:
+    return f"{wallet.wallet_id}:{internal_reference}"
+```
+
+Scoping to the **wallet** rather than to the actor, as a refinement of the obvious
+answer: a wallet has exactly one owner, so a wallet-scoped key is also an
+actor-scoped one - and it additionally closes the case where one user posts the
+same `ref` to two of *their own* wallets and the second silently returns the
+first's transaction with the second wallet untouched. That case is not a security
+bug, and it is the same defect.
+
+**108. The namespacing goes in `_run`, not in the route.** The route is where the
+client-supplied key arrives, so putting it there is the obvious move and it is the
+wrong one: the CLI's `--ref` carries the identical defect, and `_run` is the seam
+both presentations already share. Fixing it at the API would have left `budget
+withdraw --ref x` posting the same collision from a terminal - a bug that is
+invisible rather than absent, because a CLI user attacking their own ledger is not
+a threat model, but the *second wallet* case above is a plain correctness bug
+either way. `ExecutePlanRun` is untouched: it builds its operations directly and
+its references already embed the plan id.
+
+Two consequences are written down rather than discovered. **Stored references
+change shape** - rows written before this read `"<uuid>"` and `"plan:{id}:..."`, so
+a retry of an old key no longer matches once. Accepted: that is the point of the
+change and it is a developer database. And **the reference in a response is not the
+key to retry with.** A client sees `"<wallet_uuid>:<their ref>"`, and sending that
+back would produce a *new* transaction, which for a withdrawal is a double-spend.
+`MovementIn`'s docstring says the key is the one the client generated, in bold,
+because this is a footgun that only fires on a retry - exactly when somebody is
+already having a bad time.
+
+**109. `fund_name` without `source="locked"` is a 422, not a 400.** `PayoutIn`
+carries a `model_validator` that refuses the combination. Leaving it to the domain
+would be worse than late: the available-source payout has no use for a pot name at
+all, so **nothing would refuse it** and the field would be silently ignored. A
+caller who named a pot and was charged from the available balance instead would
+have been told nothing. A self-contradicting request is the schema's business, and
+this is the same shape as `CreatePlanIn._one_way_to_end`.
+
+Its sibling: `source` is a `Literal["available", "locked"]` where
+`InstructionIn.action` is a plain `str`. An action travels to the domain, which has
+its own answer for a word it does not know; a source is what the *route* branches
+on to pick a method, so an unknown one has no owner left to refuse it and would
+fall through to doing nothing.
+
+**110. The boundary list moved rather than shrank.** `EXPECTED_OPERATIONS` goes 18
+→ 26, `HELD_OPERATIONS` 13 → 2. The three operations that will *never* be routed
+moved into a list of their own, `NEVER_ROUTED_OPERATIONS`, because "not yet" and
+"not ever" are different promises and a shared list made them look alike.
+
+`/tick` and `/notifications/deliver` are installation-wide background jobs with no
+actor - they run from cron over every plan in the database, and they take nobody
+because there is nobody they could be. An endpoint that ran them would have to be
+told an actor, and the only actor that could mean anything is "whoever holds the
+token", which would make the scheduler reachable by anyone who could reach the
+port. Sessions did not change that; they are what makes it answerable.
+
+`POST /plans/{id}/run` is the same shape of answer for a different reason. It is
+not actorless - decision 56 gave the scheduler no privilege by minting one
+`ExecutePlanRun` per plan acting as that plan's user. It is simply not a request
+anybody makes: a plan fires when a clock says so, and letting a client name the
+moment would let it pay itself early, run an occurrence twice, or drive a schedule
+the user set up and forgot about.
+
+**111. The API's money tests fund wallets through the use case, and that is not a
+shortcut.** There is no deposit endpoint in this phase - decision 97 - so a test
+file that could only use HTTP would have no way to put money in a wallet, and every
+money route would be untestable. The `funded` fixture opens a wallet over the wire
+and then credits it through `build_wallet_service` against the same database file,
+and it asks `GET /users/me` for the actor's id rather than reaching into the
+sessions table.
+
+This is the same seam `tests/conftest.signed_in` uses for accounts, and for the
+same reason: the precondition is built through the layer that can build it, and
+everything the test is actually about happens over HTTP. The alternative - testing
+`WalletService.deposit` and calling the routes untested - would leave the eight new
+routes, which are the whole of this phase, covered by nothing.
+
+One consequence is worth naming. Every close test in that file closes a wallet that
+was **never funded**, because there is no way to drain one over HTTP: a withdrawal
+holds the money rather than removing it, which is decision 100 seen from the test's
+side. The reachable empty state in this phase is an unfunded wallet.
+
+**112. A confirmation is not an intent, and the vocabulary split is the first
+decision because two opposite states were about to share a word.** Decision 100
+already calls the PENDING *transaction* "the pending intent" - a movement that has
+happened, whose wallet is already debited, and which cannot yet be called finished.
+The record this phase adds is the opposite: a request nothing has been done about.
+
+> A **confirmation** is a request nothing has been done about.
+> A **pending transaction** is a movement that has been done and cannot yet be
+> called finished.
+
+So the new aggregate is a `Confirmation` with statuses `AWAITING` / `CONFIRMED` /
+`EXPIRED`, and the two status vocabularies never touch: `PENDING` is never a
+confirmation status and `AWAITING` is never a transaction status. That is why
+`TransactionStatus.PENDING` needed no change at all, and why nothing in 2b's
+settlement story moved. The failure the split prevents is specific and would have
+been silent: a reader who took "intent" to mean one thing when the code meant the
+other would conclude that money had already moved.
+
+**113. Three operations are confirmed and three are not, and the line is "money
+leaving the wallet".** `withdrawal`, `payout` and `close` record a request;
+`lock`, `release` and `extend` stay one step. The three that are *not* confirmed
+are not a lesser version of the three that are - they are a different kind of
+thing: all three are reversible and stay inside the wallet, so a mis-tap is undone
+by typing the opposite command.
+
+A prompt in front of them would not be free. It would teach people to answer
+prompts without reading them, and that habit is what the three commands that
+*do* need a prompt would pay for. `close` is grouped with the money even though it
+moves nothing, because it is the one transition in this API with no way back: the
+emptiness rule protects the money from being stranded, and nothing protects an
+owner from closing the wrong wallet.
+
+The scheduler is out of scope by construction rather than by exception -
+`ExecutePlanRun` builds its operations directly and never calls `WalletService`, so
+a plan that fires at 3am still confirms nothing. That is decision 17 holding: the
+30-minute pre-payout notification is a courtesy, never a gate.
+
+**114. The four money-out methods are private, and that is the no-bypass
+mechanism. This is a deviation from the approved plan and the reason is worth
+recording.** The plan made `confirmation` a *required parameter* on the public
+`withdraw` / `payout_from_available` / `payout_from_locked` / `close_wallet` -
+"there is then no spelling of `withdraw` that moves money without naming the
+confirmation it was authorised by". Three holes showed up on implementation:
+
+1. `Confirmation` is a public dataclass, so a caller can *fabricate* one naming a
+   `confirmation_id` that exists in no table. A required parameter proves an
+   argument was passed; it does not prove the argument is real.
+2. A legitimate confirmation whose `amount` differs from the `amount` passed
+   alongside it authorises the wrong movement. Two records of one fact, with a
+   must-agree rule that nothing enforces.
+3. Read-then-check-then-write on `status` has a gap, and two concurrent confirms
+   arriving in it would both see `AWAITING` and both move the money.
+
+So the four methods became **private** and `confirm()` is the only door. They take
+`(confirmation, as_of)` and read **every argument off the record** - the amount,
+the destination, the pot, all of it - which closes (1) and (2) at once: there is no
+second value left to disagree with. (3) is closed by decision 115.
+
+The precedent is `open_wallet`'s docstring, which solved the same problem the same
+way: *there is no longer a spelling that opens one for anybody else.* Deleting the
+spelling beats guarding it, because a guard is a thing somebody can forget to call
+and a missing method is a compile error. Verified rather than assumed: `plan tick`
+does not go through `WalletService`, so nothing in the scheduler could break.
+
+**115. The spend is one statement, and it is the same idiom as `enqueue`.** The
+plan gave `Confirmation` a `consume(as_of)` method - check the status in Python,
+then write it. That was dropped in favour of
+`ConfirmationRepository.claim(confirmation_id, user_id, kind, as_of)`, which is a
+single `UPDATE ... WHERE status = AWAITING AND expires_at > ?` whose `rowcount`
+*is* the answer. The second deviation from the plan, and the same reasoning one
+table over as `NotificationRepository.enqueue`: the write is the decision, so
+there is no interval in which two callers can both be right.
+
+`kind` is a parameter rather than something the method reads, so the claim states
+which operation it is authorising - a payout's confirmation cannot authorise a
+withdrawal because the `UPDATE` matches no row. That refusal is reported as
+`ConfirmationNotFoundError`, and the choice is deliberate: the fall-through read
+would otherwise call a wrong-kind request *expired*, which sends a caller to look
+at a clock when what is wrong is that they asked the wrong question.
+
+**116. An attempt spends the request, and `close` is the exception that proves the
+rule.** A confirm against a frozen wallet, or for more than the balance, writes a
+FAILED ledger row *and* spends the request, in one transaction. That looks harsh
+and it is the safe direction, for a concrete reason.
+
+`WalletOperation.execute:105` deduplicates on `get_by_internal_reference`, a
+**global lookup that returns the row whatever its status, including FAILED**. If a
+refused attempt left the request `AWAITING`, the retry would re-enter under the
+same spent reference, be handed the old FAILED row back, move nothing and report
+success - and `_announce` would compose a receipt for it, in the past tense, for a
+payment that did not happen.
+
+So the rule is not "an attempt spends it". It is: **the spend commits whenever the
+refusal is recorded.** `close` writes no ledger row when it refuses, so its whole
+unit rolls back - the claim included - and the request stays answerable. That is
+also the right answer for a person: the refusal says "move your money out first",
+and emptying the wallet and answering again is exactly what they are going to do
+next.
+
+This asymmetry is what the two error-handling branches in `WalletService` encode:
+`_run`'s `except MoneyError: uow.commit()` against `_close_wallet`'s
+`except BaseException: uow.rollback()`.
+
+**117. The reference chain: one reference → at most one confirmation → at most one
+attempt.** `UNIQUE (wallet_id, internal_reference)` on `confirmations` is
+load-bearing rather than tidy, and this is what it buys. A spent reference can
+never be read back as an outcome (116), because producing a second attempt under
+one reference is impossible: the first attempt already has that reference, and the
+confirmation that would authorise a second is the one that is already spent.
+
+**118. `ref` is promoted rather than changed.** It used to key the transaction; it
+now keys the request that will produce one. The transaction underneath still
+carries `wallet_id:ref` through `_scoped_reference`, so decision 107's namespacing
+is untouched, and `MovementIn`'s docstring says what a client should now send. The
+one visible consequence: a *withdrawal now takes a `ref`*, where before it
+accepted one and had nowhere to put it.
+
+**119. Expiry is checked, not swept, and `EXPIRED` is derived rather than stored.**
+`Confirmation.status_as_of(as_of)` returns `EXPIRED` for a stale `AWAITING` row;
+nothing ever writes it. Storing it would make a `GET` a write - the same objection
+decision 49 makes to re-stamping a session on every request - and it would be a
+second record of a fact `expires_at` already holds, free to disagree with it. Here
+the disagreement would be worse than redundant: a row saying `EXPIRED` with a
+future `expires_at` is a request refused for no reason.
+
+No sweeper deletes abandoned rows, and this is a place where the plan's own option
+text ("an expiry policy, and a sweeper") was deliberately not implemented. Three
+reasons: the only clocks in this system are the scheduler's and the command's own,
+and sweeping on every money command would make a withdrawal write rows it was never
+asked to write; deleting destroys the only record that somebody asked for something
+and abandoned it; and it is the shape `sessions` already has, where expired rows
+accumulate too. A `CONFIRMED` request stays `CONFIRMED` for ever - expiry is about
+whether a request may still be *answered*, and one that was answered is not
+un-answered by the clock.
+
+**120. The request does not check the balance, and the absence is the design.**
+A check at request time cannot be relied on - the balance at *confirm* time is the
+one that decides - so it would be a second, weaker copy of the wallet's own rule,
+free to disagree with it. Its absence is also a feature: a request made against an
+empty wallet is answerable once the wallet has been topped up, which is exactly what
+somebody who is about to be paid would want. The refusal is not lost; it arrives one
+call later, from the wallet, in the wallet's own words.
+
+**121. On the wire, asking and answering are separate and the confirm route takes no
+body.** The three money routes keep their URLs, bodies and 201s; their response body
+becomes a `ConfirmationOut`. `POST /confirmations/{id}/confirm` is the only route
+that spends what one of them recorded, and it carries nothing but the id - because
+everything about the movement is already on the request, and a body would be a
+second place to say what the movement is.
+
+A reused `ref` answers **200 with the existing request, 201 when it created one** -
+three lines on an injected `Response`, and it is how a client that retried a lost
+response can tell "here is your request again" from "here is a new one". The two
+bodies are identical on purpose: it *is* the same request.
+
+`GET /confirmations/{id}` is exposed rather than held because a request that cannot
+be read back is one a client cannot debug, and it costs no write to give. Both
+routes grade through the existing `errors.py`: `ConfirmationNotFoundError` → 404,
+`ConfirmationExpiredError` and `ConfirmationAlreadyUsedError` → 409. The two 409s
+are the plainest members of that list - the resource is exactly what the path names,
+it is there, and it is its state that refuses.
+
+**122. `--yes` is a statement about the room, not about the rules.** The CLI prints
+a preview and asks; `--yes` skips the question. It does not skip the confirmation -
+the request is recorded and spent either way, server-side, and a test asserts that
+the two paths leave identical rows behind. What the flag declares is that there is
+nobody at the terminal to ask, which is a true statement about a script and a false
+one about a person.
+
+**An unanswered prompt is not a yes.** `EOFError` and an empty line are both
+refusals, and only `y` (case-insensitively) is agreement - not "anything that is not
+n". The two mistakes are not symmetric: a mistyped `y` costs a second run of the
+command, a mistyped `n` read as agreement costs money that cannot be called back.
+
+Found while writing the tests rather than by reasoning: `OSError` had to be caught
+alongside `EOFError`. A closed file descriptor raises one where an exhausted pipe
+raises the other, and from the prompt's point of view the two are one fact - nobody
+is there to ask. pytest replaces stdin with an object whose `readline` raises
+`OSError`, so the first CLI test to reach the prompt without `--yes` failed with a
+traceback instead of the refusal the docstring promised.
+
+A refusal exits **0**, not 1. Nothing failed; a person declined. A non-zero exit
+would tell a script something went wrong when the system did exactly what it was
+told, and a script that read it as failure would retry a command the user had just
+refused.
+
+**123. What this does not protect against, in plain words: a stolen session token
+confirms as easily as it requests.** This is an accident guard, not a security
+control. It makes a person pause; it does not make them prove who they are. Whoever
+holds the token can record a request and answer it, and the fifteen-minute window
+does not change that - it bounds how long a *recorded* request stays live, which is
+a different property.
+
+The real answers are elsewhere and both are already on the roadmap: session lifetime
+and rate limiting (2c), and Phase 3's provider, which is the only thing that can
+actually settle a payout. Written here rather than left implicit because a
+confirmation that read as a security control would be trusted for something it does
+not do - and the failure would be discovered by somebody who had relied on it.
+
 ### Still open
 
 - **Rebuilding `wallets` to carry a foreign key to `users`** (decision 59). A
@@ -2144,6 +2620,64 @@ another reason.
   what each one carries. Worth resolving once, when nothing else is in flight.
 - Any channel other than SMTP. `NotificationChannel` is the port that makes one a
   drop-in; building it now would be guessing at the second case.
+- **The settle-and-refund path, which is Phase 3's first item and the largest thing
+  2b leaves open.** A pending transaction currently has no exit: it cannot become
+  SUCCESSFUL and it cannot be refunded, because both are triggered by a provider
+  event that does not exist yet. Three gaps are visible from here and each wants its
+  own decision - `mark_failed()` does not credit the held funds back, `reverse()`
+  refuses anything that is not SUCCESSFUL, and nothing yet writes
+  `provider_reference` for a payout. Deliberately not built in 2b: its only caller
+  would have been a webhook that does not exist, which is `WalletStatus.CLOSED`
+  again - a state guarded in eleven places and never once set. See decision 106.
+- **Migrating the `internal_reference` values already on disk.** Rows written before
+  2b read `"<uuid>"` or `"plan:{id}:..."`; a retry of an old key no longer matches,
+  once. Accepted at the time because it is a developer database and the change is
+  the point (decision 107) - but it is the kind of "accepted" that stops being true
+  the moment there is a real install, so it belongs on this list rather than only in
+  the decision.
+- **Two receipt guards that mean the same thing and are written twice.**
+  `WalletService._announce` skips a PENDING transaction; `ExecutePlanRun._record_success`
+  skips a run whose rows did not all settle. They agree, neither is derived from the
+  other, and there is no single place that says so - which is fine now and is the
+  shape that drifts. Unifying them is a small job that wants doing before a third
+  caller appears.
+- **A refused withdrawal under an explicit `--ref` can be retried into a silent
+  success.** *Found while designing the confirmation, not created by it* - the
+  reproduction exists on `main` today:
+
+  ```
+  budget-manager withdraw W 5000 --ref X      # refused: not enough money
+  budget-manager deposit  W 10000
+  budget-manager withdraw W 5000 --ref X      # says "withdrew", moves nothing
+  ```
+
+  `WalletOperation.execute:105` deduplicates on `get_by_internal_reference`, a
+  **global lookup that returns the row whatever its status**, FAILED included. So
+  the third command finds the old FAILED row, returns it as though it were the
+  outcome, and `_announce` composes a receipt for a payment that did not happen.
+
+  Unreachable without an explicit `--ref` - a minted reference is a fresh UUID
+  every time - which is why nothing has ever hit it, and why it is here rather
+  than fixed. Confirmation 116 routes *around* it for the money-out path (a spent
+  reference can never be read back, because the confirmation that would authorise
+  a second attempt is the one already spent), but the plain `withdraw --ref X`
+  path above is untouched and still walkable. The fix is either a non-FAILED-only
+  lookup or a `Transaction.retry()` transition; both collide with the column's
+  global `UNIQUE` and it is its own piece of work.
+- **No CLI `close` verb**, today or after this phase. `close` is reachable only
+  over HTTP, so its confirmation is API-only and the prompt has never been seen by
+  a terminal. Adding the verb is small - the command, its parser branch, and one
+  test - and it was left out rather than smuggled in because it is a *user-facing
+  money transition with no way back* (decision 113) and deserves its own decision
+  about what the preview should say before it deserves a prompt.
+- **Abandoned `AWAITING` confirmations are never swept, on purpose** (decision
+  119). They are dead weight read only by their own id, bounded by a fifteen-minute
+  window, and deleting them would destroy the only record that somebody asked for
+  something and abandoned it. If that judgement is ever wrong, the fix is one
+  `DELETE` on the repository and one step in `plan tick` - and the reason it is not
+  already there is that a sweeper with no clock to run it is not a sweeper, which is
+  why the plan's own option text ("an expiry policy, and a sweeper") was implemented
+  as the first half only.
 
 ## Roadmap
 
@@ -2250,7 +2784,11 @@ work now achieves nothing, and neither does a token shaped like an address) and
 account-enumeration oracle, closed).
 
 **Phase 2b - the money endpoints.** Every operation held by decision 62, now that
-there is an actor worth spending a session on.
+there is an actor worth spending a session on - and what looked like a mechanical
+phase turned out to be the one that asked when a withdrawal has actually happened.
+See "The money endpoints, and the pending intent". Two things were deliberately
+*not* done: deposits stay held for Phase 3 (decision 97), and a pending transaction
+is left with no exit (decision 106).
 
 **Phase 2c - the rest of it:**
 

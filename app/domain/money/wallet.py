@@ -22,6 +22,7 @@ from .exception import (
     WalletAlreadyFrozenError,
     WalletClosedError,
     WalletFrozenError,
+    WalletNotEmptyError,
     ZeroAmountWithdrawalError,
 )
 from .fund import Fund
@@ -406,8 +407,16 @@ class Wallet:
         if self.status == WalletStatus.FROZEN:
             raise WalletAlreadyFrozenError
 
+        # ``WalletClosedError``, not ``WalletAlreadyClosedError``, although this
+        # transition cannot in fact happen to a closed wallet. The two names grew
+        # apart while ``CLOSED`` was unreachable - no method set it, so the pair
+        # was dead code and nothing forced them to agree. Now that ``close``
+        # exists and a closed wallet is a real thing a caller can hold, the fact
+        # being reported is "this wallet is closed" in both directions, and
+        # ``WalletAlreadyClosedError`` is kept for what its name says: a second
+        # ``close``.
         if self.status == WalletStatus.CLOSED:
-            raise WalletAlreadyClosedError
+            raise WalletClosedError("this wallet is closed")
 
         self.status = WalletStatus.FROZEN
 
@@ -416,9 +425,50 @@ class Wallet:
             raise WalletAlreadyActiveError
 
         if self.status == WalletStatus.CLOSED:
-            raise WalletClosedError
+            raise WalletClosedError("this wallet is closed")
 
         self.status = WalletStatus.ACTIVE
+
+    def close(self):
+        """Close the wallet for good - the one transition with no way back.
+
+        Two rules, and they are different kinds of rule.
+
+        **The wallet must be empty.** Available balance and every pot, including
+        money locked in one that has not come due. Every guarded operation in this
+        class refuses on a ``CLOSED`` wallet, so anything left inside is
+        unreachable forever - there is no unfreeze, no reopen, no administrative
+        door. Refusing to close over money is the only way that cannot happen.
+
+        The consequence is deliberate and can be inconvenient: a wallet holding an
+        active commitment cannot be closed until that pot matures and is released,
+        because ``Fund.release`` refuses early and ``close`` will not override it.
+        That is the same position the rest of the domain takes - the promise is
+        the product - and the alternative is a wallet that quietly eats the money
+        it was keeping.
+
+        **A frozen wallet may be closed.** Freezing is a reversible hold and this
+        is not, but they are not in conflict: freeze stops value leaving, while an
+        empty wallet has no value to stop. Requiring an unfreeze first would be a
+        second command whose only effect is on a flag nobody reads.
+
+        What this method deliberately does *not* check is plans. A live plan on a
+        closed wallet would fail on every tick forever, and refusing that is a
+        rule about a wallet's obligations rather than about its money - so it
+        lives in ``WalletService.close_wallet``, which can see the plans. The
+        domain cannot: it does not import planning, and a wallet has no idea it is
+        being saved for.
+        """
+        if self.status == WalletStatus.CLOSED:
+            raise WalletAlreadyClosedError("this wallet is already closed")
+
+        if self._available_balance.amount != 0 or self.locked_balance.amount != 0:
+            raise WalletNotEmptyError(
+                f"this wallet still holds {self._available_balance} available "
+                f"and {self.locked_balance} locked, so it cannot be closed"
+            )
+
+        self.status = WalletStatus.CLOSED
 
     # --- helpers ------------------------------------------------------------
 

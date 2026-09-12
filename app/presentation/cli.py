@@ -137,6 +137,7 @@ from app.composition_root import (
     build_wallet_service,
 )
 from app.domain.identity.user import User
+from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
@@ -177,6 +178,24 @@ OPERATIONS = {
     "deposit": "deposited",
     "withdraw": "withdrew",
 }
+
+#: Which of the commands above are answered rather than merely run.
+#:
+#: **One name, and the sparseness is the decision.** ``withdraw`` moves money out
+#: of the wallet for good - it crosses the system's edge and cannot be called
+#: back - so it takes a second look before it happens. ``deposit`` does not: it
+#: brings money in, a mistyped deposit is corrected by withdrawing, and a prompt
+#: in front of it would be a prompt people learn to answer without reading. The
+#: CLI has no ``close`` verb, so the third confirmed operation over HTTP has no
+#: row here at all.
+#:
+#: This is a set rather than a flag on ``OPERATIONS`` because the two tables
+#: answer different questions - one is "how do I report this verb", the other is
+#: "does this verb need a person" - and a flag would have merged them into a
+#: shape where the second question could only be asked by reading the first.
+#: ``_operation`` dispatches on it, and ``add_commands`` reads it to decide which
+#: parsers get ``--yes``.
+_CONFIRMED_OPERATIONS = {"withdraw"}
 
 #: The ``fund`` verbs that actually move money, and how to run each.
 #:
@@ -355,6 +374,57 @@ def _prompt_password(confirm: bool) -> str:
     if password != again:
         raise CliError("the two passwords did not match")
     return password
+
+
+def _confirmed(question: str, assume_yes: bool) -> bool:
+    """Ask a yes/no question at the terminal. Returns whether to go ahead.
+
+    ``input`` and not ``getpass``, which is the opposite choice to
+    ``_prompt_password`` above and for the opposite reason: a password is a
+    secret and must not be seen, while this is a question whose whole value is
+    that the person reads it. Hiding it would defeat it.
+
+    **An unanswered prompt is not a yes.** ``EOFError`` - an unattended run with
+    nothing on stdin, which is what a cron job or a piped invocation gives - is
+    caught and read as a refusal, as is an empty line. Neither is an error and
+    neither is agreement: the only ways past this are typing ``y`` or passing
+    ``--yes``, and ``--yes`` is a person saying "there is nobody here to ask".
+    Defaulting the other way would make the prompt a decoration on any machine
+    whose stdin happens to be closed.
+
+    ``OSError`` is caught alongside it, and that is not defensive padding - it is
+    the same situation arriving by a different route. A closed file descriptor
+    raises ``OSError`` from ``input`` where an exhausted pipe raises ``EOFError``,
+    and the two are one fact from this function's point of view: nobody is there
+    to ask. It was found by running the suite rather than by reasoning about it -
+    pytest replaces stdin with an object whose ``readline`` raises ``OSError``,
+    so the first CLI test to reach this prompt without ``--yes`` failed with a
+    traceback instead of with the refusal the docstring above promises.
+
+    **Only ``y`` is accepted, and it is matched case-insensitively.** Not "any
+    answer that is not 'n'" - the cost of the two mistakes is asymmetric. A
+    mistyped ``y`` costs a second run of the command; a mistyped ``n`` that was
+    read as agreement costs money that cannot be called back. Everything that is
+    not a clear yes is a no.
+
+    **Refusing is not an error.** The caller returns 0, because nothing failed:
+    a person declined, and the request is left in the database to expire on its
+    own. A non-zero exit here would tell a script that something went wrong when
+    the system did exactly what it was told.
+    """
+    if assume_yes:
+        return True
+    try:
+        answer = input(f"{question} [y/N] ")
+    except (EOFError, OSError):
+        # Nothing to read. Printed so the user knows why nothing happened rather
+        # than seeing a command that silently did nothing at all.
+        print("no answer given - nothing was moved")
+        return False
+    if answer.strip().lower() != "y":
+        print("declined - nothing was moved")
+        return False
+    return True
 
 
 def _uuid(value: str) -> uuid.UUID:
@@ -551,6 +621,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ref",
         help="idempotency key (auto-generated if omitted)",
     )
+    payout_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="do not prompt; for scripts and unattended runs",
+    )
 
     for name, _ in OPERATIONS.items():
         op_parser = subparsers.add_parser(name, help=f"{name} money")
@@ -560,6 +635,12 @@ def build_parser() -> argparse.ArgumentParser:
             "--ref",
             help="idempotency key (auto-generated if omitted)",
         )
+        if name in _CONFIRMED_OPERATIONS:
+            op_parser.add_argument(
+                "--yes",
+                action="store_true",
+                help="do not prompt; for scripts and unattended runs",
+            )
 
     _add_plan_commands(subparsers)
     _add_fund_commands(subparsers)
@@ -971,29 +1052,103 @@ def _deliver_after(factory, settings, deferred_reason=None) -> None:
 def _operation(
     service: WalletService, args, factory, settings, deferred_reason
 ) -> int:
-    # Resolve the wallet so the unitless amount is interpreted in its currency.
+    """Run ``deposit`` or ``withdraw``.
+
+    **One branch, and it is the whole point of the feature.** ``deposit`` goes
+    straight to the service as it always did; ``withdraw`` records a request,
+    shows it to the person, asks, and answers it. The split is written out here
+    rather than hidden behind a flag on ``OPERATIONS``, because the two commands
+    now have genuinely different shapes and a shared body would have to be told
+    which one it was anyway - one line further from the place a reader looks.
+
+    **The preview is arithmetic, not a promise.** It shows what the balance would
+    become if this went through, computed from the wallet that was just read - and
+    when the amount is larger than the available balance it says so in words
+    instead of printing a negative one, which would be a number no wallet can
+    hold. The wallet still decides at execution: this line is a courtesy to the
+    person reading it, and a refusal still arrives from the domain with the
+    domain's own words.
+
+    **Nothing printed here is taken from the command line.** The preview and the
+    result line are both read off the *record*, because the record is what will
+    be carried out. That matters in the one case where they can differ: a
+    ``--ref`` that was already used returns the request it already names, whose
+    amount may not be the one just typed. Printing the typed amount would be
+    printing a movement that is not the movement about to happen.
+    """
     wallet = service.get_wallet(args.wallet_id)
     amount = Money(args.amount, wallet.currency)
-    internal_reference = args.ref if args.ref is not None else str(uuid.uuid4())
 
-    method = getattr(service, args.command)
-    method(args.wallet_id, amount, internal_reference)
+    if args.command not in _CONFIRMED_OPERATIONS:
+        service.deposit(
+            args.wallet_id,
+            amount,
+            args.ref if args.ref is not None else str(uuid.uuid4()),
+        )
+        current = service.get_wallet(args.wallet_id)
+        print(
+            f"{OPERATIONS[args.command]} {amount} | "
+            f"available {current.available_balance} | "
+            f"locked {current.locked_balance}"
+        )
+        _deliver_after(factory, settings, deferred_reason)
+        return 0
 
-    current = service.get_wallet(args.wallet_id)
-    verb = OPERATIONS[args.command]
+    now = datetime.now()
+    requested = service.request_confirmation(
+        args.wallet_id,
+        ConfirmationKind.WITHDRAWAL,
+        now,
+        internal_reference=args.ref,
+        amount=amount,
+    )
+    confirmation = requested.confirmation
+
+    # Read off the record, not off ``amount`` - see the docstring. After a
+    # reference collision these are different numbers, and the record's is the
+    # one that will move.
+    moving = confirmation.amount
     print(
-        f"{verb} {amount} | "
+        f"about to withdraw {moving} from wallet {confirmation.wallet_id}"
+    )
+    if moving > wallet.available_balance:
+        print(
+            f"  this is more than the available balance of "
+            f"{wallet.available_balance} - it will be refused"
+        )
+    else:
+        print(
+            f"  available {wallet.available_balance} -> "
+            f"{wallet.available_balance - moving}"
+        )
+    print("  this moves money out of your wallet for good")
+    if not _confirmed("confirm?", args.yes):
+        return 0
+
+    service.confirm(confirmation.confirmation_id, datetime.now())
+    current = service.get_wallet(args.wallet_id)
+    print(
+        f"{OPERATIONS[args.command]} {moving} | "
         f"available {current.available_balance} | "
         f"locked {current.locked_balance}"
     )
-    # After the line above, and that order is deliberate: the result the user
-    # asked for is printed first, so a slow mail server delays the delivery
-    # report rather than the answer.
     _deliver_after(factory, settings, deferred_reason)
     return 0
 
 
 def _payout(service: WalletService, args, factory, settings, deferred_reason) -> int:
+    """Send money out to a bank account, after asking.
+
+    Same two-step shape as ``withdraw`` above, and the same rule about where the
+    printed numbers come from: everything shown to the person, and everything
+    reported afterwards, is read off the record that will be carried out.
+
+    ``as_of`` is read at the moment of confirming rather than of requesting, and
+    that ordering is deliberate. A payout may only spend pots that have come due,
+    and a person may sit at the prompt long enough for a pot to mature - so
+    judging maturity at the moment the money moves is both the more useful answer
+    and the one that matches what the wallet will actually do.
+    """
     # Like every other amount on this CLI, the number carries no currency of its
     # own - it is read in the wallet's currency.
     wallet = service.get_wallet(args.wallet_id)
@@ -1004,18 +1159,14 @@ def _payout(service: WalletService, args, factory, settings, deferred_reason) ->
         name=args.name,
         details={"bank_code": args.bank_code},
     )
-    internal_reference = args.ref if args.ref is not None else str(uuid.uuid4())
 
-    service.payout_from_locked(
+    requested = service.request_confirmation(
         args.wallet_id,
-        amount,
-        internal_reference,
-        destination,
-        # The moment this command is running, read here at the adapter rather
-        # than inside the use case. It is not decoration: a payout may only spend
-        # pots that have come due, so the use case needs to know when "now" is -
-        # and being told makes it answerable about a moment other than this one.
+        ConfirmationKind.PAYOUT_FROM_LOCKED,
         datetime.now(),
+        internal_reference=args.ref,
+        amount=amount,
+        destination=destination,
         # The pot, if one was named. Omitted, this is the pooled draw - and the
         # omission is honest rather than lazy: a human who does not know which
         # pot they mean has not committed anything, and the wallet spends the
@@ -1024,12 +1175,25 @@ def _payout(service: WalletService, args, factory, settings, deferred_reason) ->
         # Note what is *not* passed alongside it: nothing here says when a
         # commitment to pay was made. This is a hand-typed payment, so it has
         # none, and a sealed business pot will refuse it on that ground alone.
-        args.fund,
+        fund_name=args.fund,
     )
+    confirmation = requested.confirmation
+    moving = confirmation.amount
+    paying = confirmation.destination
 
+    print(f"about to pay {moving} to {paying} from wallet {confirmation.wallet_id}")
+    if confirmation.fund_name is None:
+        print("  drawn from the matured pots, oldest first")
+    else:
+        print(f"  drawn from the pot {confirmation.fund_name!r}")
+    print("  this moves money out of your wallet for good")
+    if not _confirmed("confirm?", args.yes):
+        return 0
+
+    service.confirm(confirmation.confirmation_id, datetime.now())
     current = service.get_wallet(args.wallet_id)
     print(
-        f"paid {amount} to {destination} | "
+        f"paid {moving} to {paying} | "
         f"available {current.available_balance} | "
         f"locked {current.locked_balance}"
     )

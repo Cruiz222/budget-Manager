@@ -34,6 +34,7 @@ class PayoutFromAvailable(WalletOperation):
     """
 
     transaction_type = TransactionType.PAYOUT
+    settles_immediately = False
 
     def _apply(self, amount):
         self.wallet.withdraw(amount)
