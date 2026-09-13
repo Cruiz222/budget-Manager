@@ -30,7 +30,7 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
 from tests.conftest import TEST_USER_EMAIL, TEST_USER_PASSWORD
-from tests.presentation.api.conftest import ALICE
+from tests.presentation.api.conftest import ALICE, BOB
 
 
 class TestBecomingSomebody:
@@ -50,7 +50,7 @@ class TestBecomingSomebody:
         makes "who is asking?" a real question rather than a boolean.
         """
         alice = client.get("/users/me", headers=as_user(ALICE)).json()
-        bob = client.get("/users/me", headers=as_user("bob@localhost")).json()
+        bob = client.get("/users/me", headers=as_user(BOB)).json()
 
         assert alice["user_id"] != bob["user_id"]
 
@@ -314,7 +314,7 @@ def test_the_cli_and_the_api_resolve_one_address_to_one_account(
     """
     from app.presentation.cli import main
 
-    address = "shared@localhost"
+    address = "shared@example.com"
     session = f"{db_path}.session"
     typed_password()
 

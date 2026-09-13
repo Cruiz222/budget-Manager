@@ -18,10 +18,22 @@ class UserRepository(ABC):
     without an actor - not that exactly one file is.
 
     Concretely, that means ``get_by_id`` here returns *any* user, and the
-    discipline that keeps it safe is not in this class: it is that the auth
-    boundary is its only caller, and it always passes the id it just resolved
-    from the session rather than one a request supplied. Every later phase that
-    wants a user by id should ask that boundary, not this repository.
+    discipline that keeps it safe is not in this class: it is that **the id always
+    comes from something already resolved, and never from a request.** When this
+    docstring said "the auth boundary is its only caller" that was true and is no
+    longer; the rule it stood for is unchanged and is restated here rather than
+    widened.
+
+    There are three callers now, and each passes an id it did not get from the
+    caller: ``ResolveActorFromSession`` passes the id the presented session named,
+    and ``RequestEmailChange`` and ``ConfirmEmailChange`` pass the actor they were
+    handed - the second of those being the id a *claimed* change names, which is
+    only reachable by presenting a token this system mailed. So the door is the
+    same width; what grew is the number of things standing at it holding something
+    they proved.
+
+    Every later phase that wants a user by id should ask one of those, not this
+    repository.
     """
 
     @abstractmethod

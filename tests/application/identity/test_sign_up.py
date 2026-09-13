@@ -15,6 +15,7 @@ from app.domain.identity.exception import (
     DuplicateEmailError,
     InvalidPasswordError,
     InvalidUserEmailError,
+    UnusableEmailError,
     WeakPasswordError,
 )
 from app.domain.identity.password import PlainPassword
@@ -193,14 +194,81 @@ def test_a_weak_password_is_refused_and_nothing_is_written(factory, sign_up):
         uow.rollback()
 
 
-def test_a_malformed_address_is_refused_by_the_aggregate(sign_up):
-    """The address rule lives on ``User``, not in this method.
+def test_a_malformed_address_is_refused_as_a_shape_problem(sign_up):
+    """**The ordering assertion.** Not an address at all, and it must be *told* that.
 
-    Asserted to keep a second, weaker check from appearing here - the same
-    property ``test_actor.py`` asserts at the HTTP boundary, one layer down.
+    ``not-an-address`` fails both rules at once - it has no ``@``, so the shape rule
+    refuses it, and it has no dot after an ``@`` that is not there, so the usability
+    rule would too. Which one answers is therefore decided by the order the two are
+    asked in, and the order is load-bearing rather than tidy: this answer names the
+    thing the person can act on ("that is not an address"), where
+    ``UnusableEmailError`` names a domain rule they did not break. The two errors
+    send a reader to different files.
+
+    This used to say the rule lived on ``User`` and not in this method. That is no
+    longer true and the change is deliberate: ``SignUp`` now calls ``checked_email``
+    itself, the same function ``User.__post_init__`` calls, so there is still exactly
+    one definition of the shape rule - it is simply applied earlier, which is what
+    makes room for the second rule below it.
     """
-    with pytest.raises(InvalidUserEmailError):
+    with pytest.raises(InvalidUserEmailError) as raised:
         sign_up.execute("not-an-address", PASSWORD, NOW)
+
+    assert not isinstance(raised.value, UnusableEmailError)
+
+
+def test_an_unusable_address_is_refused_at_the_door(factory, sign_up):
+    """The rule this whole slice was built for, at the one place a fresh address enters.
+
+    ``nobody@localhost`` is a perfectly well-formed address that no payment provider
+    will bill, and before this rule the system would create an account holding one -
+    which meant the account's *first deposit* was refused, weeks later, by a third
+    party, with a message about a parameter. The person had no way to fix it: the
+    address was taken forever by the ``UNIQUE`` on ``users.email``, and the only
+    remedy was a second account.
+    """
+    with pytest.raises(UnusableEmailError):
+        sign_up.execute("nobody@localhost", PASSWORD, NOW)
+
+
+def test_a_refused_unusable_address_leaves_no_account_behind(factory, sign_up):
+    """The half that makes the rule a rescue rather than a different trap.
+
+    If the row landed anyway, the address would be taken by an account nobody could
+    ever deposit from *and* nobody could register again - which is the exact state
+    this refuses to create. ``test_a_weak_password_is_refused_and_nothing_is_written``
+    makes the same assertion for the other refusal, from the same cause: the whole
+    operation is one unit, and nothing commits until the last line.
+    """
+    with pytest.raises(UnusableEmailError):
+        sign_up.execute("nobody@localhost", PASSWORD, NOW)
+
+    uow = factory.start()
+    try:
+        assert uow.users.find_by_email("nobody@localhost") is None
+    finally:
+        uow.rollback()
+
+
+def test_the_unusable_refusal_beats_the_duplicate_answer(sign_up):
+    """Usability is asked *before* the store is consulted, and both reasons agree.
+
+    The first is what the person can act on: an address that is taken **and**
+    unusable reported as taken invites somebody to log in to an account no provider
+    will bill - true, and useless. The second is a disclosure argument, and it is the
+    sharper one: usability is a property of the string that was typed, while the
+    duplicate answer is a property of the store. Asking the local question first
+    means an unauthenticated caller learns nothing about which addresses are
+    registered until they have named one that could be.
+
+    Seeded with a *usable* address first so the store genuinely holds something - a
+    test that never wrote a row would pass whether the order was right or not.
+    """
+    sign_up.execute("ada@example.com", PASSWORD, NOW)
+
+    with pytest.raises(UnusableEmailError):
+        sign_up.execute("nobody@localhost", PASSWORD, NOW)
+
 
 
 def test_the_password_is_validated_before_the_hash_is_computed(tmp_path):

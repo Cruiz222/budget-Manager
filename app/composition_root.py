@@ -1,7 +1,9 @@
 from uuid import UUID
 
+from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
+from app.application.identity.request_email_change import RequestEmailChange
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.notifications.deliver_notifications import DeliverNotifications
@@ -424,16 +426,25 @@ def build_notification_deliverer(
 # ``build_reconciler`` by not touching a wallet at all. None of them invents an
 # actor, which is the property the whole group exists to make visible.
 #
-# All four take the same optional factory the rest do, and none of them takes
-# ``settings``. Mail settings are what the *so-far-built-a-service* side adds to a
-# receipt; a sign-up sends nothing, because there is no address to send from until
-# the account exists and no reason to tell anybody it did.
+# The four builders that made up this group before the address change - sign-up,
+# log-in, log-out and the actor lookup - take the same optional factory the rest
+# do and nothing else, and each absence is argued in its own docstring. A sign-up
+# sends nothing, because there is no address to send from until the account exists
+# and no reason to tell anybody it did.
 #
 # ``password_hasher`` is a parameter on the three that need one rather than being
 # constructed inside them, for the reason ``channel`` is a parameter on the
 # deliverers: it is the seam where a test injects a fake, and a fake is what keeps
 # the suite from paying tens of milliseconds per hash. It is the *only* such seam
 # on this side, which is the honest measure of how little there is here.
+#
+# ``settings`` reaches the last two builders only, and that is a change worth
+# marking because it is the one thing the paragraph above used to deny. Mail
+# settings were the *so-far-built-a-service* side's business: a sign-up sends
+# nothing, because there is no address to send from until the account exists, and
+# a login tells nobody. An address change is the first identity operation that
+# speaks to the outside world, and the two mails it sends are the reason - one to
+# prove the new address, one to warn the old one. They are still the only two.
 
 
 def build_sign_up(
@@ -515,4 +526,74 @@ def build_resolve_actor(
     """
     return ResolveActorFromSession(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+    )
+
+
+def build_request_email_change(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    password_hasher: PasswordHasher | None = None,
+    settings: EmailSettings | None = None,
+    actor: UUID | None = None,
+    channel=None,
+) -> RequestEmailChange:
+    """Wire up asking to move an account's address, as one account.
+
+    The first identity builder with an ``actor``, and the reason it has one is the
+    same reason the money builders do: it acts *as somebody*, reading that
+    account's credential and comparing a password against it. It is also the first
+    one that needs the hasher for a **verification rather than a hash**, which is
+    worth noticing because it is the opposite direction through the same port from
+    ``build_sign_up`` - and the reason the two builders take the identical
+    argument.
+
+    ``settings`` and ``channel`` are the pair ``build_deliverer`` already has, and
+    the arrangement is copied rather than reinvented: ``_channel_for`` picks the
+    SMTP adapter, an injected ``channel`` wins over it, and ``None`` means this
+    installation has no mail account. That last case is not an error here - it is
+    the fallback the whole feature turns on, and it is why the *use case* can apply
+    a change immediately. See ``RequestEmailChange`` for why refusing instead would
+    move the trap one layer down.
+
+    **No shared factory with the confirm builder below, and there is nothing to
+    share.** The two halves of a change never run in the same transaction: one
+    writes a request, the other spends it minutes later on another device, and a
+    shared factory would only be a way to make a reader wonder whether they were
+    supposed to. The pairing this feature needs is *within* the confirm, between
+    ``email_changes`` and ``users`` - and that one is stated on the unit.
+    """
+    return RequestEmailChange(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        password_hasher=password_hasher or Argon2PasswordHasher(),
+        actor=actor,
+        channel=_channel_for(settings, channel),
+    )
+
+
+def build_confirm_email_change(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
+    channel=None,
+) -> ConfirmEmailChange:
+    """Wire up answering a change, which has no actor to be given.
+
+    **This is the third builder in the file that takes no ``actor``, and it is the
+    first whose absence is about *authorisation* rather than about there being
+    nobody to name.** ``build_settler`` has none because a provider reporting a
+    movement is not a person, and ``build_notifier`` has none because it reads no
+    wallet. This one has none because the token *is* the authorisation: it was
+    mailed to the address being moved to, and it exists only because somebody
+    already proved the account's password to mint it. See ``ConfirmEmailChange``
+    for why a live session on top would refuse the person who asked on a laptop
+    and read the mail on a phone, and why that is a hole closed rather than a hole
+    opened.
+
+    The channel is here for the other mail - the notice to the address being left
+    behind - and it is the one send in this system whose failure is *reported
+    rather than raised*. The mail account is the same one ``build_deliverer``
+    delivers warnings and receipts through, deliberately: an installation has one
+    SMTP configuration, not one per kind of message.
+    """
+    return ConfirmEmailChange(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        channel=_channel_for(settings, channel),
     )

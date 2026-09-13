@@ -315,9 +315,9 @@ Transaction
 
 ## Signing in
 
-Every command except `signup`, `login`, `logout` and `plan tick` acts as somebody,
-and that somebody is proved by a token rather than named by a flag. So a fresh
-install starts here:
+Every command except `signup`, `login`, `logout`, `confirm-email` and `plan tick`
+acts as somebody, and that somebody is proved by a token rather than named by a
+flag. So a fresh install starts here:
 
 ```
 .venv/bin/python -m app.presentation.cli --db budget.db signup me@example.com
@@ -348,6 +348,29 @@ Three things about that are worth knowing:
 `logout` on a machine that was never signed in is not an error - it exits 0 and
 prints a note. The postcondition is "there is no usable session at this path", and
 it is already true.
+
+**Moving the address an account holds takes two commands, and they do not both act
+as somebody.** `change-email` needs a session and asks for the current password;
+`confirm-email` needs neither, because the whole of its authorisation is the code
+that was mailed to the address being moved *to*:
+
+```
+.venv/bin/python -m app.presentation.cli --db budget.db change-email me@example.com
+    # the current password is asked for; then one of two things happens
+.venv/bin/python -m app.presentation.cli --db budget.db confirm-email
+    # the code is asked for; nothing else is
+```
+
+The split is the point rather than an implementation detail. Somebody can ask at a
+desk and answer from a phone, on a machine that has never logged in - `confirm-email`
+reads no session file and is dispatched above the line that resolves an actor, so it
+works where `whoami` would not. What it costs is that the password proof and the
+mailbox proof have to be held by whoever completes the change, which is the
+trade decision 165 records.
+
+**With no mail account configured the second command is not needed.** `change-email`
+applies the change on the password proof alone and says which variable is missing,
+so a fresh install can still fix an address no provider will bill (decision 173).
 
 Three commands are worth knowing by name when something goes wrong. `whoami` says
 who the current token belongs to, which is the first question anybody debugging an
@@ -517,6 +540,41 @@ written to do: the suite's own accounts were at `@localhost` too, so the tests h
 the same blind spot as the code and agreed with it (decisions 156 to 160). What a
 live run buys is not coverage. It is an oracle for the rules this codebase does not
 own.
+
+**The third recipe is the one that undoes the second finding, and it is the first
+thing in this file built against that oracle rather than discovered by it.** The
+account refused a deposit at `live@localhost` cannot simply be re-registered -
+sign-up now refuses the address - so the way to watch the whole slice work is to
+start from a stranded row, which is what a real installation's affected accounts
+already are:
+
+```
+# 1. the account the provider will not bill, and the refusal that proves it
+.venv/bin/python -m app.presentation.cli --db budget.db whoami     # nobody@localhost
+curl -sX POST localhost:8000/wallets/$W/deposits …                 # 400 PayerEmailRefusedError
+
+# 2. move it, with a mail account configured
+.venv/bin/python -m app.presentation.cli --db budget.db change-email me@example.com
+#   confirmation code sent to me@example.com | expires 2026-09-13T14:22
+#   run 'confirm-email' and enter the code to complete the change
+.venv/bin/python -m app.presentation.cli --db budget.db confirm-email
+#   email changed to me@example.com | was nobody@localhost
+#   nobody@localhost was told about the change
+
+# 3. the same request that was refused above, now accepted
+curl -sX POST localhost:8000/wallets/$W/deposits …                 # 201, a checkout_url
+```
+
+Step 3 is the whole slice in one line, and it is the same `curl` that came back
+`invalid_email_address` the first time. Two things about running it against real
+infrastructure are worth watching, and neither is provable from the suite: that the
+verification mail actually *arrives* at the new address (a local catcher is enough
+to watch it leave the process - `aiosmtpd`, as in "Running the scheduler"), and
+that Paystack accepts the *moved* address where it refused the old one, which is
+the one claim the whole entry rule rests on (decision 162). If the second ever
+fails, the rule is wrong in the direction that matters - it would have let somebody
+move an account to an address the provider still refuses - and the remedy is the
+pair of `curl`s that found the rule, run again.
 
 ## Decisions
 
@@ -1809,6 +1867,17 @@ request is what brought it into being — and there is deliberately no `Location
 header, because there is no URL at which a session can be fetched and pointing at
 one that does not exist would be worse than pointing nowhere.
 
+**Amended: the email-change request is a second endpoint that mints a secret, and
+it is not a second response carrying one.** It sends a 256-bit token to an address
+and answers the caller with `{"status", "email", "expires_at"}` — no token, in
+either the pending or the applied case, and a test asserts the code appears
+nowhere in the response body. So this entry's sentence survives the new endpoint
+with its meaning intact and its scope widened: two endpoints now mint a credential,
+one of them hands it to the caller and the other can only post it somewhere. The
+reason is the same one, one step further out — a secret that never comes back over
+the wire cannot leak from a log, a proxy or a shoulder, and the mailbox is a
+channel this system does not have to secure. See decision 176.
+
 **76. Expiry is absolute, not sliding.** `SESSION_LIFETIME` is thirty days from the
 moment of issue. A sliding window — "extend it on every request" — means a session
 used daily never ends and one used monthly ends immediately, which is the opposite
@@ -1964,6 +2033,18 @@ address was free" and "the password works" are different facts.
 **86. `POST /users` and `POST /sessions` are the only unauthenticated writes in the
 API.** That is inherent to being the way in, and it is why rate limiting is a real
 2c item rather than a nicety. Every other endpoint resolves an actor.
+
+**Amended: there is now a third, and it is not a way in.** `POST
+/email-changes/confirm` takes no credentials at all - the mailed token is the whole
+of its authorisation (decision 166) - so "unauthenticated" is true of it in the
+sense that matters to a rate limiter and false in the sense this entry meant. It is
+not a door into the system; it is the second half of a change somebody already
+authenticated for, and the credential it spends was posted to an address rather
+than handed to the caller. It is a member of this family for exactly one reason:
+an unauthenticated caller can spend server resources here, and the resource is an
+SMTP round trip plus a 256-bit token comparison. See decision 167 for why that
+token is 256 bits rather than six digits, which is this entry's own argument
+reaching the next endpoint.
 
 **87. The grade table gains a 401, and `MissingActorHeaderError` becomes
 `MissingCredentialsError`.** Its own docstring had already promised exactly this —
@@ -3367,29 +3448,378 @@ refused by the dependency and never reaches the payer check, and arriving at a
 different refusal there would be a bug in the ordering rather than a fixture to
 fix.
 
+**161. An expectation is written from the test's own input, never from a shared
+constant.** Moving those fixtures broke exactly one test, and the way it broke is
+worth keeping. `test_sessions.py::test_the_address_is_folded` registered
+`"  Alice@LocalHost  "` and asserted the result was `ALICE` - which passed only for
+as long as `ALICE` *was* `alice@localhost`. The moment the constant moved, the test
+was asserting that the fold of one address equals a different address, and it
+failed for a reason that had nothing to do with folding.
+
+The test was wrong before the change and nothing revealed it. What it claimed to
+assert was a *transformation*; what it actually asserted was agreement between two
+values that happened to be equal, so it would have gone on passing through any
+change to the fold that moved both. It now spells out `"alice@localhost"`, and the
+rule is general: **a constant standing in for a computed result is that result by
+coincidence, and the coincidence ends the next time somebody edits a fixture.**
+
+That is 156's blind spot a third time, and the third instance is what makes the
+pattern the interesting part of this whole change rather than a run of bad luck.
+A fake that validated nothing, fixtures whose accounts could never deposit, and a
+test measuring a constant - all three are the suite agreeing with something other
+than the thing under test, and all three survive a green run indefinitely. What
+they have in common is that nothing in the repository is an oracle for them. Only
+a real call, or a deliberate re-reading, ever finds one.
+
+### The address an account holds, and the way out of a bad one
+
+This closes the gap decision 156 opened and decision 157 refused to close at the
+time. That refusal was right about the *deposit* and wrong about the *account*: an
+address no provider will bill should not be refused at the only door that can
+create one, because a person standing at a registration form cannot be asked to
+know what Paystack accepts - but an account that holds one is stranded, and until
+now the only remedy was to abandon the wallet with it.
+
+Two halves, and they are one change rather than two:
+
+```
+POST /users                  ──┐
+                               ├── the aggregate's shape rule   (User)
+                               └── refuse_unusable_email()      (the entry rule)
+POST /users/me/email-changes ──┘   ...then at most one pending EmailChange per account
+
+POST /email-changes/confirm  ──► claim_by_token_hash()   one statement, the spend
+                                   └─ users.save(user)    the same unit ──► one commit
+                                        └─ best-effort notice to the address left behind
+```
+
+**162. One predicate, three call sites, read as a guard at two of them and as a
+courtesy at the third.** `has_real_domain` answers one question - is there a dot
+after the last `@` - and it now lives in `app/domain/identity/emailAddress.py`,
+because what an address *is* belongs to the aggregate that holds one. Decision 157
+argued why the deposit-time reading is a courtesy and that argument has not
+changed; what changed is that the *same narrow rule* turned out to be the right
+entry rule too, for the opposite reason.
+
+The asymmetry is the point: a guard that guesses wrong costs a retry, because the
+person is at a form holding an address they already use. A courtesy that guesses
+wrong costs a deposit that cannot be undone on their behalf. So the rule stays
+narrow in both places, and the two readings are two functions with two error
+classes and two sentences - `UnusableEmailError` and `PayerEmailRefusedError` -
+because a caller catching one is catching a fact about the address an account may
+hold and one catching the other is catching a fact about a provider.
+`app.domain.payments.payerEmail` delegates the predicate here rather than
+restating the dot test, and `tests/domain/payments/test_payer_email.py` pins the
+agreement across ten addresses, so the only way to change either behaviour is to
+change the one predicate.
+
+**163. The entry rule is checked where an address is minted, and never by the
+aggregate.** The obvious home is `User.__post_init__`, and it is the wrong one:
+that method also runs when a row is *loaded* by the repository, so a rule enforced
+there would make every existing `@localhost` account unreadable - turning a
+stranded account into a broken one, which is strictly worse than the problem. It
+belongs at the operations that mint an address, and there are exactly two:
+`SignUp` and the email-change request.
+
+The consequence is an asymmetry that is deliberate and documented: `change_email`
+does *not* enforce usability either, because construction must accept what is
+already on disk and the two paths would otherwise disagree about what a `User` may
+hold. What `change_email` does own is the aggregate's own rule - non-empty, one
+`@`, folded - and that rule was extracted into one function (`checked_email`, with
+the folding it already had) so that `__post_init__` and the method cannot drift
+apart. The method validates into a local before assigning, so a refused change
+cannot leave a `User` holding a bad address either.
+
+**164. Shape first, then usability, and the order is load-bearing rather than
+tidy.** `"not-an-address"` has no `@`, so the usability rule refuses it too - but
+it must keep answering `InvalidUserEmailError`, which is the rule a person can act
+on, rather than `UnusableEmailError`, which is a statement about a provider. Each
+value is refused by the more specific rule it actually broke, and the two are 400s
+by the same route: neither is listed in `errors._grade`, and an unlisted
+`MoneyError` falls through to a 400.
+
+**165. An email change is authorised by a session *and* the current password.**
+Neither alone is enough. The session says which account, and it is the only thing
+in this codebase that can produce a `User`; the password is what makes a stolen
+token insufficient to move an account. The password is verified with
+`PlainPassword` + `PasswordHasher.verify`, and the wrong-password refusal is
+`InvalidCredentialsError` - `LogIn`'s own error, deliberately - so the 401 and the
+sentence are identical across the two places in this system a password is checked,
+and a value that could not be a password still gets `WeakPasswordError`'s 400 for
+free.
+
+**166. The confirmation is authorised by the token alone, and that is not a
+bypass.** `LogOut` is the precedent: the one operation in this codebase authorised
+by the thing it destroys. The token exists only because somebody already proved
+the account's password in order to mint it, so the password proof has been spent
+on this change already. Requiring a live session on top would refuse exactly the
+person this feature is for - asked on a laptop, opened the mail on a phone - and
+would leave the link dead if their session lapsed inside the window. The habit
+decision 123 records applies here unchanged: this is an accident guard, not a
+security control, and the rate limiter is what will make the second half of that
+sentence less uncomfortable.
+
+**167. The credential is 256 bits rather than six digits, and the reason is the
+rate limiter that does not exist.** A short numeric code is the friendlier shape
+and it is brute-forceable, and the endpoint it would protect is one whose whole
+power is moving an account's address. Rate limiting is a known unbuilt item
+(decision 86), so the token reuses `Session`'s exact discipline - 256 bits of
+CSPRNG output, SHA-256 at rest, the hash always *derived* from a presented value
+and never taken from the request. `hash_session_token`'s docstring said "exactly
+two callers" and now says three, with the reason written beside it: the rule is "a
+256-bit token, hashed at rest", and where it was first needed is not what it is
+about.
+
+**168. `EmailChange` is `Confirmation`'s lifecycle with none of its fields.**
+`Confirmation` requires a `wallet_id` and its docstring calls it "a request to
+move money out", so it is the wrong container. But its *lifecycle* is exactly what
+this needs - single-use, windowed, with three refusals distinguished by one atomic
+claim - so the new aggregate mirrors that shape and shares nothing else. Three
+things came across deliberately:
+
+- **`EXPIRED` is derived and never written.** `expires_at` already holds the fact,
+  and the only thing that could write `EXPIRED` is a reader, which would make a
+  `GET` a write.
+- **The row survives the change**, which is what makes the refusals
+  distinguishable: deleting it on use would collapse "already used" into "never
+  existed", and those two have different remedies. It also means the last change
+  is readable per account, which is most of an audit trail for the cost of one
+  column.
+- **No `previous_email` column.** Nothing would read it - the notice to the old
+  address is composed from the account as it is read *before* the change - and a
+  column written and never read is the speculative state this codebase refuses.
+
+`EMAIL_CHANGE_LIFETIME` is a separate constant from `CONFIRMATION_LIFETIME` even
+though the value currently matches, because nothing has decided those two windows
+move together.
+
+**169. One pending change per account, structurally.** `user_id` is the primary
+key of `email_changes`, so "at most one" is the schema rather than a rule somebody
+has to remember, and a second request is an `ON CONFLICT … DO UPDATE`. Superseding
+is not a shortcut but the behaviour a person wants: a mistyped address should be
+correctable by asking again, and a token nobody wants must not stay live.
+
+**170. A spent request is spent by the attempt, not by the success.** A confirm
+that finds the address taken in the meantime refuses with `DuplicateEmailError`
+and leaves the request `CONFIRMED`; the remedy is to ask again, not to retry the
+token. This is `ConfirmationStatus.CONFIRMED`'s rule stated again, so a client that
+has met one has met the other - and it is the reason the confirm commits *before*
+it raises, since a refusal that rolled back would leave the token live and the
+rule would be a comment.
+
+**171. What can change between the request and the confirm is checked twice; what
+cannot is checked once.** The address may have been taken by somebody else inside
+the fifteen minutes, so the duplicate lookup runs again at apply time. The
+usability rule cannot change inside one run of one version of this code, so it is
+checked at the request only - and a second check would be a second place to
+disagree with the first.
+
+**172. The credential-bearing mail is sent in-request and its failure refuses the
+request; the notice is best-effort and its failure is reported.** The asymmetry is
+the whole argument. A mail carrying the credential must arrive or the request is
+pointless, so it raises - and the row that remains after a failed send holds no
+credential, because the token is hashed at rest, so the harmless leftover is
+retried by asking again, which supersedes it.
+
+A mail announcing a fait accompli must not be able to undo it. Refusing to change
+an address because a doomed notice could not be delivered would strand the very
+account this endpoint exists to rescue - and it *will* bounce for a stranded
+account, which is the case the endpoint is for. So its failure is caught into the
+result instead: `notice_sent` and `notice_error` carry three states in two fields
+(`True`/`None`, `False` with the reason, and `False`/`None` for an installation
+with no mail at all), and both presentations print a bounced notice as a footnote
+under a success rather than as a failure.
+
+Neither message goes through the outbox. `NotificationKind` is a closed set of
+wallet-boundary events, `Notification` has no expiry *by design*, and the queue's
+whole premise is that late is acceptable - and a credential that is worthless
+after fifteen minutes is the one thing that cannot be late.
+
+**173. With no mail account configured, the change applies on the password proof
+alone - and both presentations say so.** Otherwise a fresh install could never fix
+a bad address: the trap would simply move one layer down, and the person would be
+told to check a mailbox no code can post to. The API answers `applied` with
+`expires_at` absent, the CLI prints the change and then names the missing variable,
+and the sentence is the same one the deliverers already report, because it is the
+same fact. An installation without mail is never *silently* less safe than one with
+it.
+
+**174. No link is fabricated in the mail.** This system does not know its own
+public address - there is no such setting, and inventing one would be a promise no
+code keeps and a value that is wrong on every install but one. The message carries
+the token and says where to present it: `confirm-email` at a terminal, or the
+route. A real link wants a base URL setting that also has to be right behind a
+proxy, which is a deployment decision rather than a message decision.
+
+**175. The change does not revoke sessions, and that is a decision rather than an
+omission.** `Session` is bound to `user_id` and not to an address, so a change
+cannot orphan one - nothing breaks by leaving them alone. Revoking would buy
+little against the threat that matters: an attacker holding both the token and the
+password logs in again immediately. And there is no `delete_by_user_id` to call,
+so the honest options were to add one for a measure that does not measure much, or
+to leave it. What it does mean is that a session opened before the change keeps
+working afterwards, which is worth knowing rather than assuming either way.
+
+**176. A secret is never an argument and never a path segment.** Two
+presentations, one rule, and both halves are the existing rule rather than a new
+one. The CLI prompts for the token with `_prompt_token` beside `_prompt_password`,
+for `_prompt_password`'s own reason: an argument lands in the shell's history file
+and in the process table. The API takes the token in the request *body* rather
+than the path, so that a credential which can move an account does not end up in
+an access log, a proxy log, or a `Referer` header. It is the same reasoning as
+decision 83 one bearer of a secret further along.
+
+The CLI's placement follows the same split. `change-email` sits *below* the actor
+line, because it acts as somebody; `confirm-email` sits *above* it beside
+`signup`/`login`/`logout`, because the token is the whole authorisation and there
+is no session it could act as. So one machine can ask at a desk and answer from a
+terminal that has never logged in - and a test deletes the session file before
+answering, to say that with the filesystem rather than in a comment.
+
+**177. `get_by_id`'s discipline is narrowed rather than the door widened.** The
+repository method's docstring reserved it for the auth boundary. Confirmation
+*must* read a user by the id a claimed token names, and the request reads its own
+account inside its own transaction. What still holds, and is what made it safe, is
+the part that did not change: the id always comes from a resolved actor or from a
+claimed token, and never from a request.
+
+**178. The third `Deliverable` is not an aggregate, and the Protocol's cost was
+paid where it was predicted.** `Deliverable` is a `Protocol` with three attributes
+- `recipient`, `subject`, `body` - so a composed verification message goes through
+`SmtpNotificationChannel` with no new aggregate, no `NotificationKind` member and
+no `plan_id`. Its docstring said "only two classes are ever passed to a channel";
+that sentence now says three, and `deliverable.py` names the thing it cannot
+enforce: nothing checks a `Protocol`, so a channel that reached for a fourth
+attribute would fail on the first message of the second *kind*, not at import.
+`TestTheThirdDeliverableShape` in
+`tests/infrastructure/notifications/test_smtp_notification_channel.py` is the
+compensating control that sentence asked for - it asserts the absence
+(`hasattr(mail, "plan_id")` is false) and then sends the message anyway, because
+the absence is the claim.
+
+**179. A rule that needs two aggregates is re-applied by every use case that loads
+both - and this slice found one that isn't.** A plan's currency must match its
+wallet's, and `SavingsPlan` cannot enforce that: its own docstring says so, because
+a plan cannot see a wallet. `PlanService.create_plan` is where the rule actually
+lives, in the one place both are loaded - and `edit_instructions` loads only the
+plan. So a plan can be created honestly in NGN and then edited into USD, the
+aggregate re-validating exactly what it can see (non-empty, one currency *among
+the instructions*, source rules) and nothing that needs the wallet.
+
+The consequence is worse than a wrong answer, which is why it is here rather than
+in a list: the run's pre-flight compares `wallet.available_balance <
+plan.total_to_move`, two `Money` values in different currencies raise
+`CurrencyMismatchError`, `ExecutePlanRun` re-raises it, and `RunDuePlans` has no
+per-plan catch - so one such plan stops that tick's remaining plans, for every
+user, on every tick. It is in `### Still open` as the first of the audit's
+findings, and it is the shape this whole slice was about: a value that could have
+been refused at the door, refused later in a place that holds more than the one
+thing it was asked about.
+
 ### Still open
 
-- **An account registered at an address no provider will bill has no way to fix
-  it** (decision 156). `POST /users` accepts anything with an `@`, the deposit
-  route now refuses that account's deposits with a legible 400, and **there is no
-  email-change endpoint** - so today the only remedy is a new account, which loses
-  the wallet and its history. That is a real gap and it is stated rather than
-  papered over. Two candidate shapes, and neither is obviously right: an email
-  *rule* strict enough to refuse `nobody@localhost` at registration, which means
-  this codebase asserting an email policy (157's argument against it), or an
-  email-change flow, which is a new authenticated surface with its own
-  verification story. The second is the one that matches the actual failure -
-  people mistype, and a typo is not a reason to lose a wallet.
-- **The dot rule is written from one observation, in the same way the reference
-  alphabet was** (decisions 156 and 151). What is known is that Paystack refused
-  `live@localhost` and accepted `live@example.com`, and the dot is the only
-  difference. That is not the same as knowing their rule, and the courtesy is
-  narrow for exactly that reason - but the *test* asserts the rule as though it
-  were known, so `test_payer_email.py` and `tests/conftest.py` carry the same
-  "written from memory" caveat the reference alphabet does. What settles it is a
-  live call rather than a reading, and the live run in "Reconciling the payments
-  whose webhook never arrived" is where that happens.
+- **A plan edited into a currency its wallet does not hold stops the whole tick.**
+  Found by the entry-point audit below, and the sharpest of its findings because
+  the consequence is not a refusal but an outage. `PlanService.create_plan` checks
+  `plan.total_to_move.currency is not wallet.currency` (decision 179);
+  `PlanService.edit_instructions` loads only the plan, so the check is not
+  re-applied; and a mismatched run raises `CurrencyMismatchError` out of
+  `_money_block`, through `ExecutePlanRun`'s `except BaseException: raise`, into
+  `RunDuePlans`, which catches per *plan* nowhere. The tick exits 1 and every plan
+  after it in that pass does not run.
 
+  Two candidate fixes and they are not equivalent. Re-check in
+  `edit_instructions`, which needs the wallet loaded and therefore a second read
+  in a method that currently has none - correct, and it closes only this door.
+  Or catch the domain error per plan in `RunDuePlans` and record the run as
+  blocked with a new `RunBlockReason` member, which is the more honest shape
+  (a plan that cannot run is a *blocked* plan, not a tick failure) and covers
+  every other way one plan's domain error could take a tick down with it.
+  The second is the one that matches the failure; the first is the one that
+  matches the rule. Doing both is defensible and neither is done.
+- **The entry-point audit, in full.** A read-only pass over the other places a
+  value enters this system, asking the question this slice was about - *what does
+  the door accept, and what refuses it later* - with no code changed. The six
+  findings, and the honest state of each:
+
+  - **A wallet's currency is never checked against the provider's.** `Currency`
+    has five members (`NGN`, `USD`, `GHS`, `KES`, `EUR`) and `Currency(x)` is the
+    whole of the check at `Money.__post_init__`; `PaystackPaymentProvider`
+    forwards `"currency": SUPPORTED_CURRENCY` at
+    `paystack_payment_provider.py:217`, a hard-coded `"NGN"`, whatever the amount
+    was. `_subunit(amount)` sends the *number* (`amount.amount * 100`) and the
+    constant sends the *label*, and nothing connects them - so a wallet holding USD
+    and depositing `Money(100, USD)` posts `{"amount": 10000, "currency": "NGN"}`,
+    which Paystack reads as one hundred naira. The payer is charged a hundredth of
+    what the wallet believes it holds, and the ledger row credits the wallet with
+    the amount it *intended*: the two ends disagree and neither is told. The one
+    place the wallet's currency meets anything is `initiate_deposit.py:164`, and
+    that compares the amount to the *wallet*, not to the provider. The constant's
+    own comment says it is "deliberately the only one it will send" and predicts
+    this: it is a statement about what has been verified, not a check. A wallet in
+    any of the other four currencies is creatable today, and its deposits are wrong
+    at the far end in a way nobody is told about.
+  - **The payout rail has no later refusal because it has no earlier or later
+    anything.** `Destination` requires `bank_code` for a `BANK_ACCOUNT`
+    (`destination.py:18`), which is a floor and not a ceiling, and the identifier
+    and name are only checked non-empty. Nothing verifies that the identifier is
+    the ten digits a Nigerian account number is, and nothing can - `PaymentProvider`
+    has three methods and `initiate_transfer` is deliberately not one of them. The
+    port's docstring gives the reason (a signature that would have been guessed),
+    so destinations are *recorded* and money is *held*, and no external transfer is
+    ever initiated. The real refusal will arrive with the rail that needs it, and
+    the shape of the entry rule should be decided then rather than now.
+  - **Amounts are refused for shape and never for size.** `Money` refuses a
+    non-finite value, a bool, more than two decimal places, and a foreign currency
+    in arithmetic; `initiate_deposit.py:161` and `wallet_operation.py:152` refuse
+    `<= 0`; `withdraw_money.py:38` refuses `< 0` (so a zero withdrawal is legal
+    there and refused by the wallet downstream, which is a second refusal for one
+    fact). Nothing refuses an amount above any ceiling, and the only thing that
+    would is the provider - which does refuse them, at the far end, after the
+    request has left.
+  - **A plan's schedule is validated as a type and not as a value.** `Schedule`
+    requires a `Cadence` and a `datetime` anchor (`schedule.py:31-45`), and
+    `ends_on` cannot fall before the anchor's day. Nothing refuses an anchor in the
+    past, which is a real state with a real meaning (a plan that owes several runs
+    - `RunDuePlans` is explicit that a plan missed for four months is due for four
+    occurrences), so this is a decision rather than a gap. Named here so that it is
+    read as one.
+  - **A pot's name is the CLI handle and has no normalisation.** `Fund` requires a
+    non-empty stripped string (`fund.py:306`), and `Wallet.open_pot` refuses an
+    exact duplicate (`wallet.py:111`). There is no folding and no length bound, so
+    `"Vacation"` and `"vacation"` are two pots, a name of ten thousand characters
+    is accepted, and `" Vacation "` is accepted as a *distinct* name from
+    `"Vacation"` while being indistinguishable from it in a terminal - reachable
+    afterwards only by typing the spaces. Compare `email`, which folds, and the
+    duplicate check here is `==` rather than a comparison against the folded form.
+  - **The job that resolved the worked example.** The idempotency key reference is
+    the shape this list exists to argue for and it is already closed (decisions
+    151-155): the alphabet was written down from memory in one place and copied
+    into a live path, and only a real call found it. What that cost is the
+    argument for the five above - each is a value this system accepts and expects
+    somebody further down to refuse, and the somebody is sometimes a provider, a
+    person's patience, or nobody at all.
+- **The dot rule is still written from one observation, and it is now load-bearing
+  in two more places** (decisions 156, 151 and 162). What is known is that Paystack
+  refused `live@localhost` and accepted `live@example.com`, and the dot is the only
+  difference between them. That is not the same as knowing their rule, and the
+  courtesy is narrow for exactly that reason - but it is now also the *guard* at
+  sign-up and at the change request, where a wrong guess is cheap but a
+  systematically wrong guess is a class of people who cannot register. What settles
+  it is a live call rather than a reading, and the live run below is where that
+  happens.
+- ~~**An account registered at an address no provider will bill has no way to fix
+  it** (decision 156).~~ **Done.** `POST /users` still accepts anything with an `@`
+  and always will, because decision 157's argument against this codebase asserting
+  an email policy at registration is unchanged - but the address can now be moved.
+  `POST /users/me/email-changes` and `change-email` take a session and the current
+  password, mail a 256-bit token to the new address, and apply the change when it
+  is presented; with no mail account configured the change applies on the password
+  proof alone and both presentations say so. The wallet, its pots and its whole
+  history come with it, which was the part the old remedy could not offer. Two
+  candidate shapes were named here and the second was built - an email *rule* at
+  registration, or a change flow - and the reason is the one recorded: people
+  mistype, and a typo is not a reason to lose a wallet.
 - **Rebuilding `wallets` to carry a foreign key to `users`** (decision 59). A
   SQLite table rebuild with `PRAGMA foreign_keys` off, on a table holding real
   balances, which wants a backup story worth trusting before it is attempted. The
@@ -3413,6 +3843,36 @@ fix.
   found - and it belongs here rather than on its own, because rate limiting
   addresses the same threat directly *and* covers the sign-up path, which the dummy
   hash cannot.
+
+  **A third endpoint joins this list, and it is the one that mails a credential.**
+  `POST /users/me/email-changes` is authenticated - it needs a session *and* the
+  current password - so it is not the same threat as an open door. But it is a
+  second place an unauthenticated-by-design credential is *posted*: it is the
+  endpoint whose reply is a 256-bit token at somebody's address, and each call
+  costs an SMTP round trip. That is the reason decision 167 chose a 256-bit token
+  over a six-digit code, and the reason this entry has moved up the list rather
+  than down: the brute-force defence is still "the token is too long to guess",
+  and a rate limiter is what would let it be something friendlier.
+- **Purging settled `email_changes` rows, as with sessions.** Every confirmed
+  change leaves a row behind on purpose - decision 168, because deleting it would
+  collapse "already used" into "never existed" - and nothing ever removes one. The
+  same is true of `sessions`, and the same argument applies to both: they are dead
+  weight read only by a lookup that no longer matters, bounded by a fifteen-minute
+  window, and deleting them destroys the only record that something happened. So
+  this is one design job covering two tables rather than two chores: what the
+  retention rule is, and whether *this* record is ever read by a person (an audit
+  view, the moment one exists, would make the answer "keep it"). Not urgent while
+  the tables are small; a sweep is one `DELETE` and one step in a job that already
+  runs.
+- **A session opened before an email change keeps working afterwards**, and that is
+  a decision rather than an oversight (decision 175). `Session` is bound to
+  `user_id`, not to an address, so nothing breaks by leaving it alone - but it does
+  mean that somebody who changes their address because they believe the old one is
+  compromised does not thereby log the old holder out. Revoking would need a
+  `delete_by_user_id` that does not exist, and would buy little against the threat
+  that matters (an attacker holding both the password and the token logs in again
+  anyway). Named here because "my sessions still work" is the kind of thing a person
+  discovers at the wrong moment.
 - **Rebuilding the identity tables to carry foreign keys** (decision 84).
   `password_credentials.user_id` and `sessions.user_id` are plain columns, so the
   pairing between an account and its credential is guaranteed by `SignUp` writing
@@ -3466,11 +3926,32 @@ fix.
   commands and `plan tick` are now dispatched above the line that resolves an actor,
   so a fresh database no longer grows a `dev@localhost` row on the way past a tick -
   there is no default identity left for anything to create.
-- **Password reset and email verification.** Neither blocks the design: an account
-  that cannot reset its password is inconvenient, an account that cannot exist is a
-  non-starter. But a password that is forgotten today is an account that is gone,
-  and the confirmation mail is also what would make an address *verified* rather
-  than merely claimed.
+- **Password reset, and address *verification* as a thing distinct from address
+  change.** Neither blocks the design: an account that cannot reset its password is
+  inconvenient, an account that cannot exist is a non-starter. But a password that
+  is forgotten today is an account that is gone.
+
+  **This entry's own prediction has now half come true, and the machinery is the
+  reason to read it again.** It said a password reset "will want this exact
+  mailed-token machinery", and the email-change slice built it: a 256-bit token
+  hashed at rest, a single-use windowed claim, three distinguishable refusals, a
+  mail that must arrive and a notice that must not be able to undo anything. A
+  password reset is the same shape with one field changed - the thing the token
+  authorises is a new *password* rather than a new *address* - and it should
+  **reuse** rather than re-derive, which means the question to answer first is
+  whether `EmailChange` generalises or whether a second aggregate with the same
+  lifecycle is the honest answer. That is a decision about naming and about the
+  table, not about the flow.
+
+  What is *not* covered by that machinery is verification of an address an account
+  already holds. A change proves the new address; nothing has ever proved the one
+  somebody registered with, so "verified" is a fact this system cannot state about
+  any account that predates this slice. That is a narrower claim than it sounds -
+  proving somebody reads a mailbox would not have stopped `nobody@localhost`, which
+  is why the deposit courtesy (decision 157) is a separate thing - but "this
+  address was proved at some point" is a column that does not exist, and an
+  installation that wanted to refuse an unverified address a payout would find
+  nothing to read.
 
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
   reads "salary" instead of a bare internal reference.
@@ -3878,6 +4359,40 @@ this codebase does not own, and the fix's real content was giving the double an
 opinion - the alphabet is now written down twice, deliberately, in the two test
 files, because a copy that imported the constant would agree with the code by
 construction, which is the thing that had gone wrong.
+
+**Phase 3c - the entry rule, and a way out of a bad address. Complete.** The slice
+that closes the finding 3b's live run left behind, and it is a strange one in the
+best way: the thing that found it was not a test and could not have been, and the
+thing that fixes it is a rule the codebase had already written down and declined to
+enforce for a good reason. See "The address an account holds, and the way out of a
+bad one".
+
+- **One predicate, three call sites** (decision 162): `has_real_domain` is a
+  *guard* at the two places this system mints an address and a *courtesy* at the
+  one place it hands one to a provider. `app.domain.payments.payerEmail` delegates
+  to it, so the two refusals have one opinion between them and two sentences.
+- **The rule is checked where an address is minted, never by the aggregate**
+  (decision 163) - because `User.__post_init__` also runs on load, and enforcing it
+  there would make every stranded account unreadable rather than fixable.
+- **`POST /users/me/email-changes` and `POST /email-changes/confirm`**, plus
+  `change-email` and `confirm-email` beside them: a session *and* the current
+  password to ask, a 256-bit mailed token to answer, one atomic claim, and one
+  commit that moves the address and spends the token together (decisions 165-171).
+- **Two mails with two different failure rules** (decision 172): the one carrying
+  the credential must arrive and refuses the request if it cannot; the notice to the
+  address being left is best-effort and reports rather than raises, because it *will*
+  bounce for exactly the accounts this endpoint exists to rescue.
+- **With no mail account the change applies on the password proof alone**
+  (decision 173), so a fresh install can still escape a bad address - and both
+  presentations say so rather than being quietly less safe.
+
+What it deliberately does not do, with entries under `### Still open`: **rate limit
+the second endpoint that mails a credential** (decision 86 now has three members),
+**purge settled `email_changes` rows**, and **revoke sessions on a change** (decided
+against, decision 175). And the read-only audit it was asked for turned up five more
+entry points of the same shape, one of which - a plan edited into a currency its
+wallet does not hold - takes down a whole tick rather than one request. Those are in
+`### Still open` in full, with the line numbers, and none of them was changed.
 
 ### Phase 4 - Production
 

@@ -25,7 +25,9 @@ Money, in particular, is formatted in exactly one function - which is what keeps
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
+from app.application.identity.confirm_email_change import ConfirmedEmailChange
 from app.application.identity.log_in import LoggedIn
+from app.application.identity.request_email_change import EmailChangeOutcome
 from app.application.payments.initiate_deposit import InitiatedDeposit
 from app.application.wallet_service import ConfirmedOperation
 from app.domain.identity.user import User
@@ -337,6 +339,45 @@ def session_out(logged_in: LoggedIn) -> schemas.SessionOut:
         token=logged_in.token,
         expires_at=logged_in.session.expires_at,
         user=user_out(logged_in.user),
+    )
+
+
+def email_change_out(outcome: EmailChangeOutcome) -> schemas.EmailChangeOut:
+    """A requested address change, as the client sees it.
+
+    **No token, and there is no field here that could carry one.** The token goes
+    to the address being moved to and nowhere else - not in this response, not in
+    a log, not in the caller's session - which is why ``EmailChangeOutcome`` does
+    not expose it either. A client is handed "pending" and a deadline, and the
+    only way it ever sees the code is by receiving the mail.
+
+    ``status`` is derived from ``applied`` rather than carried alongside it, so a
+    client and this function cannot disagree about which of the two happened. The
+    schema holds the word, the outcome holds the fact.
+    """
+    return schemas.EmailChangeOut(
+        status="applied" if outcome.applied else "pending",
+        email=outcome.email,
+        expires_at=outcome.expires_at,
+    )
+
+
+def email_change_confirmed_out(
+    confirmed: ConfirmedEmailChange,
+) -> schemas.EmailChangeConfirmedOut:
+    """A finished change, with the two facts about the notice passed through unread.
+
+    The notice's outcome is forwarded rather than interpreted, and that is
+    deliberate: whether a bounced farewell is worth showing somebody is a question
+    for the client's own interface, and this layer's job is to report it honestly
+    rather than to decide what it means. See ``EmailChangeConfirmedOut`` for the
+    three states the two fields hold.
+    """
+    return schemas.EmailChangeConfirmedOut(
+        user=user_out(confirmed.user),
+        previous_email=confirmed.previous_email,
+        notice_sent=confirmed.notice_sent,
+        notice_error=confirmed.notice_error,
     )
 
 

@@ -21,12 +21,20 @@ gives the client a page that will not take money.
 
 **The newest refusal is about the payer's address**, and it is the second one a
 live provider taught this codebase - in the same run that found the first. The
-address a deposit is billed under is the account's own, and this system's entire
-email rule is that it contains an ``@``, so an account registered at
-``nobody@localhost`` is perfectly legal here and unbillable at the far end. It is
+address a deposit is billed under is the account's own, and this system's email
+rule was, at the time, that it contains an ``@`` - so an account registered at
+``nobody@localhost`` was perfectly legal and unbillable at the far end. It is
 refused before the call now, and the refusal is a courtesy: the provider is still
 the authority, and the adapter raises the same error when Paystack says
 ``invalid_email_address``.
+
+**That address can no longer be registered, and the test below was re-seeded
+rather than re-pointed.** ``POST /users`` refuses it at entry as of the same
+change that added the email change endpoint, so the account this refusal is about
+is now a row that *predates* the rule - written straight into the store, which is
+the only way it can exist. The deposit check did not become dead code when the
+entry rule landed; it became the second line, and what it catches is exactly the
+accounts the change endpoint exists to rescue.
 
 The refusal before that one is about the characters in the key. A supplied key is
 quoted into the reference Paystack is given as its idempotency key, and Paystack
@@ -278,16 +286,14 @@ class TestTheRefusals:
         assert balance_of(wallet_id, headers) == "0.00"
 
     def test_a_payer_address_a_provider_would_refuse_is_a_400(
-        self, client, as_user, open_wallet, balance_of
+        self, client, legacy_account, as_existing_user, open_wallet, balance_of
     ):
         """**The second thing a live run taught this route, and the cheaper one.**
 
-        ``POST /users`` accepts any string with an ``@`` in it - that is the whole
-        of this system's email rule - so ``nobody@localhost`` is a legal account
-        that can hold a wallet and be signed into. Paystack will not bill it: its
-        answer is ``invalid_email_address``, with a ``nextStep`` about passing the
-        ``email`` parameter, which reads as though this codebase forgot to send
-        one rather than as though the address is unusable.
+        Paystack will not bill an address with no domain in it. Its answer is
+        ``invalid_email_address``, with a ``nextStep`` about passing the ``email``
+        parameter, which reads as though this codebase forgot to send one rather
+        than as though the address is unusable.
 
         So the address is refused here, at the only moment it matters and the only
         moment it *can* matter - a person is trying to put money in and cannot.
@@ -295,13 +301,24 @@ class TestTheRefusals:
         unlisted ``MoneyError`` falls through ``errors._grade``, so a refusal this
         new needs no entry there to behave like every refusal before it.
 
-        Registering at the unusable address through ``as_user`` rather than
-        picking a different one is the point of the test, not a convenience: the
-        account this refusal is about is one the API would create without
-        complaint, and that gap between what registration accepts and what a
-        provider bills is the whole finding.
+        **The account is seeded by ``legacy_account`` rather than registered, and
+        that change is the finding closing behind this test.** It used to register
+        ``nobody@localhost`` through ``as_user``, and registering it was the
+        point: the test *was* the proof of the gap between what registration
+        accepted and what a provider would bill. That gap is shut - ``POST
+        /users`` refuses the address now - so an account like this cannot be
+        created through the API at all. It can still be *held*, because rows
+        written before the rule are on disk and are deliberately still readable,
+        and this is one of those rows.
+
+        So the test did not stop being about the live finding; it moved from
+        "registration lets this through" to "this is what the deposit check is
+        still for". What it proves now is narrower and still worth proving: the
+        payer check is the second line, and what it catches is accounts already
+        stranded. ``test_request_email_change``'s rescue case is the other half.
         """
-        headers = as_user("nobody@localhost")
+        email = legacy_account("nobody@localhost")
+        headers = as_existing_user(email)
         wallet_id = open_wallet(headers)
 
         response = client.post(
@@ -350,20 +367,25 @@ class TestTheRefusals:
         the *configured* client, and a token from one app is not a token in
         another.
 
-        ``carol@localhost`` is left as it was, and it is worth saying why rather
-        than leaving it to look like an oversight now that the address is one a
-        deposit refuses: the 503 comes from the dependency, so this request never
-        reaches the payer check at all. It would be the same test with any
-        address, and arriving at a *different* refusal here would be a bug in the
-        ordering rather than a fix to this fixture.
+        ``carol@example.com`` is a real-domain address, and it moved there when
+        the entry rule landed. What used to sit here was a paragraph defending
+        ``carol@localhost`` - the argument being that the 503 comes from the
+        dependency, so the request never reaches the payer check and any address
+        would do. That was true, and it is why this test needed no change to keep
+        passing *for the reason it is about*; but the registration in front of it
+        is a real ``POST /users``, and the entry rule refuses the address there.
+        The premise the old paragraph rested on had evaporated, so it is replaced
+        rather than left to describe a fixture that no longer exists.
+
+        What the test asserts is unchanged: the ordering, not the address.
         """
         registered = unconfigured_client.post(
-            "/users", json={"email": "carol@localhost", "password": TEST_USER_PASSWORD}
+            "/users", json={"email": "carol@example.com", "password": TEST_USER_PASSWORD}
         )
         assert registered.status_code == 201, registered.text
         signed_in = unconfigured_client.post(
             "/sessions",
-            json={"email": "carol@localhost", "password": TEST_USER_PASSWORD},
+            json={"email": "carol@example.com", "password": TEST_USER_PASSWORD},
         )
         assert signed_in.status_code == 201, signed_in.text
         headers = {"Authorization": f"Bearer {signed_in.json()['token']}"}

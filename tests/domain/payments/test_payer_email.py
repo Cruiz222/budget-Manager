@@ -18,6 +18,11 @@ what makes the guard real rather than a second opinion.
 
 import pytest
 
+from app.domain.identity.emailAddress import (
+    has_real_domain,
+    refuse_unusable_email,
+)
+from app.domain.identity.exception import UnusableEmailError
 from app.domain.money.exception import MoneyError
 from app.domain.payments.exception import PayerEmailRefusedError
 from app.domain.payments.payerEmail import refuse_unusable_payer_email
@@ -102,3 +107,114 @@ def test_the_refusal_is_a_money_error_so_every_presentation_renders_it():
     traceback - and the deposit route is not the only caller this could ever have.
     """
     assert issubclass(PayerEmailRefusedError, MoneyError)
+
+
+#: Addresses chosen so that every branch of the predicate is present: a real
+#: domain, a domain without a dot, two spellings of "no ``@`` at all", the two
+#: dotted-but-odd values this file already passes on purpose, and a pair that
+#: differ only in which side of it their *last* ``@`` puts the dot.
+SHARED_PREDICATE_CASES = (
+    "payer@example.com",
+    "a@b.",
+    "a@.",
+    "live@localhost",
+    "payer@LOCALHOST",
+    "nobody",
+    "",
+    "@localhost",
+    "a@b@example.com",
+    "a@b@localhost",
+)
+
+
+def refuses(refusal, email: str) -> bool:
+    """Whether ``refusal`` refuses ``email``, without caring *which* class it raises.
+
+    Catching both refusals and answering a boolean is what makes the test below
+    about agreement rather than about either rule. The classes are asserted where
+    they belong - ``test_the_two_refusals_are_two_errors_on_purpose`` just below,
+    and the identity module's own file - and a test that compared exception types
+    here would be testing those instead of this.
+    """
+    try:
+        refusal(email)
+    except (PayerEmailRefusedError, UnusableEmailError):
+        return True
+    return False
+
+
+class TestTheTwoRefusalsAreOneRule:
+    """The entry rule and the payment courtesy, pinned against each other.
+
+    ``refuse_unusable_email`` and ``refuse_unusable_payer_email`` are the same
+    predicate read two ways - a guard where an address is minted, a courtesy where
+    one is handed to a provider - and they exist as two functions because the two
+    readings have different *error classes* and different sentences. What they must
+    never have is different *opinions*, and that is the whole of what this class
+    asserts.
+
+    It is worth a test rather than a comment because the failure mode is silent and
+    asymmetric. If somebody tightened one of the two - the obvious temptation is a
+    regex at the entry rule, where guessing wrong is cheap - the system would end up
+    refusing to create an account it would happily try to bill, or the reverse. The
+    first is a person who cannot register, the second is a person whose first
+    deposit is refused by a third party weeks later, which is the trap this whole
+    slice was built to close. Neither would fail any other test in the suite.
+    """
+
+    @pytest.mark.parametrize("address", SHARED_PREDICATE_CASES)
+    def test_the_two_refusals_agree_about_every_address(self, address):
+        assert refuses(refuse_unusable_payer_email, address) == refuses(
+            refuse_unusable_email, address
+        )
+
+    @pytest.mark.parametrize("address", SHARED_PREDICATE_CASES)
+    def test_and_both_agree_with_the_predicate_they_share(self, address):
+        """The stronger half: not merely "the two agree", but *about what*.
+
+        Two functions that both refused everything would pass the test above, and so
+        would two that both refused nothing. This pins them to the one predicate the
+        module docstring says they delegate to, so the only way to change either
+        behaviour is to change ``has_real_domain`` - which is the arrangement, and
+        the reason the rule lives in ``identity`` rather than being copied.
+        """
+        assert refuses(refuse_unusable_email, address) is (
+            has_real_domain(address) is False
+        )
+
+    def test_the_two_refusals_are_two_errors_on_purpose(self):
+        """Same input, same opinion, two classes - and the split is the two readings.
+
+        A caller catching ``PayerEmailRefusedError`` is catching a fact about a
+        provider; one catching ``UnusableEmailError`` is catching a fact about the
+        address an account may hold. Collapsing them would make the deposit route
+        unable to tell which of the two it was reporting, and the API's ``error``
+        field is what a client branches on.
+        """
+        with pytest.raises(PayerEmailRefusedError):
+            refuse_unusable_payer_email("live@localhost")
+
+        with pytest.raises(UnusableEmailError) as refused:
+            refuse_unusable_email("live@localhost")
+
+        assert not isinstance(refused.value, PayerEmailRefusedError)
+
+    def test_the_two_sentences_say_different_things_about_the_same_address(self):
+        """Both name the address; each names the authority it is speaking for.
+
+        The payment refusal talks about what "a payment provider needs", because the
+        reader is somebody trying to deposit and the next actor in the story is a
+        provider. The identity refusal talks about the domain the *address* needs,
+        because the reader is somebody at a form and the next actor is them. One
+        rule, two audiences - which is the whole reason there are two sentences
+        rather than one shared string.
+        """
+        with pytest.raises(PayerEmailRefusedError) as payer:
+            refuse_unusable_payer_email("live@localhost")
+        with pytest.raises(UnusableEmailError) as identity:
+            refuse_unusable_email("live@localhost")
+
+        assert "live@localhost" in str(payer.value)
+        assert "live@localhost" in str(identity.value)
+        assert "provider" in str(payer.value)
+        assert str(payer.value) != str(identity.value)

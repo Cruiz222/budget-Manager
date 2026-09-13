@@ -48,11 +48,15 @@ import pytest
 #: the safe side of the line - or deciding the line has moved.
 EXPECTED_OPERATIONS = {
     ("get", "/health"),
-    # The two unauthenticated writes, and the only routes on this list that need
-    # nobody: they are how a caller comes to have a credential at all. They are
-    # listed here like everything else rather than held, because the boundary is
-    # about what is *routable*, and the question of whether they should be rate
-    # limited is a different one that lives in the README's open list.
+    # Two of the three unauthenticated writes, and the only routes on this list
+    # that need nobody: they are how a caller comes to have a credential at all.
+    # (The third arrived with the email change, and it is at the end of this set
+    # rather than here because it is authorised by something else entirely - a
+    # code mailed to the address being moved to. What it has in common with these
+    # two is only the absence of a bearer token.) They are listed here like
+    # everything else rather than held, because the boundary is about what is
+    # *routable*, and the question of whether they should be rate limited is a
+    # different one that lives in the README's open list.
     ("post", "/users"),
     ("get", "/users/me"),
     ("post", "/sessions"),
@@ -148,6 +152,29 @@ EXPECTED_OPERATIONS = {
     # asymmetry is the whole safety argument for putting it on the wire at all,
     # and it is what the signature is protecting.
     ("post", "/webhooks/paystack"),
+    # --- moving an account's address, added after the live run --------------
+    #
+    # Two routes for one feature, and they are split across two prefixes because
+    # they are authorised by different things. The request is under ``/users/me``
+    # and takes a bearer token *and* the account's password: a path nested under
+    # an account means "you must be that account to touch it". The confirm is not
+    # under it, and takes no token at all.
+    #
+    # **The confirm is the third unauthenticated write in this API**, after
+    # ``POST /users`` and ``POST /sessions``, and the only one authorised by a
+    # thing mailed rather than presented at the time. It is not a hole, and the
+    # argument is short: the code exists only because somebody already presented
+    # the account's password to mint it, and it was mailed to the address being
+    # moved to - so the proof is already spent on this change, and requiring a
+    # session on top would refuse the person who asked at a desk and opened the
+    # mail on a phone. See ``routes/email_changes.py``.
+    #
+    # It is a *write*, unlike the ``GET`` on a confirmation above, and the reason
+    # is the same one that makes the comparison worth drawing: looking at a
+    # pending change spends nothing, and confirming one spends it. That is what
+    # ``EmailChangeStatus.CONFIRMED`` means.
+    ("post", "/users/me/email-changes"),
+    ("post", "/email-changes/confirm"),
 }
 
 #: Balance changes that are still held, each one because the movement's far end

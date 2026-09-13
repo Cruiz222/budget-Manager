@@ -14,11 +14,15 @@ needs by name rather than importing a helper from a sibling, so every test file
 reads on its own.
 """
 
+from datetime import datetime
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.domain.identity.password import PlainPassword
+from app.domain.identity.password_credential import PasswordCredential
+from app.domain.identity.user import User
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
@@ -239,6 +243,85 @@ def as_user(client):
         if email not in tokens:
             tokens[email] = _sign_in(client, email)
         return {"Authorization": f"Bearer {tokens[email]}"}
+
+    return _headers
+
+
+@pytest.fixture
+def legacy_account(db_path, password_hasher):
+    """Write an account straight into the store, bypassing ``SignUp`` entirely.
+
+    **This is the only way an account this system would refuse can exist**, and
+    that sentence is the whole justification for the fixture. Since the entry
+    rule, ``POST /users`` refuses an address with no domain in it, so an account
+    at ``nobody@localhost`` is no longer something a test can *create*. It is
+    still something the system can *hold*: rows written before the rule existed
+    are on disk, are read back on every load, and are not refused - which is not
+    a hypothetical, it is what a live run produced and the trap the email change
+    endpoint exists to rescue somebody from.
+
+    So the tests that need such an account seed it the way reality did, through
+    the repository, one layer below the rule. The alternative - letting a fixture
+    register one and weakening the rule to allow it - would have made every test
+    that used that fixture stop proving what its own docstring says.
+
+    ``password_hasher`` is requested rather than built, so the credential this
+    writes is one the *same* application can verify: ``app`` is assembled with
+    this suite's hasher, and a hash made by anything else would refuse a correct
+    password and present as "those details did not match an account". That is
+    ``argon2_client``'s lesson from the other direction - the fixture, not the
+    code, and it looks exactly like the bug it is not.
+    """
+
+    def _write(email: str, password: str = TEST_USER_PASSWORD) -> str:
+        factory = SqliteUnitOfWorkFactory(db_path)
+        now = datetime.now()
+        uow = factory.start()
+        try:
+            user = User(
+                user_id=uuid4(),
+                email=email,
+                google_subject=None,
+                created_at=now,
+            )
+            uow.users.save(user)
+            uow.password_credentials.save(
+                PasswordCredential(
+                    user_id=user.user_id,
+                    password_hash=password_hasher.hash(PlainPassword(password)),
+                    updated_at=now,
+                )
+            )
+            uow.commit()
+        finally:
+            uow.rollback()
+        return email
+
+    return _write
+
+
+@pytest.fixture
+def as_existing_user(client):
+    """Authorization headers for an account that is already in the store.
+
+    The counterpart to ``as_user``, for the one case that fixture cannot serve:
+    an account seeded by ``legacy_account``, which ``POST /users`` would refuse
+    today. ``as_user`` deliberately registers and *then* signs in - that is what
+    makes the two hundred tests using it exercise the sign-up endpoint as a side
+    effect - and here the registration is the exact thing that must not happen.
+    So this does the half that matters and skips the other.
+
+    Uncached, unlike ``as_user``: it is called once or twice in a test that is
+    about something else, and a cache would be a second place a token lives for
+    no gain.
+    """
+
+    def _headers(email: str) -> dict:
+        response = client.post(
+            "/sessions", json={"email": email, "password": TEST_USER_PASSWORD}
+        )
+        assert response.status_code == 201, response.text
+        return {"Authorization": f"Bearer {response.json()['token']}"}
 
     return _headers
 

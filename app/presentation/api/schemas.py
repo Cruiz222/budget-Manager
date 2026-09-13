@@ -260,6 +260,64 @@ class SessionOut(BaseModel):
     user: UserOut
 
 
+class EmailChangeOut(BaseModel):
+    """What asking to move an address produced: a request, or a finished change.
+
+    **``expires_at`` is present exactly when ``status`` is ``pending``**, and the
+    coupling is not enforced here - it cannot be, since a pydantic model has no
+    opinion about which of its fields belong together. It is enforced one layer
+    down, and structurally rather than by a check: ``EmailChangeOutcome`` holds the
+    pending ``EmailChange`` or nothing, and reads both ``applied`` and this from
+    that single field, so "applied, and here is your deadline" is not a value
+    anything can construct. By the time a response is built there is nothing left
+    to get wrong.
+
+    ``email`` is the address the *request is about* either way: the one the account
+    now holds when ``applied``, and the one it will hold once confirmed when
+    ``pending``. A client showing "we have sent a code to ..." and a client showing
+    "your address is now ..." are reading the same field, which is why it is not
+    two fields with two names.
+
+    ``status`` is two words rather than three, and the third thing a client might
+    expect - *expired* - is deliberately not among them. A request that has lapsed
+    is not reported by the endpoint that made it; it is reported by the endpoint
+    that refuses it, which is where a client can act on it.
+    """
+
+    status: Literal["pending", "applied"]
+    email: str
+    expires_at: datetime | None = None
+
+
+class EmailChangeConfirmedOut(BaseModel):
+    """A finished change, and how telling the address it left behind went.
+
+    ``user`` is the account as it now stands, embedded rather than left to a second
+    call to ``/users/me`` - the same argument ``SessionOut`` makes, and it holds
+    here for the same reason: the confirm is authorised by a token and not by a
+    session, so a client that wanted to learn the resulting address would otherwise
+    have to log in again to ask.
+
+    ``previous_email`` travels because nothing else can report it. The row
+    deliberately holds no record of the address that was left - see
+    ``ConfirmEmailChange`` - so this is the one moment the fact exists anywhere
+    outside the notice that was mailed.
+
+    **``notice_sent`` and ``notice_error`` are two fields for three states**, and
+    the third is the one worth writing down because it reads like a bug:
+    ``False`` with ``None`` means *this installation has no mail account*, so no
+    notice was attempted. ``False`` with a reason means one was attempted and
+    failed. The address moved either way - that is the whole of the best-effort
+    decision - and a client that showed "your old address was not told" as an
+    error would be reporting a courtesy as a failure.
+    """
+
+    user: UserOut
+    previous_email: str
+    notice_sent: bool
+    notice_error: str | None = None
+
+
 class HealthOut(BaseModel):
     """Deliberately one field, and deliberately not describing the contents.
 
@@ -494,6 +552,50 @@ class LogInIn(BaseModel):
 
     email: str = Field(examples=["ada@example.com"])
     password: str = Field(repr=False, examples=["a long phrase you will remember"])
+
+
+class EmailChangeIn(BaseModel):
+    """The address to move to, and the proof that this is the account's owner asking.
+
+    **Two credentials rather than one, and the pair is the design.** The request
+    arrives carrying a session - every field of it being about the *caller* - and
+    this body, which carries the one thing the session cannot say: that the person
+    holding it still knows the password. The confirmation that follows is
+    authorised by its mailed token alone, so without this second proof a stolen
+    session would be enough to walk an account off to somebody else's mailbox.
+
+    ``password`` is ``repr=False`` for ``SignUpIn``'s reason, unchanged: a pydantic
+    model reprs its fields exactly as a dataclass does, and a request caught in an
+    unexpected error must not write the secret into whatever logs the exception.
+
+    ``email`` carries no validation here either, and it never has - the shape rule
+    and the entry rule are both the domain's, and applying either one in this model
+    would answer a bad address with a 422 in pydantic's vocabulary instead of a 400
+    in the domain's.
+    """
+
+    email: str = Field(examples=["ada@example.com"])
+    password: str = Field(
+        repr=False, examples=["the password this account already has"]
+    )
+
+
+class ConfirmEmailChangeIn(BaseModel):
+    """The code that was mailed to the new address, and nothing else.
+
+    **It is in the body rather than in the path, and that is a decision about
+    logs.** A token in a URL is a token in every access log, every proxy log and
+    every ``Referer`` header that URL is ever pasted into, and this one moves an
+    account. In a body it is a field of a request that is not otherwise logged at
+    all.
+
+    No ``email``, no session, no account name: the code *is* the whole of the
+    authorisation, so a second field would be a second thing to check and a second
+    thing to get wrong. There is no endpoint anywhere in this API that reports what
+    a code is for - a client that has lost one asks for another.
+    """
+
+    token: str = Field(repr=False, examples=["the code from the confirmation email"])
 
 
 # --- moving money -----------------------------------------------------------

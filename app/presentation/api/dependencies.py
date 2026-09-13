@@ -34,21 +34,27 @@ comes back as ``InvalidSessionError`` through the same handler as every other
 domain refusal. Both are 401s, and the ``error`` field tells the two apart: "you
 sent nothing" against "what you sent was not good enough".
 
-**Two of the dependencies below are not built for an actor at all**, and they are
-the newest, so they are worth flagging on the way in. ``payment_provider``
-answers a question about the *installation* - can this deployment take money -
-and ``settler_service`` builds the one money use case that has no actor to be
-given, because a provider reporting a movement is not a person. Everything else
-here is "the services built for them"; those two are what is left when "them"
-does not exist. Their docstrings carry the arguments.
+**Three of the dependencies below are not built for an actor at all**, and they
+are the most recently added, so they are worth flagging on the way in.
+``payment_provider`` answers a question about the *installation* - can this
+deployment take money - and ``settler_service`` builds the one money use case that
+has no actor to be given, because a provider reporting a movement is not a person.
+``confirm_email_change_service`` is the third and the only one whose absence is
+about *proof* rather than about there being nobody to name: an address change is
+answered by a token mailed to the address being moved to, which is a better
+warrant than the session that asked for it. Everything else here is "the services
+built for them"; those three are what is left when "them" is the wrong question.
+Their docstrings carry the arguments.
 """
 
 from datetime import datetime
 
 from fastapi import Depends, Request
 
+from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
+from app.application.identity.request_email_change import RequestEmailChange
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.payments.initiate_deposit import InitiateDeposit
@@ -56,10 +62,12 @@ from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
+    build_confirm_email_change,
     build_initiate_deposit,
     build_log_in,
     build_log_out,
     build_plan_service,
+    build_request_email_change,
     build_resolve_actor,
     build_settler,
     build_sign_up,
@@ -226,6 +234,61 @@ def log_out_service(request: Request) -> LogOut:
     """
     return build_log_out(
         unit_of_work_factory=request.app.state.unit_of_work_factory,
+    )
+
+
+def request_email_change_service(
+    request: Request, actor: User = Depends(current_actor)
+) -> RequestEmailChange:
+    """Asking to move *this* account's address, which is why it acts as somebody.
+
+    An actor here and none on the confirm below, and the pair is the whole of how
+    this feature is authorised. Asking is a change to an account, so it is done
+    *by* that account: the caller is resolved from a token, the password in the
+    body is checked against that account's credential, and neither can stand in
+    for the other. Answering is proved by something else entirely, so it has no
+    actor at all - see ``confirm_email_change_service``.
+
+    ``settings`` is the mail settings, and this is the first identity dependency
+    that needs them: the builder turns them into a channel, or into ``None`` when
+    the installation has no mail account. That ``None`` is not a failure here - it
+    is what makes the change apply immediately, which is the fallback a fresh
+    install depends on. Nothing in this module branches on it; the use case does,
+    because it is the only code that knows what to do instead.
+    """
+    return build_request_email_change(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        password_hasher=request.app.state.password_hasher,
+        settings=request.app.state.settings,
+        actor=actor.user_id,
+    )
+
+
+def confirm_email_change_service(request: Request) -> ConfirmEmailChange:
+    """Answering a change, which has no actor and therefore no ``current_actor``.
+
+    **The second service in this module built without one**, after
+    ``settler_service``, and the two absences are different in kind. That one
+    cannot be told who is acting because a provider reporting a movement is not a
+    person. This one *could* be told - there is a live session in the world that
+    asked for the change - and is deliberately not, because the token is a better
+    proof than the session is. It was mailed to the address being moved to, and it
+    was minted only after somebody proved the account's password, so requiring a
+    session on top would add a way for the person who asked to be refused without
+    adding a check. See ``ConfirmEmailChange``, which argues this at length.
+
+    That makes it the API's second unauthenticated write, and the reason it is not
+    a hole is worth stating where the missing dependency is visible: what it can
+    write is one account's address, and the only way to reach the write is to
+    present a value this system posted to that address.
+
+    ``settings`` for the notice to the address being left behind - the same mail
+    settings everything else uses, so an installation has one SMTP account rather
+    than one per kind of message.
+    """
+    return build_confirm_email_change(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.settings,
     )
 
 

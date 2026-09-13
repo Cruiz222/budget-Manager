@@ -4,11 +4,12 @@ import uuid
 from datetime import datetime
 
 from app.application.unit_of_work import UnitOfWorkFactory
+from app.domain.identity.emailAddress import refuse_unusable_email
 from app.domain.identity.exception import DuplicateEmailError
 from app.domain.identity.password import PlainPassword
 from app.domain.identity.password_credential import PasswordCredential
 from app.domain.identity.password_hasher import PasswordHasher
-from app.domain.identity.user import User
+from app.domain.identity.user import User, checked_email
 
 
 class SignUp:
@@ -35,6 +36,23 @@ class SignUp:
     hole: they are how you come to have credentials. It is also why rate limiting
     is a real item in 2c and not a nicety - an unauthenticated write that runs
     argon2 and grows a table is a thing that can be done to you in bulk.
+
+    **There are two rules about an address here, and they are different rules
+    from different places.** The *shape* rule - fold it, it must not be empty, it
+    must contain an ``@`` - is the aggregate's own, and it is applied by calling
+    ``checked_email``, the same function ``User.__post_init__`` calls, so there is
+    still exactly one definition of it. The *usability* rule - the domain must
+    have a dot in it - is a policy about **minting** an address, and ``User``
+    deliberately does not hold it: that class refuses nothing on load, because a
+    rule enforced at construction would make every account already stranded at an
+    unusable address unreadable rather than rescuable. See
+    ``app.domain.identity.emailAddress`` for the whole of that argument, and
+    ``User.change_email`` for the other minting site.
+
+    So this is the one place a fresh address enters the system, and the check
+    that it can be *billed to* belongs here, at the door, which is what "refused
+    at entry point" means. A sign-up that got past it would create an account
+    whose first deposit is refused by a payment provider.
     """
 
     def __init__(
@@ -50,11 +68,26 @@ class SignUp:
         as ``User`` is defined to be. The caller gets an account it can now log
         in to, and nothing it could mistake for being logged in already.
 
-        **The address is validated by ``User`` and the password by
-        ``PlainPassword``, and neither check is repeated here.** Both aggregates
-        are what decide their own shape, and this method's job is only to hand
-        them the raw values and store what they accept - so there is one rule per
-        value, in the place a later reader would look for it.
+        **The address is checked twice by two rules and the password once by
+        ``PlainPassword``.** The shape rule is applied here by calling the
+        aggregate's own ``checked_email`` rather than by letting the constructor
+        below make the same test a few lines later, and that is an ordering
+        decision rather than a duplication: shape has to be settled *before*
+        usability, or ``not-an-address`` would be refused as unusable - a
+        sentence about the domain rule - when what is wrong with it is that it is
+        not an address at all. The two errors name different things and send the
+        reader to different files, so the order they can be reached in is
+        load-bearing.
+
+        **Usability is checked before the duplicate lookup, and both reasons
+        point the same way.** The first is what the person can act on: an address
+        that is already taken and *also* unusable would be reported as taken,
+        which invites somebody to log in to an account no provider will bill -
+        true, and useless. The second is that usability is a property of the
+        string that was typed and the duplicate answer is a property of the
+        store, so asking the cheap local question first means an unauthenticated
+        caller learns nothing about which addresses are registered until they
+        have named one that could be.
 
         ``now`` is passed in rather than read, following
         ``Session.issue``/``is_expired``: a caller that wants to test what an
@@ -63,6 +96,13 @@ class SignUp:
         """
         uow = self._unit_of_work_factory.start()
         try:
+            # Folded once, here, and the folded value is what everything below
+            # uses - so the duplicate lookup and the row that is written are
+            # comparing and holding the same string. ``User`` applies the same
+            # function again on construction, which is idempotent by design.
+            email = checked_email(email)
+            refuse_unusable_email(email)
+
             if uow.users.find_by_email(email) is not None:
                 raise DuplicateEmailError(f"{email} is already registered")
 

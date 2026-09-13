@@ -6,7 +6,9 @@ knew about plan ids or attempt counts would have an opinion about *what* it is
 delivering, when its whole job is to put bytes on a wire.
 
 Both message aggregates happen to have those three fields, so this is the shape
-of the seam between them and the outside world, written down once.
+of the seam between them and the outside world, written down once. (A third class,
+``EmailChangeMail``, was written against this Protocol later and is neither an
+aggregate nor stored - see the note at the end of this docstring.)
 
 **A Protocol, and this is the one place in the codebase where that is the right
 tool.** Everywhere else the domain defines an interface with an ABC and the
@@ -29,8 +31,17 @@ changing it.
 
 The cost is worth naming, because it is real: a typo'd attribute name is not
 caught until the send, where an ABC would have caught it at import. The
-compensating control is that only two classes are ever passed to a channel, and
-both are tested against the real adapter's field usage.
+compensating control is that only three classes are ever passed to a channel, and
+all three are tested against the real adapter's field usage.
+
+**The third one is the case this docstring predicted**, and it is worth naming
+because it is not an aggregate at all: ``EmailChangeMail`` is a composed value with
+three plain string fields, built by a pure function and handed straight to a
+channel. It is neither stored nor queued - a verification message carries a
+credential that expires in fifteen minutes, so it has to arrive now. Under an ABC
+that class would have had to inherit from a message family it has nothing else in
+common with, which is exactly the invented relationship this Protocol exists to
+avoid. Given the shape rather than the family, it simply qualifies.
 """
 
 from typing import Protocol

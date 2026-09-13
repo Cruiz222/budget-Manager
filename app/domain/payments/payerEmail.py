@@ -33,8 +33,23 @@ while the same call with ``live@example.com`` returned a checkout URL. That pair
 the whole of the evidence, which is why this refuses a missing dot rather than
 attempting anything cleverer - a dot is no guarantee a provider will accept, and
 that is precisely why this is not the guard.
+
+**The predicate itself lives in ``app.domain.identity.emailAddress``**, and this
+module delegates to it rather than restating it. The rule turned out to have a
+second and third reading: the same narrow test is a *guard* at the two places this
+system mints an address (``SignUp`` and the email-change request), where guessing
+wrong costs a retry rather than a deposit - which is why the entry rule and this
+courtesy are one rule read two ways rather than two rules that happen to agree. Two
+implementations would be two chances to disagree, and the disagreement would surface
+as an account registration refuses to create and this check happily tries to bill.
+
+The direction of the import is worth a word, since it crosses packages: what an
+address *is* belongs to the aggregate that holds one, and payments borrows the
+question rather than owning it. Nothing in ``identity`` imports ``payments``, so
+there is no cycle to manage.
 """
 
+from app.domain.identity.emailAddress import has_real_domain
 from app.domain.payments.exception import PayerEmailRefusedError
 
 
@@ -45,9 +60,14 @@ def refuse_unusable_payer_email(email: str) -> None:
     shape one package over: a caller that has to *check* a return value can forget
     to, and the refusal is the whole of the contract. Called by
     ``InitiateDeposit._prepare``, before anything leaves the process.
+
+    Its own error class rather than ``UnusableEmailError``, and the split is the two
+    readings of one rule: this one is a refusal about a *provider*, so it says so,
+    and the sentence names what the provider needs. A caller that catches this is
+    catching a fact about payments; a caller that catches the other is catching a
+    fact about the address an account may be created at.
     """
-    _, at, domain = email.rpartition("@")
-    if at and "." in domain:
+    if has_real_domain(email):
         return
 
     raise PayerEmailRefusedError(

@@ -27,6 +27,50 @@ def fold_email(email: str) -> str:
     return email.strip().lower()
 
 
+def checked_email(email: str) -> str:
+    """The address a ``User`` will hold, from the address it was handed.
+
+    The whole of the aggregate's own email rule - a string, folded, non-empty, an
+    ``@`` present - in one function, because it has two callers now and they must
+    not drift: ``User.__post_init__``, which checks an address on the way in (and
+    on the way *back* in, since every repository constructs a ``User`` from its
+    row), and ``User.change_email``, which checks one being moved to.
+
+    Extracted rather than written a second time in the method, and that is
+    ``fold_email``'s argument one step further out: the fold itself was already
+    shared, but the three rules *around* it were not, so a ``change_email`` that
+    re-implemented them could enforce a different emptiness test than construction
+    does. The failure would be an address this system will store but will not move
+    to - or, worse, one it will move to and then refuse to load.
+
+    Returns the folded value rather than checking in place, so a caller has no way
+    to hold a checked-but-unfolded address. A function that checked and returned
+    nothing would leave the fold to be remembered separately at each call site,
+    which is the arrangement this exists to end.
+    """
+    if not isinstance(email, str):
+        raise InvalidUserEmailError("invalid user email")
+
+    # Folded before the emptiness test rather than after, so a whitespace-only
+    # address is refused as empty instead of being stored as whitespace - which
+    # would be a user nobody could ever log in as.
+    folded = fold_email(email)
+
+    if not folded:
+        raise InvalidUserEmailError("email must not be empty")
+
+    if "@" not in folded:
+        # The whole of the validation, and deliberately so. A complete
+        # address grammar belongs at the boundary where an address is
+        # *verified* - a confirmation mail either arrives or it does not, and
+        # no regex changes that. What this refuses is the value that is
+        # obviously not an address at all, because catching it here keeps a
+        # typo out of the table rather than out of the login form.
+        raise InvalidUserEmailError("email must contain '@'")
+
+    return folded
+
+
 @dataclass
 class User:
     """Who a wallet belongs to.
@@ -50,8 +94,9 @@ class User:
     The consequence worth stating: **``User`` is not frozen.** Folding in
     ``__post_init__`` requires assignment, so this is a mutable dataclass like
     ``Wallet`` and ``SavingsPlan`` rather than a frozen one. Nothing else mutates
-    it, and a future ``change_email`` belongs as a method with its checks
-    alongside, not as free assignment.
+    it, and the one address move in the system is ``change_email`` below - a method
+    with its checks alongside, rather than free assignment, which is what this
+    paragraph asked for before there was a method to put them in.
 
     What is deliberately *not* here: an ``owns(wallet)`` method. Ownership is
     answered by the store - a scoped read either returns the wallet or reports it
@@ -68,25 +113,7 @@ class User:
         if not isinstance(self.user_id, uuid.UUID):
             raise InvalidUserIDError("invalid user id")
 
-        if not isinstance(self.email, str):
-            raise InvalidUserEmailError("invalid user email")
-
-        # Folded before the emptiness test rather than after, so a
-        # whitespace-only address is refused as empty instead of being stored as
-        # whitespace - which would be a user nobody could ever log in as.
-        self.email = fold_email(self.email)
-
-        if not self.email:
-            raise InvalidUserEmailError("email must not be empty")
-
-        if "@" not in self.email:
-            # The whole of the validation, and deliberately so. A complete
-            # address grammar belongs at the boundary where an address is
-            # *verified* - a confirmation mail either arrives or it does not, and
-            # no regex changes that. What this refuses is the value that is
-            # obviously not an address at all, because catching it here keeps a
-            # typo out of the table rather than out of the login form.
-            raise InvalidUserEmailError("email must contain '@'")
+        self.email = checked_email(self.email)
 
         if self.google_subject is not None:
             if not isinstance(self.google_subject, str):
@@ -115,3 +142,30 @@ class User:
         # true; this is the fifth.
         if not isinstance(self.created_at, datetime):
             raise InvalidUserCreatedAtError("invalid created at")
+
+    def change_email(self, email: str) -> None:
+        """Move this account to ``email``, after the aggregate's own check.
+
+        **The check lives here, beside the assignment, rather than at the use case
+        that calls this** - which is what this class's docstring asked for before
+        there was a method to put it in. A ``User`` that anything could assign an
+        address to is a ``User`` whose invariant holds only wherever somebody
+        remembered to re-check it, and the write path is exactly where nobody
+        remembers: ``users.save`` writes whatever the aggregate holds.
+
+        The checked value is assigned in one expression, so a refusal cannot leave
+        this account holding the address it just refused. That is not a theoretical
+        ordering worry - a half-applied change is a person locked out of an address
+        nobody was ever told about, since their next login would use the old one.
+
+        What is deliberately **not** checked here is whether the address is
+        *usable* (``refuse_unusable_email``'s rule). Construction has to accept
+        what is already on disk - the repository builds a ``User`` from its row -
+        so a rule enforced there would make every account registered before it
+        existed unreadable rather than merely stranded. A change must accept exactly
+        what construction does, or the two would disagree about what a ``User`` may
+        hold. Usability is a policy about *minting* an address, so it belongs to the
+        two operations that mint one: ``SignUp`` and the change request. See
+        ``app.domain.identity.emailAddress``.
+        """
+        self.email = checked_email(email)

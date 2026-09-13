@@ -66,9 +66,21 @@ def hash_session_token(token: str) -> str:
     cannot occur. Salting would only make the lookup key unpredictable, which
     defeats the point of using it as the index.
 
-    Exactly two callers - ``LogIn`` to store, ``ResolveActorFromSession`` to look
-    up - which is ``fold_email``'s arrangement: one rule, two callers, no way for
-    the two to drift into disagreeing about what a token hashes to.
+    **Three callers, and the third is the reason this is a rule rather than a
+    convenience.** ``LogIn`` to store a session, ``ResolveActorFromSession`` to look
+    one up, and ``EmailChange.issue`` / ``ConfirmEmailChange`` for the token mailed
+    to a new address - one hashes at issue, the other hashes at presentation. That
+    is ``fold_email``'s arrangement, and it is worth restating in its own terms
+    rather than as "the same as before, plus one": what is shared is **a 256-bit
+    token, hashed at rest**, and where it was first needed is not what it is about.
+    A second copy of the discipline for the mailed token would be a second chance to
+    get it wrong in the one place an error moves an account rather than spending a
+    session - and the failure would not be a wrong answer, it would be a stored
+    credential.
+
+    The name still says "session", which the third caller makes a little stale. It
+    stays because a rename would touch seventy-eight call sites for a word, and this
+    docstring is where the load-bearing part is written down.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 

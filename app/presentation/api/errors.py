@@ -51,7 +51,11 @@ from fastapi.responses import JSONResponse
 
 from app.domain.identity.exception import (
     DuplicateEmailError,
+    EmailChangeAlreadyUsedError,
+    EmailChangeExpiredError,
+    EmailUnchangedError,
     InvalidCredentialsError,
+    InvalidEmailChangeTokenError,
     InvalidSessionError,
     UserNotFoundError,
 )
@@ -102,7 +106,25 @@ from app.domain.payments.exception import DepositAlreadyInitiatedError
 #: header would be a formality that the error body's ``error`` field already
 #: answers more precisely. Worth naming rather than leaving for somebody to
 #: notice from a spec-compliance tool.
-UNAUTHORIZED = (InvalidSessionError, InvalidCredentialsError)
+#:
+#: ``InvalidEmailChangeTokenError`` is the newest member and the first that is
+#: neither a session nor a login. It fits the grade rather than stretching it:
+#: the request presented a credential, the credential was looked up, and it was
+#: not good enough. Which of the three ways it failed - no such code, a code that
+#: has been used, a code whose account is gone - is deliberately one class on the
+#: wire, and only the last of those is *not* in this list: an expired code is its
+#: own 409, because "ask again" is a different instruction from "present a better
+#: code" and a person who waited too long needs to be told which happened.
+#:
+#: The absent ``WWW-Authenticate`` argument above holds here too, and it is worth
+#: noticing that this is where it is most obviously right: a client cannot
+#: *satisfy* a challenge for a code it was mailed, so a header naming a scheme
+#: would be pointing at something that does not exist.
+UNAUTHORIZED = (
+    InvalidSessionError,
+    InvalidCredentialsError,
+    InvalidEmailChangeTokenError,
+)
 
 #: The resource is not there for the actor asking. One status, one body, whatever
 #: the reason - see the module docstring.
@@ -159,6 +181,23 @@ NOT_FOUND = (
 #: has already been opened under this key - and a checkout URL is single-use, so
 #: there is nothing to hand back. A duplicate key is the plainest possible
 #: statement about a resource's state, so it is a 409 like the rest.
+#:
+#: ``EmailChangeExpiredError`` and ``EmailChangeAlreadyUsedError`` are the change
+#: flow's pair, and they are deliberately *not* folded into
+#: ``InvalidEmailChangeTokenError`` even though all three refuse the same request.
+#: The two here are the same shape as the confirmation pair above - the request is
+#: exactly what was presented, the row is there, and its own state is what refuses
+#: it - and the split is the same split for the same reason: *ask again*, against
+#: *ask again, and answer it sooner*. The third is a 401 because it is about the
+#: credential rather than about the row, which is the line this whole module is
+#: drawn along.
+#:
+#: ``EmailUnchangedError`` is the member that fits least obviously, and it earns
+#: its place the same way ``DuplicateEmailError`` did. Nothing is malformed: the
+#: address is real, usable, and the caller's own. What refuses the request is that
+#: the account is already in the state it is asking for - so the honest answer is
+#: "not from where you are standing" rather than a 400 blaming a value that is
+#: fine, and definitely not a 200 reporting a change that did not happen.
 CONFLICT = (
     InsufficientFundsError,
     WalletFrozenError,
@@ -180,6 +219,9 @@ CONFLICT = (
     ConfirmationExpiredError,
     ConfirmationAlreadyUsedError,
     DepositAlreadyInitiatedError,
+    EmailUnchangedError,
+    EmailChangeExpiredError,
+    EmailChangeAlreadyUsedError,
 )
 
 
@@ -295,7 +337,16 @@ class PaymentsUnconfiguredError(ApiError):
 
 
 def _grade(exc: MoneyError) -> int:
-    """The status for a domain refusal, by kind rather than by name."""
+    """The status for a domain refusal, by kind rather than by name.
+
+    The fall-through is the 400, and ``UnusableEmailError`` is the member that
+    most needs saying so rather than being left to be discovered: it is refused
+    because of the *value that was typed* - an address with no domain - and not
+    because of anything the store holds. That is the definition of this module's
+    400, and it is the same grade ``InvalidUserEmailError`` gets beside it, which
+    is the pair that has to agree: a person told "that is not an address" and a
+    person told "that address cannot work" are being told the same kind of thing.
+    """
     if isinstance(exc, UNAUTHORIZED):
         return 401
     if isinstance(exc, NOT_FOUND):

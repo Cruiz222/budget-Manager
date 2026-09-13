@@ -546,9 +546,16 @@ class TestThePayerAddressTheProviderWouldRefuse:
         Not ``localhost`` in particular - the rule is the missing dot, because one
         refused address and one accepted one differing by exactly that is the
         whole of the evidence anybody has. It is the same address the register
-        endpoint happily created, which is the half of this that is uncomfortable:
-        the account exists, it can hold a wallet, and no provider will ever bill
-        it.
+        endpoint used to create, which was the uncomfortable half: the account
+        existed, it could hold a wallet, and no provider would ever bill it.
+
+        **That half is closed, and it is why this test seeds rather than
+        registers.** ``SignUp`` refuses the address now, so the account this
+        refusal catches can only be one written before the rule - which is what
+        ``build_user`` produces here, a row constructed in memory and stored
+        directly. The refusal did not become unreachable when the entry rule
+        landed; it became what it always should have been, a second line for the
+        accounts already stranded rather than the only line for new ones.
         """
         wallet = build_wallet()
         provider = build_payment_provider()

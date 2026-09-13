@@ -117,6 +117,13 @@ TEST_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 #: these for a person - and adds the one it lacked. It is not a guess either:
 #: ``live@example.com`` was accepted by Paystack in the very live run that refused
 #: ``live@localhost``, so the value is one there is evidence for.
+#:
+#: **And what was a convention here is now a rule.** When this constant moved, the
+#: domain was a choice the suite made to keep its deposits honest - nothing stopped
+#: a test registering at ``localhost`` anyway, and several did. ``SignUp`` refuses
+#: an address with no real domain now, so a fixture that moved back would not be
+#: making a poor choice; it would be refused. The paragraph above is history and the
+#: rule is what makes it stick.
 TEST_USER_EMAIL = "test@example.com"
 
 #: The password :data:`TEST_USER_EMAIL` is registered with, where a test needs one.
@@ -348,6 +355,37 @@ class FakeChannel(NotificationChannel):
         if self._failures:
             raise self._failures.pop(0)
         self.sent.append(message)
+
+
+def code_in(message) -> str:
+    """The code out of a verification message, the way a person would read it.
+
+    **Here rather than in one of the three test modules that need it**, and the
+    placement is the argument: the *text* belongs to
+    ``emailChangeMessage.verification_message``, the envelope belongs to
+    ``FakeChannel`` just above, and what is left - four lines that find the line
+    under a label - is neither module's to own. Three copies of it would be three
+    things to change when the message changes, and the two that nobody thought
+    about would fail with an ``IndexError`` in a test about something else.
+
+    Recovered from the text rather than from a returned value, and that is the
+    point rather than an inconvenience: ``RequestEmailChange`` deliberately returns
+    no token - it is not in the outcome, not in the response, not in a log - so the
+    mailbox is the only place one exists. A test that wants to answer a request is
+    under the same constraint the person is: it has to be holding the envelope.
+
+    Found by its *label* rather than by matching the token alphabet, which would be
+    ambiguous. ``budget-manager`` appears two lines below the code and is spelled
+    entirely in characters a urlsafe token may contain, so "the longest
+    token-looking run in the body" would sometimes return the wrong line.
+    """
+    lines = message.body.splitlines()
+    label = next(
+        index
+        for index, line in enumerate(lines)
+        if "present this code to confirm it" in line
+    )
+    return lines[label + 2].strip()
 
 
 @pytest.fixture

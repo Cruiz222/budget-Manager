@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
 from app.domain.repositories.confirmation_repository import ConfirmationRepository
+from app.domain.repositories.email_change_repository import EmailChangeRepository
 from app.domain.repositories.notification_repository import NotificationRepository
 from app.domain.repositories.outbound_message_repository import (
     OutboundMessageRepository,
@@ -101,6 +102,27 @@ class UnitOfWork(ABC):
     #: one outside the money's transaction decides nothing. It is here for the
     #: write, and the write is the spend. See ``ConfirmationRepository.claim``.
     confirmations: ConfirmationRepository
+    #: Correctness, not convenience, and the fourth member of that small group
+    #: after ``wallets``/``transactions``/``plan_runs``, ``notifications`` and
+    #: ``confirmations``.
+    #:
+    #: Confirming an address change makes two things true at once: the mailed token
+    #: was spent, and the account holds a different address. Those must land
+    #: together, and a crash between them is worse than either alone - a token that
+    #: still works after it has been used, or an account moved to an address whose
+    #: request still reads ``AWAITING`` so the same token can be presented a second
+    #: time. The pairing is what makes "this request was spent" imply "and this is
+    #: the address it bought".
+    #:
+    #: The request half is written by a *different* repository from the account
+    #: half - ``email_changes`` here and ``users`` above - which is the reason this
+    #: declaration exists at all rather than being left to the use case to
+    #: remember. A use case that opened two units would commit the spend and the
+    #: move separately, and nothing about either write would look wrong.
+    #:
+    #: See ``EmailChangeRepository.claim_by_token_hash`` for the statement that
+    #: spends one.
+    email_changes: EmailChangeRepository
 
     @abstractmethod
     def commit(self) -> None:

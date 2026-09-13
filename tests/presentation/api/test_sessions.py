@@ -78,10 +78,35 @@ class TestRegistering:
         assert "google_subject" not in body
 
     def test_the_address_is_folded(self, client):
-        response = register(client, email="  Alice@LocalHost  ")
+        """Whitespace and case both go, and the expectation is written from the input.
+
+        **The expected value is spelled out rather than written as ``ALICE``**, and
+        that is a correction rather than a style choice. It read ``== ALICE`` until
+        that constant moved off ``@localhost`` (decision 160) and this test failed
+        for a reason that had nothing to do with folding: it was asserting that the
+        fold of ``"  Alice@LocalHost  "`` equals whatever ``ALICE`` happens to be,
+        which is true only for as long as the two agree. A test about a
+        transformation has to state the transformation's result; a constant that
+        stands in for it is that result only by coincidence, and the coincidence
+        ends the next time somebody edits a fixture.
+
+        It is the same class of coupling decision 160 is about, one layer down: the
+        suite agreeing with something other than the thing under test.
+
+        **The address it folds moved to ``example.com`` when the entry rule
+        landed, and that is worth a sentence rather than being left to look like
+        tidying.** A test about folding has to *register* the thing it folds, so
+        it is bound by whatever registration accepts - and registration no longer
+        accepts an address with no domain in it. Left at ``@localhost`` this test
+        would fail at the 400 and report itself as a folding bug, which is the
+        same misdirection the paragraph above is about: the fixture, not the
+        subject. The fold is unchanged by this; only the address it is measured
+        on had to become one the system would mint.
+        """
+        response = register(client, email="  Alice@Example.COM  ")
 
         assert response.status_code == 201
-        assert response.json()["email"] == ALICE
+        assert response.json()["email"] == "alice@example.com"
 
     def test_a_second_account_at_the_same_address_is_a_409(self, client):
         """And it is the one refusal that *does* confirm an account exists.
@@ -102,9 +127,9 @@ class TestRegistering:
         Without it this would reach the database and come back as an unhandled
         ``IntegrityError`` - a 500 for a mistake the user made.
         """
-        register(client, email="alice@localhost")
+        register(client, email="alice@example.com")
 
-        response = register(client, email="ALICE@Localhost")
+        response = register(client, email="ALICE@Example.COM")
 
         assert response.status_code == 409
 
@@ -244,6 +269,17 @@ class TestSigningIn:
         assert response.json()["error"] == "InvalidCredentialsError"
 
     def test_an_unknown_address_is_a_401(self, client):
+        """``nobody@localhost`` stays, and it is the sign-in half of the entry rule.
+
+        Every address that gets *registered* in this suite moved to a real domain
+        when the entry rule landed, because registration mints an address and the
+        rule governs minting. This one is not registered - it is an address with
+        nothing behind it, offered to the login form - and it stays exactly as it
+        was, which is the assertion: **the rule is an entry rule, not a lookup
+        rule.** Had it been folded into ``find_by_email``, this test would have
+        started answering 400 where it now answers 401, and that difference is the
+        whole of the design.
+        """
         response = sign_in(client, email="nobody@localhost")
 
         assert response.status_code == 401

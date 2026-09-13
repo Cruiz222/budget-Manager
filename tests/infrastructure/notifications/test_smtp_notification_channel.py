@@ -1,8 +1,14 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 import pytest
 
+from app.domain.identity.emailChange import EmailChange
+from app.domain.identity.emailChangeMessage import (
+    address_changed_notice,
+    verification_message,
+)
+from app.domain.identity.emailChangeStatus import EmailChangeStatus
 from app.domain.notifications.outboundMessage import OutboundMessage
 from app.infrastructure.notifications import smtp_notification_channel
 from app.infrastructure.notifications.smtp_notification_channel import (
@@ -190,3 +196,98 @@ class TestWhenItFails:
             build_channel().send(build_message())
 
         assert smtp.instances[0].closed is True
+
+
+class TestTheThirdDeliverableShape:
+    """A *composed* message through the same adapter, which is the control this file owes.
+
+    ``Deliverable`` is a ``Protocol`` and deliberately not an ABC, so nothing at all
+    enforces its three attributes - a channel that reached for a fourth would not
+    fail at import, or at the point the class was written, but the first time the
+    second *kind* of message was sent. ``deliverable.py`` names a test as the
+    compensating control for that choice, and this class is it.
+
+    What is being checked is not the wording of either message - ``compose``'s
+    output is pinned beside it and ``EmailChangeMail``'s own module is where its
+    text is argued. It is that the adapter, driven by a message that is not an
+    aggregate at all, produces an envelope: the first two ``Deliverable`` classes
+    are aggregates that happen to have these fields, and this one is a frozen value
+    that has nothing else. If the port's contract really is three attributes, the
+    two cases must be indistinguishable from in here.
+    """
+
+    def test_a_composed_message_goes_through_the_same_adapter(self, smtp):
+        change, token = EmailChange.issue(
+            user_id=uuid4(), new_email="ada.new@example.com", now=NOON
+        )
+
+        build_channel().send(verification_message(change, token))
+
+        message = smtp.instances[0].message
+        assert message["From"] == "me@example.com"
+        assert message["To"] == "ada.new@example.com"
+        assert message["Subject"] == "Confirm your new email address"
+        # The credential really is in the body, which is the one thing about this
+        # message that is not text: a composed message that reached the adapter
+        # without its token would be a request nobody could answer.
+        assert token in message.get_content()
+        assert smtp.instances[0].closed is True
+
+    def test_the_notice_goes_to_the_address_being_left(self, smtp):
+        """The second message, and the direction is the whole of its purpose.
+
+        Sent to the address the account is *leaving*, so the recipient a channel
+        reads comes from the composed message rather than from the account - which
+        is precisely the sort of thing a channel reaching for the wrong attribute
+        would get wrong, and the reason both builders are driven through here.
+
+        **The change is built settled rather than issued**, and that is the
+        dependency this message has that the verification one does not: the notice
+        prints the moment the change was answered, so it reads ``settled_at`` off
+        the aggregate. A row only ever holds that field set once the claim's
+        ``UPDATE`` has written it - ``EmailChange`` refuses a ``CONFIRMED`` row
+        without one - so a notice is only ever composed for a change that a claim
+        produced. Composing one from an issued request is not a state a caller can
+        reach, and the field is the reason rather than an incidental detail of the
+        text.
+        """
+        answered_at = NOON + timedelta(minutes=1)
+        change = EmailChange(
+            email_change_id=uuid4(),
+            user_id=uuid4(),
+            new_email="ada.new@example.com",
+            token_hash="a hash, never read by this builder",
+            status=EmailChangeStatus.CONFIRMED,
+            requested_at=NOON,
+            expires_at=NOON + timedelta(minutes=15),
+            settled_at=answered_at,
+        )
+
+        build_channel().send(address_changed_notice(change, "ada@example.com"))
+
+        message = smtp.instances[0].message
+        assert message["To"] == "ada@example.com"
+        assert "ada.new@example.com" in message.get_content()
+        assert answered_at.isoformat(timespec="minutes") in message.get_content()
+
+    def test_the_protocol_is_three_attributes_and_this_is_what_that_means(self, smtp):
+        """**The absence, asserted, because the absence is the claim.**
+
+        ``EmailChangeMail`` has no ``plan_id``, no ``due_at`` and no ``created_at``
+        - an ``OutboundMessage`` is a queued row with a due date and this is a value
+        that is sent the moment it is composed. A channel that had grown a
+        dependency on any of the three would work for every test above this class
+        and fail here, which is exactly the failure this file is meant to catch.
+        """
+        change, token = EmailChange.issue(
+            user_id=uuid4(), new_email="ada.new@example.com", now=NOON
+        )
+        mail = verification_message(change, token)
+
+        assert not hasattr(mail, "plan_id")
+        assert not hasattr(mail, "due_at")
+        assert not hasattr(mail, "created_at")
+
+        build_channel().send(mail)
+
+        assert smtp.instances[0].message["To"] == "ada.new@example.com"

@@ -32,7 +32,17 @@ from tests.conftest import session_path_for
 #: given.
 PASSWORD = "a-long-enough-passphrase"
 
-ADDRESS = "cli@localhost"
+#: The address every test in this file signs up and signs in as.
+#:
+#: The domain is ``example.com`` and not ``localhost``, and it moved when the entry
+#: rule landed: ``signup`` mints an address, so it is bound by the rule that an
+#: address must have a real domain. Every test below that used to be spelled
+#: ``cli@localhost`` is spelled this way now, and the ones that fail loudly if it
+#: moves back are the twelve that assert on this constant's value.
+#:
+#: ``example.com`` rather than a real domain for the reason ``TEST_USER_EMAIL``
+#: gives: nobody can mistake a reserved domain for a person.
+ADDRESS = "cli@example.com"
 
 
 @pytest.fixture
@@ -119,13 +129,13 @@ class TestSigningUp:
 
     def test_the_address_is_folded(self, db, session, typed, capsys):
         """``whoami`` afterwards reports the one spelling, not what was typed."""
-        register(db, session, typed, address="  CLI@LocalHost  ")
+        register(db, session, typed, address="  CLI@Example.COM  ")
         capsys.readouterr()
 
-        sign_in(db, session, typed, address="cli@localhost")
+        sign_in(db, session, typed, address="cli@example.com")
         run(db, session, "whoami")
 
-        assert "cli@localhost" in capsys.readouterr().out
+        assert "cli@example.com" in capsys.readouterr().out
 
     def test_a_second_account_at_the_same_address_fails(self, db, session, typed, capsys):
         register(db, session, typed)
@@ -240,6 +250,20 @@ class TestSigningIn:
         Held by the domain rather than by this presentation, which is the point of
         asserting it here: the CLI does nothing to make it true, so a change that
         broke it would have to be made one layer down.
+
+        **``nobody@localhost`` stays, and it is the only address in this file the
+        entry rule left alone.** Every other one moved to a real domain because
+        ``signup`` now refuses to mint it - but this test never signs anybody up,
+        it *signs in* at an address with no account behind it. That is not the
+        same operation and not the same rule, and keeping the address is what says
+        so: an entry rule is a rule about what may be created, not about what may
+        be looked up. Folding the rule into ``find_by_email`` would have been the
+        easy mistake, and this line is the cheapest place to notice it.
+
+        It also makes the property slightly sharper than it was. This address is
+        now one the system refuses to *register* and answers identically to a
+        wrong password on login - so a stranger cannot use the difference between
+        those two refusals to learn anything about it either.
         """
         assert sign_in(db, session, typed, address="nobody@localhost") == 1
         unknown = capsys.readouterr().err
@@ -259,16 +283,16 @@ class TestSigningIn:
         Refusing it would mean two commands to do one thing, with a state in
         between where the machine is signed in as nobody.
         """
-        register(db, session, typed, address="first@localhost")
-        register(db, session, typed, address="second@localhost")
+        register(db, session, typed, address="first@example.com")
+        register(db, session, typed, address="second@example.com")
         capsys.readouterr()
-        sign_in(db, session, typed, address="first@localhost")
+        sign_in(db, session, typed, address="first@example.com")
         capsys.readouterr()
 
-        sign_in(db, session, typed, address="second@localhost")
+        sign_in(db, session, typed, address="second@example.com")
         run(db, session, "whoami")
 
-        assert "second@localhost" in capsys.readouterr().out
+        assert "second@example.com" in capsys.readouterr().out
 
 
 class TestBeingSomebody:

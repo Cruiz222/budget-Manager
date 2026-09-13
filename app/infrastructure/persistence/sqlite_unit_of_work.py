@@ -27,6 +27,9 @@ from app.infrastructure.repositories.sqlite_plan_notice_repository import (
 from app.infrastructure.repositories.sqlite_confirmation_repository import (
     SqliteConfirmationRepository,
 )
+from app.infrastructure.repositories.sqlite_email_change_repository import (
+    SqliteEmailChangeRepository,
+)
 from app.infrastructure.repositories.sqlite_notification_repository import (
     SqliteNotificationRepository,
 )
@@ -361,6 +364,68 @@ CREATE TABLE IF NOT EXISTS confirmations (
     -- lets a client's own key be handed back to them without leaking anything:
     -- the key cannot name a request on somebody else's wallet.
     UNIQUE (wallet_id, internal_reference)
+);
+
+-- A requested move of an account's address, waiting to be proven. Nothing has
+-- changed while a row here is AWAITING: the account still holds the address it
+-- held, and what is outstanding is a token mailed to the *new* address - proving
+-- somebody can read mail there before the account is moved onto it.
+--
+-- The lifecycle is ``confirmations``' and the subject is not. That table is a
+-- request to move money out and names a wallet; this one moves an identity and has
+-- no wallet anywhere in it. The shape is written out again rather than shared for
+-- the reason ``instruction.py`` gives about coupling two aggregates to
+-- deduplicate a few lines - so each copy is free to move on its own.
+--
+-- There is no migration function for this table, for the reason recorded against
+-- ``plan_notices``, ``outbound_messages``, ``users``, ``password_credentials``,
+-- ``sessions``, ``notifications`` and ``confirmations`` above: CREATE TABLE IF NOT
+-- EXISTS creates a missing table on a database already in the wild for free.
+-- Adding a table is not a migration; changing a table that is already on disk is.
+CREATE TABLE IF NOT EXISTS email_changes (
+    -- The request's own id, and the row's identity. **Not the key this table is
+    -- *about*** - see ``user_id`` below, which is the one that carries the rule.
+    email_change_id TEXT PRIMARY KEY,
+    -- **UNIQUE, and this is where "one pending change per account" lives.** One row
+    -- per user, so a second request supersedes the first rather than joining it -
+    -- and superseding is the remedy for a mistyped address, where the alternative
+    -- would be a person stuck with a token sent to an address they typed wrong. No
+    -- REFERENCES users(user_id), matching every other owner column here.
+    --
+    -- It is the UNIQUE index rather than the primary key, and the distinction is a
+    -- SQLite rule rather than a preference: a table may declare only one PRIMARY
+    -- KEY, so an id column and a per-account key cannot both be one. UNIQUE is the
+    -- whole of what the upsert needs - ``ON CONFLICT(user_id)`` targets any unique
+    -- index - and it enforces the same one-row-per-account guarantee.
+    --
+    -- That the row is keyed this way is also what lets a *spent* request stay in
+    -- the table: the last change per account survives as a small audit trail, and
+    -- its survival is what makes "this token was already used" distinguishable
+    -- from "this token never existed". See ``EmailChangeRepository``.
+    user_id         TEXT NOT NULL UNIQUE,
+    new_email       TEXT NOT NULL,   -- folded to lowercase by the aggregate
+    -- The hash, never the token, and UNIQUE for ``sessions``' reason: two requests
+    -- sharing a hash cannot realistically happen, and if it did - a broken RNG, a
+    -- row copied by hand - the store refuses it rather than letting one token
+    -- answer two changes. It is also the index the claim reads through.
+    --
+    -- Hashed at rest buys the same thing it buys for a session and no more: the
+    -- server hashes whatever arrives and looks *that* up, so a copy of this table
+    -- holds no token anybody can present. That matters more here than for a
+    -- session, because what a token in this table authorises is moving an account
+    -- rather than spending one wallet's balance.
+    token_hash      TEXT NOT NULL UNIQUE,
+    -- AWAITING or CONFIRMED. There is deliberately no stored EXPIRED: expiry is
+    -- *checked*, not swept, and a request past its window is reported as expired
+    -- from ``expires_at`` alone - so nothing has to write on a read. See
+    -- ``EmailChange.status_as_of``.
+    status          TEXT NOT NULL,
+    requested_at    TEXT NOT NULL,   -- ISO moment
+    expires_at      TEXT NOT NULL,   -- ISO moment; absolute, never extended
+    -- When the request was answered: set by the same UPDATE that sets CONFIRMED,
+    -- and NULL exactly while it is AWAITING. The pair is validated on load, so a
+    -- row whose two halves disagree fails loudly rather than being interpreted.
+    settled_at      TEXT
 );
 """
 
@@ -845,6 +910,12 @@ class SqliteUnitOfWork(UnitOfWork):
         # the ledger row it authorises must land in one transaction. See the
         # attribute's declaration on ``UnitOfWork``.
         self.confirmations = SqliteConfirmationRepository(connection)
+        # Correctness, not convenience, and written by a *different* repository
+        # from the account it moves: the spend of the mailed token and the address
+        # change it authorises must land in one transaction, or a crash between
+        # them leaves a token that still works after it has been used. See the
+        # attribute's declaration on ``UnitOfWork``.
+        self.email_changes = SqliteEmailChangeRepository(connection)
 
     def commit(self) -> None:
         self._connection.commit()

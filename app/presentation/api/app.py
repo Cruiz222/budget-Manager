@@ -33,6 +33,7 @@ from app.infrastructure.settings import from_environment, paystack_from_environm
 from app.presentation.api import errors
 from app.presentation.api.routes import (
     confirmations,
+    email_changes,
     funds,
     health,
     plans,
@@ -152,6 +153,7 @@ def create_app(
         health,
         users,
         sessions,
+        email_changes,
         wallets,
         funds,
         plans,

@@ -125,6 +125,7 @@ from decimal import Decimal, InvalidOperation
 from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
+    build_confirm_email_change,
     build_deliverer,
     build_log_in,
     build_log_out,
@@ -132,6 +133,7 @@ from app.composition_root import (
     build_notifier,
     build_plan_service,
     build_reconciler,
+    build_request_email_change,
     build_resolve_actor,
     build_scheduler,
     build_sign_up,
@@ -378,6 +380,30 @@ def _prompt_password(confirm: bool) -> str:
     return password
 
 
+def _prompt_token() -> str:
+    """Ask for the code that was mailed to a new address.
+
+    ``getpass`` for ``_prompt_password``'s reason, and the argument is stronger
+    here rather than weaker. A password is a secret its owner chose and can change;
+    this is a 256-bit value that moves an account's address, it is valid for
+    fifteen minutes, and it is the *whole* of the authorisation for the operation
+    it belongs to. ``--token abc123`` would put it in the shell's history file, in
+    ``ps`` output for the duration, and in whatever the terminal is recording - and
+    somebody who reads it out of any of those within the window can move the
+    account, with no password and no session.
+
+    Read invisibly rather than echoed, too, and that is not only about
+    over-the-shoulder reading: a terminal that echoes it has written it to
+    scrollback, which outlives the fifteen minutes.
+
+    There is no confirmation prompt, unlike ``signup``. A mistyped password at
+    sign-up creates an account nobody can open, which is why that one asks twice;
+    a mistyped code simply does not match anything and is refused with the
+    refusal that says so, and the person is holding the mail it came from.
+    """
+    return getpass.getpass("confirmation code: ")
+
+
 def _confirmed(question: str, assume_yes: bool) -> bool:
     """Ask a yes/no question at the terminal. Returns whether to go ahead.
 
@@ -528,12 +554,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # --- identity: the three commands that need no session -------------------
+    # --- identity: the commands that need no session -------------------------
     #
     # They are top-level rather than nested under a noun, because there is no
-    # noun that covers them - ``account signup`` would suggest the other two act
+    # noun that covers them - ``account signup`` would suggest the others act
     # on an account too, and logging out discards a token rather than touching
-    # one. Three verbs, no group.
+    # one. And they are *four* rather than three now, which is the first thing
+    # an address change added to this file: ``confirm-email`` is authorised by a
+    # code mailed to the address being moved to, so it needs no session and
+    # belongs here rather than beside ``change-email``.
     signup_parser = subparsers.add_parser(
         "signup",
         help="register an address, with a password to prove it later",
@@ -556,6 +585,29 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "logout", help="discard the stored token and end the session"
     )
+
+    # ``confirm-email`` belongs with the three above and not with the commands
+    # that act as somebody, which is why it is declared here rather than beside
+    # ``change-email`` below. It reads no session file at all: the code is the
+    # whole of the authorisation, and requiring a login to answer a mail would
+    # refuse exactly the person who asked on this machine and opened the mail on
+    # another. See ``_confirm_email``.
+    confirm_parser = subparsers.add_parser(
+        "confirm-email",
+        help="apply a requested address change, using the code that was mailed",
+    )
+    # No --token argument, and its absence is deliberate. See ``_prompt_token``:
+    # this one moves an account and expires in fifteen minutes, so the history
+    # file is the last place it should be.
+
+    change_parser = subparsers.add_parser(
+        "change-email",
+        help="ask to move this account's address to a new one",
+    )
+    change_parser.add_argument("email", help="the address to move to")
+    # No --password argument either, for ``signup``'s reason. The session is
+    # required as well, and the pair is the design: the token says which account,
+    # and the password says that whoever holds it still knows the secret.
 
     open_parser = subparsers.add_parser("open", help="open a new wallet")
     open_parser.add_argument(
@@ -987,6 +1039,49 @@ def _logout(args, factory) -> int:
     return 0
 
 
+def _confirm_email(args, factory, settings) -> int:
+    """Apply a requested address change, using the code that was mailed.
+
+    **This reads no session file, and that is the whole of its design.** The code
+    was mailed to the address the account is moving *to*, so presenting it proves
+    something a session does not - which is why this sits with ``signup``,
+    ``login`` and ``logout`` above rather than below the actor line, and why it
+    works on a machine where nobody has ever logged in. Somebody who asks at a
+    desk and opens the mail on a phone is the case the whole flow is arranged
+    around; requiring a login here would refuse exactly them.
+
+    It is not a privileged command, and the difference is worth stating where the
+    missing token check would otherwise look like one: the code names one account
+    and moves that one account, and it exists only because somebody already
+    presented that account's password to mint it. Nothing here decides *which*
+    account to touch - that is read off the row the code names.
+
+    **The output distinguishes the two mails**, because they fail differently and
+    only one of them is a problem. The notice to the old address is best-effort,
+    so a failure is reported as a note rather than raised; the change itself has
+    already happened by the time this prints, and saying so first is what makes the
+    note read as a footnote rather than as a failure.
+    """
+    result = build_confirm_email_change(
+        unit_of_work_factory=factory, settings=settings
+    ).execute(_prompt_token(), datetime.now())
+
+    print(f"email changed to {result.user.email} | was {result.previous_email}")
+    if result.notice_sent:
+        print(f"{result.previous_email} was told about the change")
+    elif result.notice_error is not None:
+        # Not an error and not an exit code: the account moved, and this is the
+        # courtesy that did not land. Printed in full because the reason is a
+        # connection or a mailbox rather than anything the person typed.
+        print(f"note: {result.previous_email} could not be told: {result.notice_error}")
+    else:
+        print(
+            f"note: this installation has no email configured, so "
+            f"{result.previous_email} was not told"
+        )
+    return 0
+
+
 def _current_actor(args, factory) -> User:
     """The user this invocation acts as, proved by the token at ``--session``.
 
@@ -1009,6 +1104,51 @@ def _current_actor(args, factory) -> User:
     return build_resolve_actor(unit_of_work_factory=factory).execute(
         _read_token(args.session), datetime.now()
     )
+
+
+def _change_email(args, factory, settings, actor: User, deferred_reason) -> int:
+    """Ask to move this account to a new address, proving the password again.
+
+    Below the actor line, unlike ``confirm-email`` above it, because asking is
+    something done *as* an account: the caller is resolved from the stored token
+    and the password is checked against that account's credential. Either alone
+    would be weaker than the pair - a stolen token is not enough to move an
+    account, and a password typed into a terminal that is signed in as somebody
+    else is not enough either.
+
+    **What it prints depends on which of two things happened**, and the two are
+    different enough that it must not be left to be inferred from a status word.
+    On an installation with mail, a code has gone to the new address and the change
+    has *not* happened yet - ``confirm-email`` is the next step, and the deadline
+    is printed because what the person needs is *when*, not "fifteen minutes". On
+    an installation with no mail there is nothing to confirm and the change is
+    already applied, and the command says so **and says why**, naming the missing
+    variable. That is the plan's rule arriving at a terminal: an install without
+    mail must never be *silently* less safe than one with it.
+    """
+    outcome = build_request_email_change(
+        unit_of_work_factory=factory,
+        settings=settings,
+        actor=actor.user_id,
+    ).execute(args.email, _prompt_password(confirm=False), datetime.now())
+
+    if outcome.applied:
+        print(f"email changed to {outcome.email} | was {actor.email}")
+        # ``deferred_reason`` is the same string the deliverers report, so the
+        # explanation of "no email" reads identically wherever it appears.
+        if deferred_reason is not None:
+            print(
+                f"note: the change was applied without a confirmation step - "
+                f"no email is configured ({deferred_reason})"
+            )
+        return 0
+
+    print(
+        f"confirmation code sent to {outcome.email} | "
+        f"expires {_moment(outcome.expires_at)}"
+    )
+    print("run 'confirm-email' and enter the code to complete the change")
+    return 0
 
 
 def _open(service: WalletService, args) -> int:
@@ -1950,17 +2090,23 @@ def main(argv=None) -> int:
         # Dispatched before any actor is resolved, and that ordering is the
         # design rather than an optimisation. The three identity commands cannot
         # need a session - they are how a session comes to exist, or cease to -
-        # ``plan tick`` must not, because it serves the whole installation and
-        # there is no person it could act as, and ``reconcile`` must not either,
-        # because it asks a payment provider about payments that belong to
-        # whoever made them. Resolving an actor first, as this function used to
-        # do unconditionally, would have made a scheduler that requires a login.
+        # ``confirm-email`` must not need one either, because the code it prompts
+        # for was mailed to the address being moved to and is a better warrant
+        # than the session that asked for the change, ``plan tick`` must not,
+        # because it serves the whole installation and there is no person it could
+        # act as, and ``reconcile`` must not either, because it asks a payment
+        # provider about payments that belong to whoever made them. Resolving an
+        # actor first, as this function used to do unconditionally, would have
+        # made a scheduler that requires a login - and an address change that
+        # cannot be answered from a second machine.
         if args.command == "signup":
             return _signup(args, factory)
         if args.command == "login":
             return _login(args, factory)
         if args.command == "logout":
             return _logout(args, factory)
+        if args.command == "confirm-email":
+            return _confirm_email(args, factory, settings)
         if args.command == "plan" and args.plan_command == "tick":
             return _plan_tick_command(args, factory, settings, deferred_reason)
         if args.command == "reconcile":
@@ -1980,6 +2126,10 @@ def main(argv=None) -> int:
         )
         if args.command == "whoami":
             return _whoami(args, actor)
+        if args.command == "change-email":
+            return _change_email(
+                args, factory, settings, actor, deferred_reason
+            )
         if args.command == "plan":
             return _plan_command(
                 args, factory, service, settings, deferred_reason, actor
