@@ -179,7 +179,7 @@ def a_deposit(wallet_id, reference="dep-1"):
         wallet_id=wallet_id,
         type=TransactionType.DEPOSIT,
         amount=Money(Decimal("5000"), Currency.NGN),
-        internal_reference=f"{wallet_id}:{reference}",
+        internal_reference=f"{wallet_id}.{reference}",
         provider_reference=reference,
         created_at=datetime.fromisoformat(EARLIER),
     )

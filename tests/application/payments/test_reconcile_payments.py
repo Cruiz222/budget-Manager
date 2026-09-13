@@ -150,7 +150,7 @@ def a_deposit(wallet, amount="5000", reference="dep-1", created_at=EARLIER):
         wallet_id=wallet.wallet_id,
         type=TransactionType.DEPOSIT,
         amount=Money(Decimal(amount), NGN),
-        internal_reference=f"{wallet.wallet_id}:{reference}",
+        internal_reference=f"{wallet.wallet_id}.{reference}",
         provider_reference=reference,
         created_at=created_at,
     )
@@ -169,7 +169,7 @@ def an_unsponsored_row(wallet, reference="pay-1"):
         wallet_id=wallet.wallet_id,
         type=TransactionType.WITHDRAWAL,
         amount=Money(Decimal("1000"), NGN),
-        internal_reference=f"{wallet.wallet_id}:{reference}",
+        internal_reference=f"{wallet.wallet_id}.{reference}",
         created_at=EARLIER,
     )
 

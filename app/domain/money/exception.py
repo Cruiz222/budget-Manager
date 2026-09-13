@@ -204,3 +204,27 @@ class ConfirmationExpiredError(MoneyError):
     pass
 class ConfirmationAlreadyUsedError(MoneyError):
     pass
+
+# --- A key that cannot become a reference --------------------------------
+# Raised by ``app.domain.money.reference.scoped_reference``, which is the one
+# place a caller's idempotency key is turned into a ledger reference - and so the
+# one place that can refuse one.
+#
+# **Not ``InvalidInternalReference`` above**, and the difference is the whole
+# reason this name exists. That one is the ``Transaction`` aggregate checking its
+# own field: a value that is not a string, or is blank, which is a bug in this
+# codebase rather than anything a caller did. This one is a *caller's* key that
+# this system may not use, and it is refused before any row is built.
+#
+# The rule it enforces is a payment provider's, and only one of the two ends
+# cares: a reference is a ledger's name for a movement, and for a deposit it is
+# also the idempotency key handed to Paystack, which accepts letters, digits and
+# ``- . , =`` and answers anything else with a bare 400. That answer arrives
+# reading as though this system were broken, which is why the refusal is made
+# here, where it can say what the allowed characters are.
+#
+# It is a 400 through ``app.presentation.api.errors`` by falling through: it is
+# neither a missing resource nor a conflict, and the plainest word for "your
+# request carried something I cannot use" is the one the fall-through carries.
+class InvalidIdempotencyKeyError(MoneyError):
+    pass

@@ -19,6 +19,23 @@ duplicate key. The friendly-looking alternative - hand back the first
 the docstring: a checkout URL is single-use, so replaying one that has been paid
 gives the client a page that will not take money.
 
+**The newest refusal is about the payer's address**, and it is the second one a
+live provider taught this codebase - in the same run that found the first. The
+address a deposit is billed under is the account's own, and this system's entire
+email rule is that it contains an ``@``, so an account registered at
+``nobody@localhost`` is perfectly legal here and unbillable at the far end. It is
+refused before the call now, and the refusal is a courtesy: the provider is still
+the authority, and the adapter raises the same error when Paystack says
+``invalid_email_address``.
+
+The refusal before that one is about the characters in the key. A supplied key is
+quoted into the reference Paystack is given as its idempotency key, and Paystack
+takes letters, digits and ``- . , =`` and nothing else - so a key holding anything
+else produced a reference the far end rejected, with an answer that read as though
+this system were broken. Nothing here noticed, because the double the suite talks
+to accepted whatever it was handed. It refuses now, and the test below is the one
+that failed the first time it did.
+
 Two things are deliberately *not* here. There is no test that a frozen wallet can
 receive a deposit: it is asserted at the domain level, and reaching it over the
 wire would mean the freeze-confirmation dance to set up a state whose only
@@ -228,6 +245,74 @@ class TestTheRefusals:
         assert response.status_code == 409
         assert response.json()["error"] == "DepositAlreadyInitiatedError"
 
+    def test_a_key_a_provider_would_refuse_is_a_400_naming_the_characters(
+        self, client, a_wallet, balance_of
+    ):
+        """**The refusal that would have caught the bug this route shipped with.**
+
+        A supplied key is quoted into the reference Paystack is handed as its own
+        idempotency key, and Paystack accepts letters, digits and ``- . , =`` and
+        nothing else. A colon in the key therefore produced a reference the far
+        end rejected - and it rejected it with a body that reads as though *this*
+        system is broken, which is how a deposit route that had never once worked
+        against the real provider stayed unexamined.
+
+        The status is the assertion that matters, and the ``detail`` is the second:
+        a client holding a key it chose itself is owed the characters that would
+        have been accepted. Note the refusal is a 400 rather than the 500 an
+        unlisted exception would give - it is graded by falling through
+        ``errors._grade``, which is what makes a refusal this new behave like every
+        refusal that came before it.
+        """
+        headers, wallet_id = a_wallet()
+
+        response = client.post(
+            deposits_url(wallet_id),
+            json={"amount": "5000.00", "ref": "invoice:7"},
+            headers=headers,
+        )
+
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "InvalidIdempotencyKeyError"
+        assert ":" in response.json()["detail"]
+        assert balance_of(wallet_id, headers) == "0.00"
+
+    def test_a_payer_address_a_provider_would_refuse_is_a_400(
+        self, client, as_user, open_wallet, balance_of
+    ):
+        """**The second thing a live run taught this route, and the cheaper one.**
+
+        ``POST /users`` accepts any string with an ``@`` in it - that is the whole
+        of this system's email rule - so ``nobody@localhost`` is a legal account
+        that can hold a wallet and be signed into. Paystack will not bill it: its
+        answer is ``invalid_email_address``, with a ``nextStep`` about passing the
+        ``email`` parameter, which reads as though this codebase forgot to send
+        one rather than as though the address is unusable.
+
+        So the address is refused here, at the only moment it matters and the only
+        moment it *can* matter - a person is trying to put money in and cannot.
+        Note it is the same 400 the key refusal gets, by the same route: an
+        unlisted ``MoneyError`` falls through ``errors._grade``, so a refusal this
+        new needs no entry there to behave like every refusal before it.
+
+        Registering at the unusable address through ``as_user`` rather than
+        picking a different one is the point of the test, not a convenience: the
+        account this refusal is about is one the API would create without
+        complaint, and that gap between what registration accepts and what a
+        provider bills is the whole finding.
+        """
+        headers = as_user("nobody@localhost")
+        wallet_id = open_wallet(headers)
+
+        response = client.post(
+            deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers
+        )
+
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "PayerEmailRefusedError"
+        assert "nobody@localhost" in response.json()["detail"]
+        assert balance_of(wallet_id, headers) == "0.00"
+
     @pytest.mark.parametrize(
         "amount", ["-5000.00", "0", "five thousand", ""], ids=repr
     )
@@ -264,6 +349,13 @@ class TestTheRefusals:
         hand rather than through ``as_user`` is forced: that fixture is bound to
         the *configured* client, and a token from one app is not a token in
         another.
+
+        ``carol@localhost`` is left as it was, and it is worth saying why rather
+        than leaving it to look like an oversight now that the address is one a
+        deposit refuses: the 503 comes from the dependency, so this request never
+        reaches the payer check at all. It would be the same test with any
+        address, and arriving at a *different* refusal here would be a bug in the
+        ordering rather than a fix to this fixture.
         """
         registered = unconfigured_client.post(
             "/users", json={"email": "carol@localhost", "password": TEST_USER_PASSWORD}

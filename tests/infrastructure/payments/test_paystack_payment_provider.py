@@ -38,6 +38,7 @@ from app.domain.money.money import Money
 from app.domain.payments.exception import (
     InvalidPaymentIntentError,
     InvalidProviderAnswerError,
+    PayerEmailRefusedError,
     PaymentProviderError,
 )
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
@@ -346,12 +347,12 @@ class TestWhenTheProviderSaysNo:
         assert "authorization_url" in str(refused.value)
 
     def test_a_refused_status_is_a_provider_error(self, provider, requesting):
-        """A 400 or a 500 from the far end, and the two are one answer here.
+        """A 500 from the far end, reported as a refusal and nothing more.
 
-        The status is in the message because it is what a human acts on; the
-        response *body* deliberately is not, because it is a third party's words
-        and may quote the request back - including the secret key, if it decides
-        to echo headers.
+        The status is in the message because it is what a human acts on. The body
+        here is an HTML error page and so carries no provider words - which is the
+        other half of the amendment above: ``_provider_words`` contributes only
+        when the provider sent the two fields it documents as its error contract.
         """
         requesting.response = httpx.Response(500, text="<html>oops</html>")
 
@@ -405,6 +406,139 @@ class TestWhenTheProviderSaysNo:
             )
 
         assert len(requesting.calls) == 1
+
+
+class TestWhatARefusalSays:
+    """A refusal carries the provider's own words, and one of them is translated.
+
+    **This class exists because of a live run**, and what it pins is the thing that
+    cost two round trips to a bare ``curl``. The original deposit bug was answered
+    with ``{"message": "Invalid character in transaction reference", "code":
+    "invalid_character_in_reference"}``, and this adapter reported only "the payment
+    provider refused the call with 400" - a sentence that sends the reader looking
+    at this system rather than at the reference, which is precisely where three
+    phases of nobody looked.
+
+    The words are carried for a human. The **code** is carried because one of them
+    is translated below, and a code is the half of Paystack's error contract that
+    is stable - so nothing here, and nothing in the adapter, matches on prose.
+    """
+
+    def test_a_refused_reference_is_reported_with_the_providers_words(
+        self, provider, requesting
+    ):
+        """The exact body the original bug produced, four phases later.
+
+        Had this test existed, that bug would have been a five-minute read instead
+        of an investigation: the provider names the problem, in the word
+        ``reference``, and the assertion below is simply that we repeat it.
+        """
+        requesting.response = httpx.Response(
+            400,
+            json={
+                "status": False,
+                "message": "Invalid character in transaction reference",
+                "code": "invalid_character_in_reference",
+            },
+        )
+
+        with pytest.raises(PaymentProviderError) as refused:
+            provider.initialize_deposit(
+                reference="ps_ref_1", amount=an_amount("5000"), email="p@example.com"
+            )
+
+        assert "400" in str(refused.value)
+        assert "Invalid character in transaction reference" in str(refused.value)
+        assert "invalid_character_in_reference" in str(refused.value)
+
+    def test_an_address_the_provider_will_not_bill_is_our_own_refusal(
+        self, provider, requesting
+    ):
+        """**Translated rather than reported**, which is what an adapter is for.
+
+        The code is what says which input the provider objected to, and this one
+        has a better answer than "the provider refused the call": the address this
+        account would be billed under is not one they will take. The client is told
+        that instead, in the same words the local courtesy check uses, so the two
+        checks are indistinguishable from outside.
+
+        Note the address below has a real domain - that is the point of the test.
+        This is the path a *legitimate-looking* address takes when the provider
+        refuses it for a reason this codebase did not anticipate, and it is why the
+        courtesy check is not the guard.
+        """
+        requesting.response = httpx.Response(
+            400,
+            json={
+                "status": False,
+                "message": "Invalid Email Address Passed",
+                "code": "invalid_email_address",
+            },
+        )
+
+        with pytest.raises(PayerEmailRefusedError) as refused:
+            provider.initialize_deposit(
+                reference="ps_ref_1",
+                amount=an_amount("5000"),
+                email="payer@example.com",
+            )
+
+        assert "payer@example.com" in str(refused.value)
+        assert "cannot be used as a payer address" in str(refused.value)
+
+    @pytest.mark.parametrize(
+        "body",
+        [["not", "an", "object"], {"code": 42, "message": 7}],
+        ids=["a-list", "an-object-of-the-wrong-types"],
+    )
+    def test_a_body_that_is_not_an_object_contributes_nothing(
+        self, provider, requesting, body
+    ):
+        """A shape nobody expected contributes no words, and must not raise.
+
+        This runs on the path that is already refusing a call, so a diagnostic that
+        can itself fail is worse than no diagnostic - which is why both readers of
+        the error contract are quiet about anything they do not recognise rather
+        than trusting it. The second case is the narrower half: an object whose
+        fields are present and of the wrong type, which a check for "is it a dict"
+        alone would wave through.
+
+        **This test found a defect rather than confirming an absence**, which is
+        worth recording because the failing line was not the one under discussion.
+        The 400 below is a status ``initialize_deposit`` asked to interpret, so it
+        arrives as a *body* rather than as a refusal, and the translation branched
+        on ``response.get("code")`` - an attribute a list does not have. A provider
+        answering a refused call with a JSON array would therefore have produced an
+        ``AttributeError`` out of a code path whose entire purpose is to report a
+        problem legibly. ``_provider_code`` is the guard, and its twin's docstring
+        claims the quietness for both.
+        """
+        requesting.response = httpx.Response(400, json=body)
+
+        with pytest.raises(PaymentProviderError) as refused:
+            provider.initialize_deposit(
+                reference="ps_ref_1", amount=an_amount("5000"), email="p@example.com"
+            )
+
+        assert str(refused.value) == "the payment provider refused the call with 400"
+
+    def test_a_lookup_refusal_carries_the_words_too(self, provider, requesting):
+        """The other method, because the sentence has one home for both.
+
+        ``_refusal_sentence`` exists so that the transport and this adapter's two
+        outbound methods cannot disagree about how a refusal reads - which is the
+        drift this project has already been bitten by once, in a reference string
+        that had two homes and disagreed with itself.
+        """
+        requesting.response = httpx.Response(
+            500, json={"message": "Something went wrong", "code": "server_error"}
+        )
+
+        with pytest.raises(PaymentProviderError) as refused:
+            provider.outcome_for("ps_ref_1")
+
+        assert "Something went wrong" in str(refused.value)
+        assert "server_error" in str(refused.value)
 
 
 class TestLookingUpACollection:

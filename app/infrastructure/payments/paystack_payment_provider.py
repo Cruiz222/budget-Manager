@@ -32,6 +32,7 @@ from app.domain.money.money import Money
 from app.domain.payments.exception import (
     InvalidPaymentIntentError,
     InvalidProviderAnswerError,
+    PayerEmailRefusedError,
     PaymentProviderError,
 )
 from app.domain.payments.paymentIntent import PaymentIntent
@@ -85,6 +86,33 @@ NO_SUCH_REFERENCE_FAILURES = frozenset({404})
 #: key deserves can only be written by the caller, which is the only frame that
 #: knows what the call was for.
 LOOKUP_FAILURES = NO_SUCH_REFERENCE_FAILURES | AUTHENTICATION_FAILURES
+
+#: The statuses ``initialize_deposit`` reads for itself.
+#:
+#: A 400 is a refusal everywhere else in this file, and the distinction is exactly
+#: the one ``answers`` exists to draw: for a call that *creates* something, a
+#: refusal is the whole of what the transport can know, so it reports the status
+#: and stops. Paystack's 400 on ``/transaction/initialize`` is not uniform, though
+#: - it carries a ``code`` saying which input it objected to - and one of those
+#: codes has a better answer than "the provider refused the call": the address
+#: this account would be billed under is not one they will take. Telling that
+#: apart from a malformed reference takes the caller, which is the only frame that
+#: knows an address was sent at all.
+BAD_REQUEST_STATUSES = frozenset({400})
+
+#: Paystack's code for "that is not an address I will bill".
+#:
+#: Learned from a live call rather than from documentation, and quoted from it:
+#: ``live@localhost`` produced ``{"message": "Invalid Email Address Passed",
+#: "code": "invalid_email_address"}`` while the same call with a real domain
+#: returned a checkout URL.
+#:
+#: A **code** is matched rather than a message, and the difference matters. A code
+#: is the part of Paystack's error contract that is machine-readable and stable; a
+#: message is prose they are free to reword, so matching on it would pin this
+#: adapter to the wire's vocabulary in the one place its own rule says the
+#: translation runs the other way.
+INVALID_PAYER_EMAIL_CODE = "invalid_email_address"
 
 #: Paystack's name for the one transaction status that means money has arrived.
 #:
@@ -167,8 +195,19 @@ class PaystackPaymentProvider(PaymentProvider):
         stores a ``Decimal``, so the multiplication is exact and the conversion to
         ``int`` cannot round - there is no float anywhere on this path, which is
         the same reason ``Money`` refuses them.
+
+        **Two refusals are interpreted here rather than reported**, and both are
+        cases where the status alone is not the answer. A ``401``/``403`` means the
+        key is wrong, which only this frame can say because only this frame knows a
+        collection was being opened; a ``400`` carrying
+        ``INVALID_PAYER_EMAIL_CODE`` means the address will never be billed, which
+        earns a better sentence than "the provider refused the call". Everything
+        else a provider refuses leaves through ``_refusal_sentence`` with its own
+        words attached. That a 400 is *allowed* to reach this method at all is the
+        ``answers`` argument in one line: a refusal is the whole of what is
+        knowable to the transport, and not the whole of what is knowable here.
         """
-        _, response = self._request(
+        status, response = self._request(
             "POST",
             "/transaction/initialize",
             payload={
@@ -177,8 +216,31 @@ class PaystackPaymentProvider(PaymentProvider):
                 "reference": reference,
                 "currency": SUPPORTED_CURRENCY,
             },
-            answers=AUTHENTICATION_FAILURES,
+            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
         )
+
+        if (
+            status >= 400
+            and _provider_code(response) == INVALID_PAYER_EMAIL_CODE
+        ):
+            # Translated rather than reported, and it is the one place this adapter
+            # turns a provider's refusal into a domain refusal of its own naming -
+            # which is what the vocabulary rule asks of an adapter, and the same
+            # translation the lookup does for a status. The first clause is the one
+            # ``app.domain.payments.payerEmail`` writes locally, so the courtesy
+            # check and the authority are indistinguishable to a client.
+            raise PayerEmailRefusedError(
+                f"{email!r} cannot be used as a payer address; the payment "
+                f"provider will not bill it"
+            )
+
+        if status >= 400 and status not in AUTHENTICATION_FAILURES:
+            # A 400 this call named as interpretable and did not recognise. It goes
+            # out with the provider's own words, which is what a live run bought:
+            # the bug that started this was ``invalid_character_in_reference``, and
+            # it arrived as a bare "refused the call with 400" - a sentence that
+            # sent the reader looking at this system rather than at the reference.
+            raise PaymentProviderError(_refusal_sentence(status, response))
 
         data = response.get("data")
         if not isinstance(data, dict):
@@ -334,9 +396,22 @@ class PaystackPaymentProvider(PaymentProvider):
         **``raise_for_status`` before the body is read**, so that a 500 with an
         HTML error page produces "the provider rejected this call" rather than a
         JSON decode error. The status is included in the message because it is
-        the part a human acts on; the response *body* deliberately is not, because
-        it is a third party's words and may quote the request back - including
-        the secret key, if it decides to echo headers.
+        the part a human acts on.
+
+        **The body is still not carried, and what is carried instead is narrower
+        than it looks.** A response body is a third party's text and may quote the
+        request back - including the secret key, if it decides to echo headers - so
+        quoting one into an error stays refused. ``_provider_words`` takes instead
+        the two fields Paystack documents as its error contract, ``message`` and
+        ``code``: a sentence written for a human and a stable identifier, neither
+        of which is echoed request state. That narrowing is a live run's doing. The
+        deposit bug that started all this was answered with
+        ``invalid_character_in_reference``, and this method reported only "refused
+        the call with 400" - which cost two round trips to a bare ``curl`` to
+        rediscover something the provider had already said. Carrying the *code* is
+        also what lets ``initialize_deposit`` translate one refusal without
+        matching on prose. If a provider is ever observed quoting request state
+        inside ``message``, this is the line to revisit.
 
         **A 401 is not this function's refusal to make.** It is the one status
         where the useful sentence cannot be written here: ``_request`` knows a
@@ -379,8 +454,9 @@ class PaystackPaymentProvider(PaymentProvider):
 
         if response.status_code >= 400 and response.status_code not in answers:
             raise PaymentProviderError(
-                f"the payment provider refused the call with "
-                f"{response.status_code}"
+                _refusal_sentence(
+                    response.status_code, _json_or_none(response)
+                )
             )
 
         try:
@@ -389,6 +465,74 @@ class PaystackPaymentProvider(PaymentProvider):
             raise PaymentProviderError(
                 "the payment provider returned a body that is not JSON"
             ) from failure
+
+
+def _json_or_none(response: httpx.Response) -> object:
+    """The response's JSON body, or ``None`` when there is not a usable one.
+
+    Deliberately quiet. This runs on the path that is already refusing a call, and
+    a diagnostic that can itself raise is worse than no diagnostic: a body that is
+    absent, HTML, or not an object all come back as ``None``, and
+    ``_provider_words`` then contributes nothing.
+    """
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _provider_words(body: object) -> str:
+    """The provider's own ``message`` and ``code``, or nothing at all.
+
+    The narrow half of the amendment ``_request``'s docstring records: two named
+    fields of a documented error contract, extracted rather than quoted. Returns a
+    suffix rather than a finished sentence, so the one place a refusal is put into
+    words stays the one place.
+    """
+    if not isinstance(body, dict):
+        return ""
+
+    message = body.get("message")
+    if not isinstance(message, str):
+        return ""
+
+    code = body.get("code")
+    return f": {message}" + (f" ({code})" if isinstance(code, str) else "")
+
+
+def _provider_code(body: object) -> str | None:
+    """The provider's ``code``, when the body is an object carrying a string one.
+
+    ``_provider_words``'s twin, and the pair exists for the same reason: these are
+    the two fields of Paystack's error contract that are read anywhere in this file,
+    and each has exactly one reader. ``_provider_words`` formats them for a person;
+    this one is what a caller *matches* on, which is the half that has to be stable
+    - so ``initialize_deposit`` compares a code rather than a sentence, and is not
+    pinned to Paystack's prose.
+
+    Quiet for the same reason its twin is: a body that is absent, HTML, a list, or
+    an object whose ``code`` is not a string contributes ``None`` rather than
+    raising. A diagnostic that can itself fail, on a path that exists to report a
+    failure, is worse than no diagnostic.
+    """
+    if not isinstance(body, dict):
+        return None
+
+    code = body.get("code")
+    return code if isinstance(code, str) else None
+
+
+def _refusal_sentence(status: int, body: object) -> str:
+    """The one place a refused call becomes a sentence.
+
+    A named function rather than the same f-string at each raise site, because
+    there are two of them - the transport for a status nobody claimed, and
+    ``initialize_deposit`` for the 400 it asked to interpret - and this codebase
+    has already paid for one rule with two homes. Two copies of a reference string
+    disagreed with each other, and the copy that reached the wire was the wrong
+    one.
+    """
+    return f"the payment provider refused the call with {status}{_provider_words(body)}"
 
 
 def _subunit(amount: Money) -> int:

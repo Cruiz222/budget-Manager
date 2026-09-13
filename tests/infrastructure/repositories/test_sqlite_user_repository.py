@@ -86,7 +86,7 @@ def test_save_overwrites_an_existing_user(build_user):
     repository.save(user)
 
     assert repository.get_by_id(user.user_id).email == "moved@example.com"
-    assert repository.find_by_email("test@localhost") is None
+    assert repository.find_by_email("test@example.com") is None
 
 
 def test_find_by_google_subject_returns_the_account_holding_it(build_user):

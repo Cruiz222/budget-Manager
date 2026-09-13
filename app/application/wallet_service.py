@@ -29,6 +29,7 @@ from app.domain.money.exception import (
 from app.domain.money.fund import Fund
 from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
+from app.domain.money.reference import scoped_reference
 from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.wallet import Wallet
@@ -779,51 +780,6 @@ class WalletService:
         """
         return uow.wallets.get_owned(wallet_id, self._actor)
 
-    def _scoped_reference(self, wallet: Wallet, internal_reference: str) -> str:
-        """Namespace a caller's idempotency key to the wallet it is spent from.
-
-        **Without this, the key is a cross-actor leak.** ``get_by_internal_reference``
-        is a global lookup over a globally UNIQUE column, and
-        ``WalletOperation.execute`` returns the row it finds without asking whose
-        wallet it belongs to. Two people choosing the same key therefore do not
-        merely collide - the second one receives the first one's transaction back
-        as though it were their own.
-
-        It was unreachable while the CLI was the only caller: it mints a fresh
-        ``uuid4`` per command unless a human passes ``--ref``. The moment a key
-        can arrive in a request body it is reachable by anyone holding a token,
-        and a key is not a secret - it is a word the client picks.
-
-        The namespace is the **wallet**, not the actor, and that is the tighter
-        of the two rather than a different idea. A wallet has exactly one owner,
-        so a wallet-scoped key is also an actor-scoped one; and it additionally
-        closes a case scoping by owner would leave open - one user posting the
-        same key to two of their own wallets, where the second would silently
-        return the first's transaction and leave the second wallet untouched.
-
-        The prefix is derived from the wallet the service has already loaded
-        through ``_wallet``, so it is not client input and cannot be chosen. A
-        caller who sends ``"<somebody else's wallet uuid>:x"`` gets that string
-        as *their* key, prefixed again with their own wallet - which is a key
-        nobody else will ever use, and not a way into anyone's namespace.
-
-        Two consequences worth stating rather than discovering:
-
-        - **Stored references change shape.** Rows written before this read a
-          bare uuid or ``plan:{id}:...``, so a retry of an old key no longer
-          matches once. That is the change working, not a regression.
-        - **The reference in a response is not the key to retry with.** A client
-          sees ``"<wallet uuid>:<the key they sent>"`` and sending that back
-          would create a *second* transaction - for a withdrawal, a double
-          spend. The key is the one the caller generated.
-
-        ``ExecutePlanRun`` does not come through here, and does not need to: it
-        builds its operations directly and its references already embed
-        ``plan_id``, which is unique and server-minted. A client key can never
-        equal one, because the client's is namespaced and the plan's is not.
-        """
-        return f"{wallet.wallet_id}:{internal_reference}"
-
     def _claim(
         self,
         uow: UnitOfWork,
@@ -915,7 +871,7 @@ class WalletService:
             )
             transaction = operation.execute(
                 amount,
-                self._scoped_reference(wallet, internal_reference),
+                scoped_reference(wallet.wallet_id, internal_reference),
                 destination,
             )
             # The wallet changed (or would have) - persist the aggregate's new

@@ -119,7 +119,7 @@ def a_deposit(wallet, amount="5000", reference="dep-1"):
         wallet_id=wallet.wallet_id,
         type=TransactionType.DEPOSIT,
         amount=Money(Decimal(amount), NGN),
-        internal_reference=f"{wallet.wallet_id}:{reference}",
+        internal_reference=f"{wallet.wallet_id}.{reference}",
         provider_reference=reference,
     )
 
@@ -154,7 +154,7 @@ def a_transfer(
         wallet_id=wallet.wallet_id,
         type=type,
         amount=Money(Decimal(amount), NGN),
-        internal_reference=f"{wallet.wallet_id}:{reference}",
+        internal_reference=f"{wallet.wallet_id}.{reference}",
         provider_reference=reference,
         destination=DESTINATION if type is TransactionType.PAYOUT else None,
         status=status,

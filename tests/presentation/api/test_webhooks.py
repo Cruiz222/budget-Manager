@@ -217,7 +217,7 @@ def a_pending_payout(client, app, as_user, open_wallet):
                     wallet_id=UUID(wallet_id),
                     type=TransactionType.PAYOUT,
                     amount=money,
-                    internal_reference=f"{wallet_id}:{reference}",
+                    internal_reference=f"{wallet_id}.{reference}",
                     provider_reference=reference,
                     destination=DESTINATION,
                     status=status,

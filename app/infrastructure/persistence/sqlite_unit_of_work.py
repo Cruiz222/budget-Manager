@@ -334,7 +334,7 @@ CREATE TABLE IF NOT EXISTS confirmations (
     fund_name          TEXT,            -- locked payouts only; NULL = pooled draw
     -- The caller's idempotency key, or one minted when they sent none. This is
     -- the key that will be handed to the ledger row underneath, namespaced with
-    -- the wallet by ``WalletService._scoped_reference`` exactly as it always was.
+    -- the wallet by ``app.domain.money.reference`` exactly as it always was.
     internal_reference TEXT NOT NULL,
     -- AWAITING or CONFIRMED. There is deliberately no stored EXPIRED: expiry is
     -- *checked*, not swept, and the API reports an awaiting request past its

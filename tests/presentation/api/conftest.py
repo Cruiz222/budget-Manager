@@ -27,9 +27,13 @@ from app.presentation.api.app import create_app
 from tests.conftest import TEST_USER_EMAIL, TEST_USER_PASSWORD
 
 #: Two addresses that could never be real accounts, for the same reason the CLI's
-#: default is ``test@localhost``: nobody can mistake one of these for a person.
-ALICE = "alice@localhost"
-BOB = "bob@localhost"
+#: default is ``test@example.com``: nobody can mistake one of these for a person.
+#:
+#: The domain is ``example.com`` rather than ``localhost`` because the standard
+#: account has to be able to *deposit*, and no provider bills an address with no
+#: real domain. ``TEST_USER_EMAIL`` carries the live evidence for that.
+ALICE = "alice@example.com"
+BOB = "bob@example.com"
 
 
 @pytest.fixture

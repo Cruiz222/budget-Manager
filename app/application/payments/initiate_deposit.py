@@ -8,11 +8,13 @@ from app.domain.money.exception import (
     WalletClosedError,
 )
 from app.domain.money.money import Money
+from app.domain.money.reference import scoped_reference
 from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.payments.exception import DepositAlreadyInitiatedError
+from app.domain.payments.payerEmail import refuse_unusable_payer_email
 from app.domain.payments.paymentProvider import PaymentProvider
 
 
@@ -168,7 +170,22 @@ class InitiateDeposit:
             if wallet.status is WalletStatus.CLOSED:
                 raise WalletClosedError("this wallet is closed")
 
-            reference = f"{wallet.wallet_id}:{internal_reference}"
+            # The payer address, refused here when it plainly cannot work.
+            # ``payerEmail`` carries the argument for the check's narrowness, and
+            # the short version is that this is a courtesy and the provider is the
+            # guard: the adapter raises this same error when Paystack refuses the
+            # address, so a client is told one thing either way and nothing rests
+            # on this codebase's reading of the provider's rule. It sits after the
+            # wallet checks so that a closed wallet answers with its own refusal
+            # rather than a lecture about an address.
+            refuse_unusable_payer_email(user.email)
+
+            # Which is ``app.domain.money.reference``'s rule rather than this
+            # method's, and it moved there after the copy that used to stand here
+            # turned out to be the one that reached the wire - carrying a
+            # separator Paystack refuses. What this method owes the rule is the
+            # wallet it has already proved the actor owns, and nothing else.
+            reference = scoped_reference(wallet.wallet_id, internal_reference)
             if uow.transactions.get_by_internal_reference(reference) is not None:
                 raise DepositAlreadyInitiatedError(
                     "a deposit is already open under this key"

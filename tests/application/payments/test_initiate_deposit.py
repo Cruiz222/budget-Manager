@@ -15,6 +15,11 @@ take a real person's money and have nowhere to put it. The test for that asserts
 the provider's ``requests`` list is empty, because "it raised" and "it never
 called out" are different claims and only the second one is the point.
 
+**One refusal is about the characters in the key itself**, and it is the newest
+one in this file - a real provider is what taught it. The reference built here is
+also the idempotency key Paystack is handed, and their alphabet is narrower than
+a Python string's; see ``TestAKeyTheProviderWouldRefuse`` for the bug that cost.
+
 **Every test here seeds a user row**, and that is a consequence of a design
 decision rather than an inconvenience. The email the provider requires is read
 from the actor's own record (``_prepare`` does
@@ -39,6 +44,7 @@ from app.domain.money.currency import Currency
 from app.domain.money.exception import (
     CurrencyMismatchError,
     InvalidAmountError,
+    InvalidIdempotencyKeyError,
     WalletClosedError,
     WalletNotFoundError,
 )
@@ -48,6 +54,7 @@ from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.payments.exception import (
     DepositAlreadyInitiatedError,
+    PayerEmailRefusedError,
     PaymentProviderError,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
@@ -68,7 +75,12 @@ STRANGER = uuid4()
 #: test asserting the provider was told the actor's address is asserting a value
 #: that could only have come from the row this test seeded - a shared constant
 #: would pass if the adapter fell back to something else that happened to match.
-PAYER = "payer@localhost"
+#:
+#: ``example.com`` rather than ``localhost`` because this address is one a payment
+#: provider is asked to bill, and it will not bill a domain that cannot exist -
+#: ``app.domain.payments.payerEmail`` refuses one before the call, so a payer at
+#: ``localhost`` would make every deposit test here a test of the refusal.
+PAYER = "payer@example.com"
 
 
 def a_deposit_service(tmp_path, provider, actor=ACTOR, name="deposits.db"):
@@ -429,6 +441,168 @@ class TestTheSameKeyTwice:
         service.execute(wallet.wallet_id, Money(7500, NGN), "invoice-8")
 
         assert len(rows(factory, wallet)) == 2
+
+
+class TestAKeyTheProviderWouldRefuse:
+    """The character rule, at the layer that violated it and could not see it.
+
+    The reference this use case builds is the one a payment provider is handed as
+    its idempotency key, and it used to join the wallet and the caller's key with
+    a ``:`` - a character Paystack refuses outright. Every deposit this route ever
+    attempted against the real provider came back
+    ``400 invalid_character_in_reference``, and nothing in this file noticed,
+    because nothing in this file checked: the fake provider accepted whatever it
+    was given, so the suite agreed with the bug for as long as it existed.
+    """
+
+    def test_a_key_the_provider_cannot_take_is_refused_before_the_call(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """Which is the same *ordering* claim the closed-wallet refusal makes.
+
+        "It raised" and "it never called out" are different claims, and only the
+        second one is worth anything here: a collection opened under a reference
+        the provider would reject is a collection that does not exist, so the
+        refusal has to land before the request leaves this process. Nothing is
+        left at the far end to clean up, and no row is written here to explain.
+        """
+        wallet = build_wallet()
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(InvalidIdempotencyKeyError):
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order:42")
+
+        assert provider.requests == []
+        assert rows(factory, wallet) == []
+
+    def test_the_refusal_names_the_character_and_what_is_allowed(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """Because the provider's own answer is a sentence about nothing.
+
+        Paystack replies to this with a 400 whose body reads as though *this*
+        system is broken - which is precisely how it read for the whole life of
+        the deposit route, and why nobody looked at the reference. The refusal
+        made here has to be the opposite of that: it names the offending
+        character and the set that would have been accepted, because the person
+        reading it is holding a key they chose.
+        """
+        wallet = build_wallet()
+        service, factory = a_deposit_service(tmp_path, build_payment_provider())
+        seed(factory, wallet, payer)
+
+        with pytest.raises(InvalidIdempotencyKeyError) as refused:
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order:42")
+
+        assert ":" in str(refused.value)
+        assert "- . , =" in str(refused.value)
+
+    def test_a_key_of_legal_characters_still_reaches_the_provider(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The other side of the rule, so the check is pinned as a check.
+
+        A validator that refused everything would pass both tests above and make
+        the route useless - and the point of this one is narrower than it looks:
+        the separator is in the same alphabet as the key, so the whole reference
+        is one a provider accepts, which is exactly what the fake now enforces.
+        """
+        wallet = build_wallet()
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        service.execute(wallet.wallet_id, Money(5000, NGN), "order-42.retry")
+
+        assert provider.requests[0]["reference"] == (
+            f"{wallet.wallet_id}.order-42.retry"
+        )
+
+
+class TestThePayerAddressTheProviderWouldRefuse:
+    """The second thing a real provider taught this use case, and the cheaper one.
+
+    ``TestAKeyTheProviderWouldRefuse`` above is about the *key* this use case
+    builds; this class is about the *address* it passes along, and the address is
+    not built here at all - it is read off the actor's own row. That difference is
+    why the refusal is a courtesy rather than this layer's judgement: what a
+    provider will bill is the provider's rule, and this layer knows only the one
+    case that is certain.
+
+    ``app.domain.payments.payerEmail`` carries the argument for the narrowness.
+    What is asserted *here* is the ordering, which is the same claim the
+    closed-wallet test makes and the same one the key test makes: a collection
+    opened under an address no provider will bill does not exist, so the refusal
+    has to land before the request leaves this process.
+    """
+
+    def test_an_address_the_provider_would_refuse_never_reaches_it(
+        self, tmp_path, build_wallet, build_user, build_payment_provider
+    ):
+        """``live@localhost``, which is the address a live run was refused for.
+
+        Not ``localhost`` in particular - the rule is the missing dot, because one
+        refused address and one accepted one differing by exactly that is the
+        whole of the evidence anybody has. It is the same address the register
+        endpoint happily created, which is the half of this that is uncomfortable:
+        the account exists, it can hold a wallet, and no provider will ever bill
+        it.
+        """
+        wallet = build_wallet()
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, build_user(email="payer@localhost"))
+
+        with pytest.raises(PayerEmailRefusedError):
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
+
+        assert provider.requests == []
+        assert rows(factory, wallet) == []
+
+    def test_the_refusal_names_the_address_and_the_reason(
+        self, tmp_path, build_wallet, build_user, build_payment_provider
+    ):
+        """Because the provider's own answer sends the reader to the wrong system.
+
+        Paystack's reply to this is ``Invalid Email Address Passed`` with a
+        ``nextStep`` about passing the ``email`` parameter - which reads as though
+        this codebase forgot to send one, when in fact it sent exactly the address
+        the account was registered under. A refusal that names the address and
+        says what is wrong with it is something the person holding the account can
+        act on; the provider's sentence is not.
+        """
+        wallet = build_wallet()
+        service, factory = a_deposit_service(tmp_path, build_payment_provider())
+        seed(factory, wallet, build_user(email="payer@localhost"))
+
+        with pytest.raises(PayerEmailRefusedError) as refused:
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
+
+        assert "payer@localhost" in str(refused.value)
+        assert "real domain" in str(refused.value)
+
+    def test_an_ordinary_address_still_reaches_the_provider(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The other side of the courtesy, so it is pinned as a check.
+
+        A check that refused everything would pass both tests above and close the
+        deposit route entirely - so the common case, the one every account a
+        person actually creates looks like, has to be shown to cost nothing. This
+        is also the half ``payerEmail``'s own test file argues hardest for: the
+        two ways of being wrong here are not symmetrical, and refusing a good
+        address is the one this system cannot undo on somebody's behalf.
+        """
+        wallet = build_wallet()
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
+
+        assert provider.requests[0]["email"] == PAYER
 
 
 class TestWhenTheProviderFails:

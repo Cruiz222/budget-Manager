@@ -672,7 +672,7 @@ class TestConfirmingAWithdrawal:
 
         assert answered["confirmation"]["internal_reference"] == "client-key-7"
         assert answered["transaction"]["internal_reference"] == (
-            f"{wallet_id}:client-key-7"
+            f"{wallet_id}.client-key-7"
         )
 
     def test_an_amount_beyond_the_balance_fails_the_row(self, client, as_user, funded):

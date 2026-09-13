@@ -11,5 +11,10 @@ __pycache__/
 # Local database files (created by the SQLite composition root)
 *.db
 
+# Local environment files (real credentials - never committed)
+.env
+.env.*
+!.env.example
+
 # Project archive snapshots
 project.zip

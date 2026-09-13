@@ -483,6 +483,41 @@ deposit over HTTP (`POST /wallets/{id}/deposits`, with the same test key), then
 have left. Run it a second time and it says `nothing in flight`, because the row
 is no longer in flight.
 
+**That recipe is worth more than it was written for, and it is the reason to keep
+it.** Running it against a real test key is how the deposit route turned out never
+to have worked at all: the first `POST` came back
+
+```
+{"status":false,"message":"Invalid character in transaction reference",
+ "code":"invalid_character_in_reference"}
+```
+
+- the reference carried a colon, Paystack refuses colons, and every deposit this
+system had ever attempted had been refused at the far end in the same way. Two
+thousand passing tests had nothing to say about it, because the fake provider
+accepted whatever string it was handed (decisions 151 and 155). The step that
+found it was not a test and could not have been: it was the one instruction in
+this file that talks to the *real* provider, and everything in flight above it was
+self-consistent without being true. Any future step that reaches the real service
+earns its place the same way.
+
+**The same run found a second one, and it is the better argument for the recipe.**
+With the reference fixed, the deposit opened - and then the account it was opened
+for, `live@localhost`, came back
+
+```
+{"status":false,"message":"Invalid Email Address Passed",
+ "code":"invalid_email_address"}
+```
+
+because a deposit is billed under the account's own address and this system's
+entire email rule is that it contains an `@`. The fix was two `curl`s that differed
+in one field, which is not something any test in this repository could have been
+written to do: the suite's own accounts were at `@localhost` too, so the tests had
+the same blind spot as the code and agreed with it (decisions 156 to 160). What a
+live run buys is not coverage. It is an oracle for the rules this codebase does not
+own.
+
 ## Decisions
 
 A running log of the architectural and business decisions this project runs on,
@@ -3087,7 +3122,273 @@ that is `describe_configuration`'s rule: the failure mode of a job with nothing 
 with is *silence*, and naming the variable is the difference between a two-minute fix
 and an afternoon of guessing.
 
+**151. Every deposit this system had ever attempted against the real provider was
+refused, and nothing could see it.** Found by the last step of 3b's verification -
+a real test-mode key, a real deposit over HTTP, no webhook - which returned
+
+```
+{"status":false,"message":"Invalid character in transaction reference",
+ "meta":{"nextStep":"Ensure that you aren't using any characters that aren't
+ alphanumeric or contained in \"-,., =\" in your reference"},
+ "type":"validation_error","code":"invalid_character_in_reference"}
+```
+
+The reference a deposit sends was `"<wallet uuid>:<the caller's key>"`, and Paystack
+refuses a colon outright. The route had therefore never once worked: every
+`POST /wallets/{id}/deposits` in its history opened no collection, and the only
+thing a client ever got back was a 400.
+
+Three things kept it invisible, and two of them were decisions this project had
+already made on purpose. **Decision 132 calls the provider *between* two units of
+work**, so a rejected call writes no row - the ledger was clean, `reconcile`
+correctly kept reporting `nothing in flight`, and a database that had recorded
+nothing looked exactly like a database with nothing to record. **The fake provider
+validated nothing about the reference it was handed**, so 2,042 passing tests
+agreed with the bug; `test_initiate_deposit.py` asserted the reference started with
+the wallet id, which it did. And the reference was built in **two** places - see
+153 - so the string that reached the wire had never been compared with the string
+that did not.
+
+There was a second, reachable instance of the same fault underneath. A client's key
+is interpolated into that string raw, and `DepositIn.ref` carried no charset rule,
+so anyone holding a token could send `ref: "a:b"` and reproduce the identical 400
+through a door they can open. It failed closed, and it failed unreadably.
+
+Nothing was corrupt, and that is the honest whole of the good news: no row was
+half-written, no collection was opened, no payer was ever sent to a page. The
+deposit route's three phases of design - the pending intent, the boundary, the
+credits-nothing rule - were all correct. What was wrong was eleven characters in a
+string, and the only thing that could have told anybody was the provider.
+
+**152. The separator is a dot, and the reason is that the stricter end decides.**
+For a deposit a reference is two things at once - the ledger's name for a movement
+and the idempotency key handed to Paystack (decision 131) - so its shape has to
+satisfy the provider, not merely this system. Paystack accepts letters, digits and
+`- . , =`; a colon is not in that set.
+
+A dot rather than a hyphen, and the choice is narrower than it looks. The separator
+has to be a character a wallet id cannot contain, or the string would not identify
+one `(wallet, key)` pair - and wallet ids are UUIDs, which are made of hyphens. A
+UUID has no dots in it, so the first dot in the result is always the separator, and
+the two halves stay recoverable even though a caller's key is allowed to contain
+dots of its own. Nothing parses the string back apart today; this is what makes
+that safe to rely on if anything ever does.
+
+What it costs is the consequence decision 107 already documents: stored references
+change shape, so a retry of a key minted before the change no longer matches once.
+That cost is nil here, for the one reason worth writing down - the faulty shape
+never produced a row, because a reference that never reached the provider never
+became a ledger row either.
+
+**153. The scoping rule gets one home, in the domain, and the second copy is
+deleted.** It existed twice: as `WalletService._scoped_reference`, with the
+cross-actor argument written out at length, and inline in `InitiateDeposit._prepare`
+with no pointer back to the first. The inline copy is the one that had drifted onto
+the wire (151). A rule written twice is a rule that will disagree with itself, and
+this one already had.
+
+`app.domain.money.reference.scoped_reference(wallet_id, key)` is now the only place
+a caller's key becomes a ledger reference, and both callers import it.
+`WalletService._scoped_reference` is gone rather than delegating - a private method
+whose body is one call to a public function is an indirection that exists only to
+preserve a name.
+
+It lives in the domain because all three layers need it and only the domain can be
+imported by all three: the API's schemas import nothing from `app.domain` by design
+(see 154), `app.domain.payments` already depends on `app.domain.money` and not the
+other way around, and the tests reach for it directly. And it is about the identity
+of a ledger row, which is the domain's subject rather than a service's.
+
+**The withdrawal path moved with it**, and that is not scope creep. A withdrawal's
+reference never goes on the wire today - no payout reaches a provider yet - so the
+colon was harmless there. It changed anyway, for two reasons: leaving one rule at
+`:` and one at `.` is precisely the drift this entry is about, and payouts to
+external accounts are on the roadmap, at which point that same string becomes a
+provider's idempotency key and the bug arrives a second time, in a path nobody
+would think to re-check.
+
+**154. An unusable key is refused where the string is built, not at the door.**
+The rule is checked inside `scoped_reference`, which raises
+`InvalidIdempotencyKeyError`, and **not** in `schemas.py`, which is a decision
+rather than a placement. That module's own docstring promises shape-only checks and
+imports nothing from the domain; more to the point, the rule belongs to the string
+being built, so it holds for every caller - the API today, the CLI, and whatever
+opens a collection next - rather than only for the door that remembered to ask. A
+refusal made here is also the only one that can *explain* itself: it names the
+offending character and the set that would have been accepted, which is exactly
+what Paystack's bare 400 never does.
+
+The alphabet is a constant in `app.domain.money.reference`, quoting Paystack's own
+sentence, and the space their message shows inside the quotes is read as
+punctuation rather than a member of the set - refusing it is the safe side of an
+ambiguous sentence, and a test says so out loud rather than leaving it to be
+discovered.
+
+`InvalidIdempotencyKeyError` is deliberately **not** `InvalidInternalReference`,
+which already existed. That one is the `Transaction` aggregate refusing its own
+field - a value that is not a string, or is blank - which is a bug in this codebase.
+This one is a caller's key that this system may not use. And the charset is
+emphatically *not* a `Transaction` invariant: a plan run's reference is
+`plan:{id}:...`, full of colons and correct to be so, and no provider ever sees it.
+
+It reaches a client as a **400 by falling through** `errors._grade`, which is what
+makes a refusal this new behave like every refusal that came before it: the same
+`{"error", "detail"}` body, the same `error:` line and exit 1 through the CLI, no
+handler edited. The OpenAPI descriptions of both `ref` fields were updated too,
+which is documentation rather than validation - a client reading the schema learns
+the alphabet before it ever sends one.
+
+**155. The double now refuses what the provider refuses, and the alphabet is written
+down twice on purpose.** The lesson of 151 is not "a test was missing". It is that
+**the double had no opinion**, and a suite whose fake accepts everything agrees with
+the code by construction rather than by being right - which is the one failure mode
+a fake is supposed to prevent. `FakePaymentProvider.initialize_deposit` now refuses
+a reference outside Paystack's alphabet, raising the same `PaymentProviderError` the
+adapter raises on a 400, which is what makes `test_deposits.py`'s refusal test able
+to fail.
+
+The alphabet is therefore written out as a literal in two places - `tests/conftest.py`
+and `tests/domain/money/test_reference.py` - and neither imports it from the module
+being checked. That duplication is the mechanism, not a lapse: a copy that imported
+the constant would agree with the code by construction, which is the thing being
+fixed.
+
+**Neither copy can tell you Paystack's rule is still Paystack's.** Only Paystack can,
+and that is the honest limit of this whole arrangement: what the suite can prove is
+that this code still agrees with the rule a live 400 spelled out, and what proves
+the rule itself is the end-to-end run in "Reconciling the payments whose webhook
+never arrived" - which is exactly how 151 was found.
+
+**156. The payer's address is the account's own, and this system's entire email rule
+is that it contains an `@`.** `InitiateDeposit` reads the actor's row and hands
+Paystack `user.email` - the address the account was registered under - and
+`app.domain.identity.user`'s validation is `"@" in email` and nothing else. So
+`live@localhost` is a legal account here: it registers, it signs in, it opens a
+wallet, and no provider will ever bill it.
+
+**Found live, and only live.** The first deposit this route ever successfully
+opened ran against `live@localhost` and came back
+`400 invalid_email_address`. Two `curl`s to
+`https://api.paystack.co/transaction/initialize` differing in that one field
+isolated it: the same call with `live@example.com` returned 200 and an
+`authorization_url`. The dot in the domain is the whole of the evidence, and the
+live run in "Reconciling the payments whose webhook never arrived" is where it was
+collected.
+
+Nothing in the suite could have found this, which is the point rather than an
+aside. Every fake in this codebase accepted every address it was handed, and the
+accounts the suite registered were at `@localhost` besides - so the tests agreed
+with the code and neither agreed with the provider. That is decision 151's
+blind-spot pattern a second time, and the second instance is what makes it a
+pattern worth naming: **the far end is the only oracle for a rule the far end
+owns.**
+
+**157. The address is refused at deposit time, and the refusal is a courtesy rather
+than the guard.** Two decisions, both the user's, and they compose: it should be
+refused when a person tries to put money in, and the refusal should say something
+useful.
+
+Where the check lives follows from what it is. `app.domain.payments.payerEmail`
+holds one function, `refuse_unusable_payer_email`, which refuses an address with no
+dot after the `@` - and the rule is deliberately the *narrowest* the evidence
+supports, not the cleverest available. The two ways of being wrong are not
+symmetrical: guessing wrong permissively costs one provider call and a legible
+refusal, while guessing wrong strictly refuses a legitimate person's deposit, which
+this system cannot undo on their behalf. So `a@b.` and `a@.` are passed through to
+the authority, and a test asserts they are.
+
+**The provider remains the authority.** The adapter raises the same
+`PayerEmailRefusedError` when Paystack answers `invalid_email_address`, so a client
+is told one thing whichever caught it, and correctness never rests on this
+codebase's reading of the provider's rule. The local check makes the common case
+cheap; it is not a second opinion that could be wrong in the expensive direction.
+Same shape as 143: the grace window is a courtesy, and the four settled events are
+the guard.
+
+It sits **after** the wallet checks in `_prepare`, so a closed wallet answers with
+its own refusal rather than a lecture about an address. It is graded a 400 by
+falling through `errors._grade`, like every other refusal this domain makes - no
+handler edited, and the same `{"error", "detail"}` body.
+
+`payerEmail` is not an identity rule and is deliberately not raised by `User`. The
+account is fine; what is unusable is the address *as a payer address*, which is a
+fact about a payment provider and not about the person. A `User` that refused to
+hold `live@localhost` would be this codebase inventing an email policy it has not
+been asked for and cannot enforce.
+
+**158. Our errors now carry the provider's words, and the body is still not
+carried.** `_request`'s docstring documented that the response body is deliberately
+discarded, because it is *"a third party's words and may quote the request back -
+including the secret key, if it decides to echo headers."* That argument is not
+reversed here; it is narrowed. `_json_or_none` parses the body as JSON, and
+`_provider_words` extracts exactly the two fields Paystack's error contract
+documents - `message` and `code` - and never the body itself. A refusal now reads
+`the payment provider refused the call with 400: Invalid character in transaction
+reference (invalid_character_in_reference)` instead of a bare status.
+
+The reason this is worth the edit is decision 151: the answer that hid the
+reference bug for the entire life of the deposit route was a body nobody kept, so
+the operator was left with a status and no sentence. A third party's words are
+still not trusted enough to store or re-emit whole; the two fields that name what
+went wrong are read out and the rest is dropped. A body that is not a JSON object
+contributes nothing, and a test asserts the sentence degrades to the bare status
+rather than to a traceback.
+
+**159. `invalid_email_address` is translated into a domain refusal by the adapter.**
+Recognising a provider's stable error `code` and turning it into an error this
+domain already has is the adapter's job, and it is the same rule
+`initialize_deposit` already followed when it raised `InvalidPaymentIntentError`
+for a missing `data`. Matching on Paystack's prose would pin this codebase to their
+wording; matching on the `code` pins it to their contract.
+
+This is also what makes 157's guard real rather than a claim. The local check and
+the adapter raise **one** error, so the API's answer and the CLI's line are
+identical whichever caught it - and the day the local rule is wrong, the provider's
+refusal still arrives as a 400 naming the address.
+
+Both `400` and the `code` arrived together, so `answers` grew. `initialize_deposit`
+already named `AUTHENTICATION_FAILURES` as the statuses it would interpret; a 400
+joins via `BAD_REQUEST_STATUSES`, and the principle is unchanged - a status is an
+*answer* when it means something about the thing asked about, and the caller names
+the ones it will read. The `data`-not-a-dict branch is untouched and still catches
+401 and 403.
+
+**160. Every deposit fixture in the suite was registered at `@localhost`, so no
+deposit test could ever have deposited.** `TEST_USER_EMAIL`, `ALICE`, `BOB` and the
+deposit file's own `PAYER` all used it. The whole API suite was asserting
+collections that the provider would have refused, and it passed - which is 156's
+blind spot reached from the other side: not a fake that validated nothing, but
+fixtures whose accounts could never have done the thing under test.
+
+They moved to `@example.com`, and the value is not a guess: `live@example.com` was
+accepted by Paystack in the very live run that refused `live@localhost`. The
+`carol@localhost` in the 503 test was left alone deliberately - that request is
+refused by the dependency and never reaches the payer check, and arriving at a
+different refusal there would be a bug in the ordering rather than a fixture to
+fix.
+
 ### Still open
+
+- **An account registered at an address no provider will bill has no way to fix
+  it** (decision 156). `POST /users` accepts anything with an `@`, the deposit
+  route now refuses that account's deposits with a legible 400, and **there is no
+  email-change endpoint** - so today the only remedy is a new account, which loses
+  the wallet and its history. That is a real gap and it is stated rather than
+  papered over. Two candidate shapes, and neither is obviously right: an email
+  *rule* strict enough to refuse `nobody@localhost` at registration, which means
+  this codebase asserting an email policy (157's argument against it), or an
+  email-change flow, which is a new authenticated surface with its own
+  verification story. The second is the one that matches the actual failure -
+  people mistype, and a typo is not a reason to lose a wallet.
+- **The dot rule is written from one observation, in the same way the reference
+  alphabet was** (decisions 156 and 151). What is known is that Paystack refused
+  `live@localhost` and accepted `live@example.com`, and the dot is the only
+  difference. That is not the same as knowing their rule, and the courtesy is
+  narrow for exactly that reason - but the *test* asserts the rule as though it
+  were known, so `test_payer_email.py` and `tests/conftest.py` carry the same
+  "written from memory" caveat the reference alphabet does. What settles it is a
+  live call rather than a reading, and the live run in "Reconciling the payments
+  whose webhook never arrived" is where that happens.
 
 - **Rebuilding `wallets` to carry a foreign key to `users`** (decision 59). A
   SQLite table rebuild with `PRAGMA foreign_keys` off, on a table holding real
@@ -3218,6 +3519,41 @@ and an afternoon of guessing.
   the point (decision 107) - but it is the kind of "accepted" that stops being true
   the moment there is a real install, so it belongs on this list rather than only in
   the decision.
+
+  **Re-read after 151, because the separator changed again and this entry is where a
+  reader would come looking.** Decision 152 moved the scope separator from `:` to
+  `.`, so stored references changed shape a second time - and the cost was genuinely
+  nil this time, for a reason worth keeping beside this entry: the old shape never
+  reached the provider, so no row was ever written under it. A reference that
+  Paystack refused left no ledger row behind, which is the one place where "it never
+  worked" is better news than it sounds.
+- **Paystack's reference alphabet is written down from memory, three times, and
+  nothing checks it against the provider.** This is the direct residue of decision
+  151, and it is worth stating plainly rather than leaving the tests to imply
+  otherwise. The set `letters, digits, - . , =` now appears in
+  `app/domain/money/reference.py`, in `tests/conftest.py`'s double, and in
+  `tests/domain/money/test_reference.py` - and every copy descends from the same
+  source: the `nextStep` sentence in one 400 that a live call returned once. The
+  duplication in the tests is deliberate (decision 155), so the real gap is not the
+  count, it is that **no run anywhere asks Paystack what it currently accepts.** The
+  suite can prove the code and the double still agree with the rule as it was written
+  down; only a live call can prove the rule is still the rule, which is exactly the
+  distinction that let a deposit route sit broken behind 2,042 green tests.
+
+  Two ways to close it, neither built. A one-off script that posts a handful of
+  references - one per candidate character - and records which come back
+  `invalid_character_in_reference`, run by hand when Paystack's docs change; or a
+  single test that is skipped unless a real key is present, which is the honest
+  version of the same thing but adds a test whose meaning depends on an environment
+  variable. Worth doing before this system takes a real payment, and not urgent
+  before it.
+
+  **One character in the set is a judgement rather than a quotation**, and it should
+  stay visible as one: Paystack's sentence spells the set as `-,., =`, and the space
+  inside those quotes may be punctuation or may be a member. It is read as
+  punctuation and refused (a test says so out loud), which is the safe side - but it
+  is this codebase's reading of an ambiguous sentence, not the provider's answer, and
+  the script above is what would settle it.
 - **Three receipt guards that mean the same thing and are written three times.**
   `WalletService._announce` skips a PENDING transaction; `ExecutePlanRun._record_success`
   skips a run whose rows did not all settle; and `SettlePayment._announce` skips
@@ -3524,6 +3860,24 @@ port read is about collections only), and **deposit reversals** - which was alre
 open and is unchanged.
 
 That is the last item on the original Phase 3 list. Nothing there is unbuilt any more.
+
+**And 3b's own verification is what found out that 3a's deposit route had never
+worked.** The second-to-last step of the plan is a run against a real test-mode key,
+and the first `POST /wallets/{id}/deposits` it made came back
+`invalid_character_in_reference`: the reference sent as Paystack's idempotency key
+carried a colon, and Paystack refuses colons. Every deposit in the route's history
+had been refused the same way, which the 2,042 tests then passing could not see,
+because the fake provider accepted any string it was handed (decisions 151-155).
+
+It is worth keeping in the roadmap rather than filed away as a bug, because it is
+the clearest evidence this project has for a claim Phase 4 already makes in the
+abstract: **a green suite proves the code agrees with itself.** Three of 3a's four
+bullets above were correct and stayed correct, and the one that was not was
+invisible from inside. What found it was the single step that talks to something
+this codebase does not own, and the fix's real content was giving the double an
+opinion - the alphabet is now written down twice, deliberately, in the two test
+files, because a copy that imported the constant would agree with the code by
+construction, which is the thing that had gone wrong.
 
 ### Phase 4 - Production
 

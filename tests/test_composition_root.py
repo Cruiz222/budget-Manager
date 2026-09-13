@@ -511,7 +511,7 @@ def a_pending_deposit(wallet, amount="5000", reference="dep-1") -> Transaction:
         wallet_id=wallet.wallet_id,
         type=TransactionType.DEPOSIT,
         amount=Money(Decimal(amount), NGN),
-        internal_reference=f"{wallet.wallet_id}:{reference}",
+        internal_reference=f"{wallet.wallet_id}.{reference}",
         provider_reference=reference,
     )
 

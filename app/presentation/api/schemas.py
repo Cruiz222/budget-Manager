@@ -519,9 +519,9 @@ class MovementIn(BaseModel):
     what keeps a retry from ever being handed back an old FAILED row.
 
     **The answer echoes the key you sent, not the one the ledger will hold.** The
-    transaction underneath still stores ``"<wallet uuid>:<your key>"`` - see
-    ``WalletService._scoped_reference`` - so a client that sent ``"abc"`` sees
-    ``"abc"`` back here and would see ``"<wallet uuid>:abc"`` on the transaction
+    transaction underneath still stores ``"<wallet uuid>.<your key>"`` - see
+    ``app.domain.money.reference`` - so a client that sent ``"abc"`` sees
+    ``"abc"`` back here and would see ``"<wallet uuid>.abc"`` on the transaction
     it becomes. Sending the *transaction's* form back as a new ``ref`` would be a
     new key and, for a withdrawal, a second one. Generate the key once, per
     operation, and keep it for the retry.
@@ -535,7 +535,10 @@ class MovementIn(BaseModel):
     ref: str | None = Field(
         default=None,
         examples=["withdrawal-2026-09-12"],
-        description="Idempotency key. Auto-generated when omitted.",
+        description=(
+            "Idempotency key. Auto-generated when omitted. Only letters, "
+            "digits and - . , = are accepted."
+        ),
     )
 
 
@@ -627,11 +630,25 @@ class DepositIn(BaseModel):
     The key is namespaced to the wallet before it becomes a ledger reference, on
     the same argument ``MovementIn`` gives: two callers choosing the same word do
     not collide, because the server prefixes a wallet id it has already resolved.
+
+    **And it is the one ``ref`` here with a rule about its characters.** The
+    others never leave this system; this one is quoted into a reference that a
+    payment provider has to accept, and the provider takes letters, digits and
+    ``- . , =`` and nothing else. A key outside that set is refused as an
+    ``InvalidIdempotencyKeyError`` - a 400 whose ``detail`` names the characters -
+    before any collection is opened. That refusal is made by the domain rather
+    than checked here, and it is the only place it can be made usefully: the
+    provider's own answer is a bare 400 that reads as though *this* system were
+    broken, which is exactly what it read as for as long as this route existed.
     """
 
     amount: str = Field(examples=["5000.00"])
     ref: str | None = Field(
         default=None,
         examples=["deposit-2026-09-12"],
-        description="Idempotency key. Auto-generated when omitted.",
+        description=(
+            "Idempotency key. Auto-generated when omitted. Only letters, "
+            "digits and - . , = are accepted - this key is handed to the "
+            "payment provider, which refuses anything else."
+        ),
     )

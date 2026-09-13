@@ -18,6 +18,7 @@ import hmac
 import secrets
 from datetime import date, datetime
 from decimal import Decimal
+from string import ascii_letters, digits
 from uuid import UUID, uuid4
 
 import pytest
@@ -41,6 +42,7 @@ from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notificationChannel import NotificationChannel
+from app.domain.payments.exception import PaymentProviderError
 from app.domain.payments.paymentIntent import PaymentIntent
 from app.domain.payments.providerAnswer import ProviderAnswer
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
@@ -101,9 +103,21 @@ TEST_USER_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 #: The address :data:`TEST_USER_ID` is registered at.
 #:
-#: ``localhost`` for the reason the CLI's default uses it - an address that could
-#: never be a real account cannot be mistaken for one.
-TEST_USER_EMAIL = "test@localhost"
+#: **``example.com`` rather than ``localhost``, and the change is not cosmetic: an
+#: account registered at ``localhost`` cannot take a deposit.** A payment provider
+#: refuses an address with no real domain - Paystack answers
+#: ``invalid_email_address``, which a live run found the hard way - so a suite
+#: whose standard account lived at ``localhost`` was asserting deposits that could
+#: never have happened outside the suite. That is the same shape of blind spot as
+#: the reference string this project fixed in the same week: the fixtures agreed
+#: with the code, and neither agreed with the provider.
+#:
+#: ``example.com`` keeps the property the old address had - RFC 2606 reserves it
+#: precisely so that it can never be a real account, and nobody can mistake one of
+#: these for a person - and adds the one it lacked. It is not a guess either:
+#: ``live@example.com`` was accepted by Paystack in the very live run that refused
+#: ``live@localhost``, so the value is one there is evidence for.
+TEST_USER_EMAIL = "test@example.com"
 
 #: The password :data:`TEST_USER_EMAIL` is registered with, where a test needs one.
 #:
@@ -690,6 +704,21 @@ def recording_transactions():
 #: rather than ``sk_live_`` is the honest prefix for exactly that.
 TEST_PAYSTACK_SECRET = "sk_test_" + "0" * 32
 
+#: The characters Paystack accepts in a transaction reference.
+#:
+#: Quoted from its own rejection of a reference this codebase used to send, which
+#: is the sentence that found the bug: *"Ensure that you aren't using any
+#: characters that aren't alphanumeric or contained in '-,., =' in your
+#: reference"*. The space inside those quotes is read as punctuation rather than a
+#: member of the set - no reference this system mints contains one, and refusing
+#: it is the safe side of an ambiguous sentence.
+#:
+#: **A second copy of the rule, deliberately.** It could be imported from
+#: ``app.domain.money.reference``, and importing it would make this constant
+#: agree with the code by construction rather than by being right - see
+#: ``FakePaymentProvider``'s docstring for what that cost the last time.
+_PAYSTACK_REFERENCE_ALPHABET = frozenset(ascii_letters + digits + "-.,=")
+
 
 class FakePaymentProvider(PaystackPaymentProvider):
     """A payment provider that answers instead of calling out.
@@ -733,6 +762,15 @@ class FakePaymentProvider(PaystackPaymentProvider):
     deposit path alone; a reconciler test that wants a lookup to fail scripts
     that into ``answers`` instead, where it can name the row.
 
+    **And it refuses what Paystack refuses**, which is the one thing that changed
+    after a bug this double could not see. The alphabet below is written out here
+    rather than imported from ``app.domain.money.reference``, because a double
+    that borrows the rule it is checking cannot check it: the reference that broke
+    every deposit against the real provider was perfectly well formed as far as
+    this file was concerned, so the whole API suite passed while the far end was
+    rejecting all of it. Quoting Paystack's own rejection keeps the two copies
+    independent, so a separator changed on one side fails on the other.
+
     ``provider_reference`` is the name this fake reports the collection under.
     It defaults to the reference it was handed, which is what Paystack does when
     it is given one - and it is a dial because the honest thing to test is that
@@ -775,6 +813,23 @@ class FakePaymentProvider(PaystackPaymentProvider):
         self.requests.append(
             {"reference": reference, "amount": amount, "email": email}
         )
+        if not set(reference) <= _PAYSTACK_REFERENCE_ALPHABET:
+            # Paystack's answer to this is a 400 whose body reads as though
+            # *this* system is broken - ``invalid_character_in_reference``, with
+            # the allowed set in a ``meta.nextStep`` string. Raised as the same
+            # failure the adapter would raise, so a caller has one thing to catch
+            # and a test can say which reference it was about.
+            #
+            # The sentence carries the provider's own words, because the real
+            # adapter's does now: it reports the two error-contract fields the
+            # provider sent, which is what a live run proved was missing. A double
+            # that refuses for the right reason but says less than the thing it
+            # stands in for is the same class of gap as one that refuses nothing.
+            raise PaymentProviderError(
+                "the payment provider refused the call with 400: "
+                "Invalid character in transaction reference "
+                "(invalid_character_in_reference)"
+            )
         if self._failures:
             raise self._failures.pop(0)
         return PaymentIntent(

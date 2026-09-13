@@ -67,6 +67,28 @@ class InvalidProviderAnswerError(PaymentError):
     """
 
 
+class PayerEmailRefusedError(PaymentError):
+    """The address this account would be billed under is not one a provider takes.
+
+    Raised from two places, and the pair is the design rather than a duplication.
+    ``app.domain.payments.payerEmail`` refuses an address that plainly cannot work
+    *before* a request is built, and the adapter raises this same error when
+    Paystack answers ``invalid_email_address`` - so a client is told one thing
+    whichever caught it, and correctness never rests on this codebase's reading of
+    the provider's rule. The local check makes the common case cheap; the provider
+    remains the authority.
+
+    It is not an identity error, and deliberately not raised by ``User``. The
+    account is a perfectly good account; what is unusable is the address, in the
+    one role that needs a domain a provider will bill. That asymmetry is why the
+    rule could not simply be tightened at signup - it would refuse people this
+    system has no complaint about.
+
+    Graded a 400 by falling through ``errors._grade``, like every other refusal
+    this domain makes.
+    """
+
+
 class DepositAlreadyInitiatedError(PaymentError):
     """A deposit is already open under this idempotency key.
 

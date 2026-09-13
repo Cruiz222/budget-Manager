@@ -121,11 +121,13 @@ def as_stored(wallet, internal_reference):
     against a globally unique column, with no wallet in the predicate. That is
     why the key has to carry the wallet's identity - otherwise two actors
     choosing the same word share one row and the second one's retry returns the
-    first one's transaction. Spelling the format here as well as in the service
-    is deliberate: it is observable in every money response, so it is part of
-    what this API promises rather than an internal detail.
+    first one's transaction. Spelling the format here as well as in
+    ``app.domain.money.reference`` is deliberate: it is observable in every money
+    response, so it is part of what this API promises rather than an internal
+    detail, and the separator is now a promise with a provider on the other end
+    of it - which is why a test that pins it is worth the duplication.
     """
-    return f"{wallet.wallet_id}:{internal_reference}"
+    return f"{wallet.wallet_id}.{internal_reference}"
 
 
 def notifications_of(factory):
@@ -1332,15 +1334,17 @@ class TestTheIdempotencyKeyIsScoped:
     ):
         """The shape on disk, pinned because it is visible to every client.
 
-        The key a response echoes is this one - ``"<wallet uuid>:<their key>"`` -
+        The key a response echoes is this one - ``"<wallet uuid>.<their key>"`` -
         which is why ``MovementIn``'s docstring has to tell a caller not to send
         it back: doing so would not match the row it came from, and for a
         withdrawal it would be a second one.
 
-        Pinning the separator here as well as in the service is deliberate. It is
-        not an internal detail; it is in every money response, so a change to it
-        is a change to what this API promises, and a test that would notice is
-        worth the duplication.
+        Pinning the separator here as well as in ``app.domain.money.reference``
+        is deliberate. It is not an internal detail; it is in every money
+        response, so a change to it is a change to what this API promises, and a
+        test that would notice is worth the duplication. This one is the test
+        that failed when the separator moved off ``:`` - the character a payment
+        provider refuses, which is why it moved.
         """
         wallet = build_wallet()
         service, factory = build_service(tmp_path)
@@ -1350,9 +1354,9 @@ class TestTheIdempotencyKeyIsScoped:
             wallet.wallet_id, Money(Decimal("5000"), NGN), "client-key-7"
         )
 
-        assert transaction.internal_reference == f"{wallet.wallet_id}:client-key-7"
+        assert transaction.internal_reference == f"{wallet.wallet_id}.client-key-7"
         assert get_transaction(
-            factory, f"{wallet.wallet_id}:client-key-7"
+            factory, f"{wallet.wallet_id}.client-key-7"
         ) is not None
 
     def test_the_raw_key_alone_finds_nothing(self, tmp_path, build_wallet):
