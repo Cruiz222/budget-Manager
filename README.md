@@ -3716,6 +3716,118 @@ findings, and it is the shape this whole slice was about: a value that could hav
 been refused at the door, refused later in a place that holds more than the one
 thing it was asked about.
 
+**The ten verification items, run by hand against a throwaway database, with the
+suite as one of them.** Item 1 is `python3 -m pytest -q` - 2,267 passed in 200
+seconds - and it is the only one that can be run alone. The other nine exist
+because a green suite proves the code agrees with itself and this project has
+already been taught that lesson once (decisions 151-155), so each of them puts a
+claim in front of something this codebase does not own: a real HTTP call, a real
+SMTP conversation, a real store read with the standard library's `sqlite3`. Item 3
+is the whole slice and the reason the two halves are a composition rather than a
+pair - an account registered at `nobody@localhost` before the rule existed, a
+deposit refused by the payer courtesy, `change-email` to a real address, and the
+same deposit then accepted with an `authorization_url` from Paystack.
+
+Items 4 to 9 each put one decision in front of that something. The session minted
+before the change still authorises after it - five address changes and both
+deposits, which is decision 175 made visible rather than argued. Both mails arrived
+through `aiosmtpd`: the verification carrying the code and no fabricated link, the
+notice carrying no code at all, naming the change, the moment, and the actionable
+fact. The three refusals were distinguishable by class and sentence. A second
+request left one row per account and killed the first token. An unconfigured install
+applied the change at request time, minted no row, and named the variable it lacked
+(`SMTP_HOST is not set`). A refused notice at confirm time reported
+`[Errno 111] Connection refused` while the address change stood. Item 10 is the
+boundary test's set - the two new routes appear nowhere in `app/presentation` outside
+their own module - and `plan tick` was handed over rather than run here, since it is
+actorless by dispatch position and nothing in this slice moved it.
+
+**Two of the ten refused to be as tidy as the plan assumed, and both were the
+run's errors rather than the code's.** The CLI's top-level `deposit` is a ledger
+credit (`WalletService.deposit`), not the provider path, so the first attempt at
+item 3's refusal demonstrated a command that was never supposed to refuse it; the
+payer check is reachable only through `POST /wallets/{wallet_id}/deposits`, which is
+the one path where a provider is asked to collect. And `sqlite3` is not installed on
+this machine, so every store read in the run is a `python -c "import sqlite3"`
+one-liner.
+Both are recorded because the alternative is a verification section that reads as
+though it went to plan.
+
+**One item's evidence is stronger than the plan asked for.** Item 6 wants an
+expired token, and the plan's route to one is a row backdated in the store. That
+works, and it is not what happened: the token minted at 18:26 for
+`nobody4@example.com` was still unspent when its window closed at 18:41, during the
+attempt to paste it cleanly, so the refusal the run recorded - `this email change
+expired at 2026-09-14T18:41:04.676425 and can no longer be answered` - is fifteen
+minutes elapsing rather than a `datetime` written backwards. The backdated row was
+kept as well, and what it did is the more interesting half: `EmailChange.__post_init__`
+refused to load it at all (`an email change must expire after the moment it was
+requested`), and the nearest state the shipped code can reach is
+`expires_at = requested_at + 1 second`, which is how the suite reaches it too. That
+is the aggregate doing exactly what decision 163 says an aggregate should do, and it
+is the contrast that makes the `User` case read correctly: a window is a fact about
+the row's own two fields, and usability is a fact about the world.
+
+**180. A token prompt must strip and a password prompt must not, and the alphabet
+is the whole of the difference.** `_prompt_token` returns
+`getpass.getpass("confirmation code: ")` exactly as typed, and the verification
+message indents the code by four spaces under its heading - so a reader who selects
+the whole line rather than the value pastes 44 characters whose inner 43 are the
+token. The refusal is `InvalidEmailChangeTokenError`, which names nothing,
+deliberately: a message saying "that is a code with a space on the front" would tell
+a caller something about what the store holds, and the remedy for a mistyped code and
+for an invented one is identical - ask again. The live run hit this more than once,
+and each time the refusal was indistinguishable from a token that had never existed.
+
+Stripping is safe here for a reason the token alphabet guarantees rather than one the
+prompt happens to satisfy: `secrets.token_urlsafe` draws from `[A-Za-z0-9_-]`, so
+whitespace cannot be part of a real token and any that arrives is an artefact of the
+selection. It is **not** safe one function up, and the difference is not tidiness.
+`_prompt_password` shares the no-strip habit deliberately, because a password may
+legitimately begin or end with a space - and the two failures are not equal:
+refusing a password a person typed locks them out of their own account, while
+accepting whitespace they did not type is a password they could not reproduce
+anyway. So the two prompts keep one shape and two dispositions, and what separates
+them is what the printable set can contain.
+
+**This run demonstrates the fix rather than shipping it.** The `.strip()` that made
+the paste work lived in a wrapper written to measure it; `cli.py` still passes the
+paste through untouched. It is recorded in that order on purpose, so the decision
+record does not claim a change the code does not have.
+
+**181. Neither mail identifies its own request, so a mailbox holding five of them
+cannot tell them apart.** Both subjects are fixed strings - every request's mail says
+"Confirm your new email address" and every notice says "Your account's email address
+was changed" - and neither body carries the `email_change_id`. The live run put five
+requests into one inbox inside an hour, and the only thing that distinguished them
+was arrival order, which is the one property a mail client does not promise: a
+threaded or re-sorted view loses exactly that, and the person is left holding codes
+with no way to know which window each one belongs to.
+
+This is a usability defect rather than a wrong state, which is why it is in
+`### Still open` instead of fixed here. Two candidate fixes answer different needs.
+Carrying the `email_change_id` makes a mail citable - it is a bare UUID that means
+nothing outside the store, so it adds no secret to a message that already carries the
+one credential - but it is addressed to somebody with no way to use it. Quoting the
+*request's* moment rather than the window's close gives the reader a fact they can
+match against what they did, which is how a person actually tells five similar mails
+apart, and it costs one line in a message that already prints when the window shuts.
+
+**182. An aggregate invariant reaches the wire as a 400, and its own docstring calls
+it a bug.** `errors._grade` maps any `MoneyError` that is not in `UNAUTHORIZED`,
+`NOT_FOUND` or `CONFLICT` to 400, documented as "the safe direction to be wrong in" -
+and `IdentityError` is a `MoneyError`, so `InvalidEmailChangeWindowError` is a 400.
+The error means `expires_at <= requested_at` on a stored row, which
+`EmailChange.__post_init__` refuses to construct, so the only way to reach it through
+a running server is a row written straight into the database - which is what the live
+run did, and what the aggregate then refused to load. The `unexpected_error_handler`
+is never reached.
+
+The fallthrough is right for the class it was written about, which is input a person
+supplied, and this error is not in that class: it is reached by a row, not by a
+request. That is a question rather than a fix, because both answers cost something,
+and it is in `### Still open` with the two of them.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**
@@ -3873,6 +3985,24 @@ thing it was asked about.
   that matters (an attacker holding both the password and the token logs in again
   anyway). Named here because "my sessions still work" is the kind of thing a person
   discovers at the wrong moment.
+- **Neither of the two mails identifies its own request** (decision 181). Five
+  requests landed in one inbox inside an hour, the two subject lines are fixed
+  strings, and no body carries the `email_change_id` - so arrival order is the only
+  thing that tells one mail from another, and a mail client does not promise arrival
+  order. Two candidate fixes and they are not equivalent: an id makes a mail citable
+  but is useless to the person holding it, and the request's own moment is something
+  they can match against what they did. The second is the one that helps, and
+  neither is done.
+- **An invariant whose own docstring calls it a bug answers 400** (decision 182).
+  `InvalidEmailChangeWindowError` gets to the wire through `errors._grade`'s
+  fallthrough for unlisted `MoneyError`s, so a stored row whose `expires_at` is at or
+  before its `requested_at` is reported to a client as its own bad request. Narrowing
+  the fallthrough to a named set of client-caused errors is the precise fix and means
+  classifying every 400 that currently arrives by falling through, one at a time;
+  mapping this one member to 500 would be honest about a broken row and would make
+  every future invariant reached by a direct write read as this server's fault, which
+  is what `unexpected_error_handler`'s wording is for. Doing neither leaves the grade
+  coarse rather than wrong, which is why it is here rather than done.
 - **Rebuilding the identity tables to carry foreign keys** (decision 84).
   `password_credentials.user_id` and `sessions.user_id` are plain columns, so the
   pairing between an account and its credential is guaranteed by `SignUp` writing
@@ -4393,6 +4523,13 @@ against, decision 175). And the read-only audit it was asked for turned up five 
 entry points of the same shape, one of which - a plan edited into a currency its
 wallet does not hold - takes down a whole tick rather than one request. Those are in
 `### Still open` in full, with the line numbers, and none of them was changed.
+
+**Its ten verification items were then run by hand, and the run is recorded in the
+section above** - including the two that refused to go as planned and the one whose
+evidence came out stronger than the plan asked for. Nothing there contradicted a
+decision, and all three findings it produced are defects the plan could not have
+predicted, which is 3b's lesson arriving a second time in a gentler form: what a live
+run is for is not confirmation.
 
 ### Phase 4 - Production
 
