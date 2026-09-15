@@ -16,4 +16,13 @@ prefix in their head, and the boundary this phase draws - which operations exist
 and which do not - is legible by reading the files rather than by inferring it
 from what is missing. ``tests/presentation/api/test_boundary.py`` asserts the
 missing half.
+
+``password_resets`` is the newest module and the first whose two paths are under
+prefixes that name no resource the caller owns. Every other file here answers
+"whose is this?" somewhere in its paths - ``/users/me``, ``/wallets/{id}``,
+``/sessions/current``. This one cannot, because the caller is a person who cannot
+log in: the account is inferred from an address and the mail goes to whatever
+mailbox that address names. So the paths are bare plurals, and the absence of a
+``/me`` is a true statement about the feature rather than a router that forgot to
+say whose it was.
 """

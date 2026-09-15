@@ -10,6 +10,7 @@ from app.domain.repositories.plan_notice_repository import PlanNoticeRepository
 from app.domain.repositories.password_credential_repository import (
     PasswordCredentialRepository,
 )
+from app.domain.repositories.password_reset_repository import PasswordResetRepository
 from app.domain.repositories.plan_run_repository import PlanRunRepository
 from app.domain.repositories.savings_plan_repository import SavingsPlanRepository
 from app.domain.repositories.session_repository import SessionRepository
@@ -123,6 +124,39 @@ class UnitOfWork(ABC):
     #: See ``EmailChangeRepository.claim_by_token_hash`` for the statement that
     #: spends one.
     email_changes: EmailChangeRepository
+    #: Correctness, not convenience, and the fifth member of that small group
+    #: after ``wallets``/``transactions``/``plan_runs``, ``notifications``,
+    #: ``confirmations`` and ``email_changes`` - and the one that pairs the most
+    #: things at once.
+    #:
+    #: Answering a password reset makes **three** things true together: the mailed
+    #: token was spent, the account holds a new password, and every session the
+    #: account held has been deleted. Those must land together, and a crash between
+    #: any two of them is worse than either alone. A spent token with the old
+    #: password still in place is a reset the person believes happened and that did
+    #: not. A new password with the old sessions still live is a revocation that
+    #: silently did not happen, which is the failure mode that matters most here:
+    #: the premise of a reset is that somebody else may hold the old password, so a
+    #: session opened with it and still working is exactly the hole the whole
+    #: operation exists to close. And a new password with nothing recording that the
+    #: token was spent leaves a code that can change the password a second time.
+    #:
+    #: The three halves are written by three different repositories -
+    #: ``password_resets`` here, ``password_credentials`` and ``sessions`` above -
+    #: which is the reason this declaration exists at all rather than being left to
+    #: the use case to remember. A use case that opened separate units would commit
+    #: the spend and the replacement separately, and nothing about either write
+    #: would look wrong.
+    #:
+    #: Note what is **not** on this list: the account's address. A reset does not
+    #: move it, and ``password_changed_notice`` is sent *after* the commit rather
+    #: than queued inside it - a warning that a reset happened cannot be a condition
+    #: of the reset happening. Contrast ``email_changes`` above, where the address
+    #: *is* the thing the request authorises.
+    #:
+    #: See ``PasswordResetRepository.save`` for the statement that records one and
+    #: ``PasswordResetRepository.claim_by_token_hash`` for the one that spends it.
+    password_resets: PasswordResetRepository
 
     @abstractmethod
     def commit(self) -> None:

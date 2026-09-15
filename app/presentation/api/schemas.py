@@ -598,6 +598,132 @@ class ConfirmEmailChangeIn(BaseModel):
     token: str = Field(repr=False, examples=["the code from the confirmation email"])
 
 
+class PasswordResetRequestIn(BaseModel):
+    """The address a reset is being asked for, and nothing else.
+
+    **One field, and the absence of a second is the whole design.** An address
+    change asks for a session and a password because the caller has both; a reset
+    exists because the caller has neither. So this is the only request body in the
+    API that carries no credential at all, and the field it does carry is not
+    secret - it is an address, which a stranger may already know.
+
+    ``email`` carries no validation here, and it is worth saying so because this is
+    the one place where that has a *different* consequence from everywhere else.
+    ``RequestEmailChange`` refuses a malformed address with a 400; this flow
+    deliberately does not, and treats ``not-an-address`` as an address that names
+    no account. That is not this model's decision to make or to undo - see
+    ``RequestPasswordReset``, which argues why inventing a shape rule here would be
+    a second copy of a rule only ``User`` is entitled to apply.
+
+    There is no ``repr=False`` here because there is nothing to redact. An address
+    appears in every other request body this API accepts and is not a secret; the
+    field that would need it does not exist yet, and does not exist at this step
+    even conceptually - the new password is chosen later, by whoever reads the mail.
+    """
+
+    email: str = Field(examples=["ada@example.com"])
+
+
+class PasswordResetAcceptedOut(BaseModel):
+    """That the request was received, and **nothing about whether an account exists**.
+
+    **This is the only response in the API that is deliberately the same for a hit
+    and a miss**, and the reason is that the alternative is an enumeration oracle.
+    An address that names an account and one that does not produce byte-identical
+    bodies here, because "is ada@example.com registered?" is a question a stranger
+    has no standing to ask and can otherwise ask as fast as they can type.
+
+    The consequence for a client is that this body says nothing it can act on, and
+    that is honest rather than lazy: the server genuinely has nothing to report. The
+    instruction a person needs - *if that address names an account, a code has been
+    sent* - is in the OpenAPI description and in the human-facing prose, not in a
+    response the server would have to vary to be useful.
+
+    ``status`` is a field rather than a bare 202, for the reason ``DepositIntentOut``
+    carries one: a client that reads a status code alone will eventually show the
+    wrong thing, and the cost of the extra field is one word.
+    """
+
+    status: str = Field(default="accepted", examples=["accepted"])
+
+
+class ConfirmPasswordResetIn(BaseModel):
+    """The mailed code and the password to replace, in one body.
+
+    **Two fields, and the pairing is what makes this different from the change
+    flow's confirm.** That one carries only a token because the thing being applied
+    was decided at request time and written to the row; here the row deliberately
+    holds no payload - a password is written down exactly once in this system, as an
+    argon2 hash - so the value being authorised has to arrive with the answer. The
+    permission is stored; the secret never is.
+
+    ``token`` is ``repr=False`` for ``ConfirmEmailChangeIn``'s reason and ``password``
+    for ``SignUpIn``'s, unchanged: both are credentials, and a request caught in an
+    unexpected error must not write either into whatever logs the exception.
+
+    **``password`` carries no length rule here**, which is exactly the decision
+    ``SignUpIn`` documents and it matters more in this flow rather than less. The
+    policy lives in ``PlainPassword``, and a second copy in this model would answer a
+    password that is too short with a 422 in pydantic's vocabulary instead of a 400
+    in the domain's. Beyond the vocabulary, it would change a behaviour that is
+    argued for: a refusal from the aggregate happens *before* the claim, so the code
+    is not spent and can be presented again with a longer password. A refusal here,
+    in this layer, would happen before the endpoint body ever ran - which also leaves
+    the code unspent, and that is the only reason this duplication is a nuisance
+    rather than a bug. It is still a nuisance worth refusing: two copies of the
+    policy can disagree, and the disagreement would be a password this layer accepted
+    and the aggregate refused.
+
+    No session and no address accompany these two, for ``ConfirmEmailChangeIn``'s
+    reason: the code is the whole of the authorisation and names the account itself,
+    so a third field would be a second thing to check and a second thing to get
+    wrong.
+    """
+
+    token: str = Field(repr=False, examples=["the code from the reset email"])
+    password: str = Field(
+        repr=False,
+        examples=["a long phrase you will remember"],
+        description="At least 8 characters. Never logged, never stored in the "
+        "clear - the server keeps an argon2id hash and nothing else.",
+    )
+
+
+class PasswordResetConfirmedOut(BaseModel):
+    """A replaced password, how many devices were signed out, and how warning went.
+
+    ``user`` is embedded rather than left to a second call, matching
+    ``EmailChangeConfirmedOut`` and for a stronger version of its reason: this
+    request was authorised by a code rather than a session, so the client may well
+    hold no usable token at all - every one of them has just been deleted. Without
+    this field the only way to learn who was affected would be to log in with the
+    new password, which the person may not have done yet.
+
+    ``sessions_revoked`` is reported rather than kept internal, and it is the one
+    field here a client should show. Every device that was signed in has been signed
+    out - including the one that asked, if there was one - and a person who does not
+    expect to be logged out everywhere will read a closed tab as a bug. ``0`` is a
+    real answer, not a failure: an account with no live sessions had none to end.
+
+    **``notice_sent`` and ``notice_error`` are two fields for three states**, cloned
+    from ``EmailChangeConfirmedOut`` and true for the same reasons: ``False`` with
+    ``None`` means no mail account reached this call, so no notice was attempted;
+    ``False`` with a reason means one was attempted and failed. The password changed
+    either way - refusing to apply a reset because the warning about it bounced would
+    leave the person locked out with the code spent - and a client that rendered a
+    bounced notice as an error would be reporting a courtesy as a failure. The third
+    state is unreachable for a successful confirm today, because a reset cannot be
+    requested on an install with no mail; it is kept because the value it comes from
+    can express it, and narrowing this model would mean the response silently
+    dropping a state rather than never having it.
+    """
+
+    user: UserOut
+    sessions_revoked: int
+    notice_sent: bool
+    notice_error: str | None = None
+
+
 # --- moving money -----------------------------------------------------------
 
 

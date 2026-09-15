@@ -126,6 +126,7 @@ from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
     build_confirm_email_change,
+    build_confirm_password_reset,
     build_deliverer,
     build_log_in,
     build_log_out,
@@ -134,6 +135,7 @@ from app.composition_root import (
     build_plan_service,
     build_reconciler,
     build_request_email_change,
+    build_request_password_reset,
     build_resolve_actor,
     build_scheduler,
     build_sign_up,
@@ -380,17 +382,17 @@ def _prompt_password(confirm: bool) -> str:
     return password
 
 
-def _prompt_token() -> str:
-    """Ask for the code that was mailed to a new address.
+def _prompt_code(label: str) -> str:
+    """Ask for a code that was mailed, invisibly, and return it stripped.
 
     ``getpass`` for ``_prompt_password``'s reason, and the argument is stronger
     here rather than weaker. A password is a secret its owner chose and can change;
-    this is a 256-bit value that moves an account's address, it is valid for
-    fifteen minutes, and it is the *whole* of the authorisation for the operation
-    it belongs to. ``--token abc123`` would put it in the shell's history file, in
-    ``ps`` output for the duration, and in whatever the terminal is recording - and
-    somebody who reads it out of any of those within the window can move the
-    account, with no password and no session.
+    one of these is a 256-bit value that moves an account's address or replaces its
+    password, it is valid for fifteen minutes, and it is the *whole* of the
+    authorisation for the operation it belongs to. ``--token abc123`` would put it
+    in the shell's history file, in ``ps`` output for the duration, and in whatever
+    the terminal is recording - and somebody who reads it out of any of those within
+    the window can take the account, with no password and no session.
 
     Read invisibly rather than echoed, too, and that is not only about
     over-the-shoulder reading: a terminal that echoes it has written it to
@@ -398,10 +400,33 @@ def _prompt_token() -> str:
 
     There is no confirmation prompt, unlike ``signup``. A mistyped password at
     sign-up creates an account nobody can open, which is why that one asks twice;
-    a mistyped code simply does not match anything and is refused with the
-    refusal that says so, and the person is holding the mail it came from.
+    a mistyped code simply does not match anything and is refused with the refusal
+    that says so, and the person is holding the mail it came from.
+
+    **The label is a parameter because two commands prompt for two different
+    codes**, and the difference is not cosmetic: "confirmation code" belongs to an
+    address change and "reset code" to a password reset, and a person who has asked
+    for one and is looking at a prompt naming the other would reasonably wonder
+    whether they were in the right command. Two constants at the call sites rather
+    than two functions, because everything below the label is identical.
+
+    **The value is stripped, and that is the fix decision 180 recorded and did not
+    ship.** ``getpass`` returns exactly what was typed, so a code selected with a
+    double-click and pasted arrives with the trailing whitespace the terminal
+    copied - and one of these codes is base64url, which makes ``+`` and ``/``
+    plausible-looking characters that a person may well paste with a trailing
+    space or a newline. Before this, that refusal read "the code means nothing",
+    which is true, unhelpful, and identical to the refusal for a code that genuinely
+    means nothing. Stripping is safe because the alphabet a token is drawn from
+    contains no whitespace at all, so a stripped code is either the code or a
+    different string that was never going to match.
+
+    What is deliberately *not* stripped is a password, in ``_prompt_password``
+    above: ``PlainPassword``'s docstring makes that argument in full, and it turns
+    on a password being a secret the person chose rather than a value this system
+    minted. A code has no such property - every character in it is ours.
     """
-    return getpass.getpass("confirmation code: ")
+    return getpass.getpass(label).strip()
 
 
 def _confirmed(question: str, assume_yes: bool) -> bool:
@@ -559,10 +584,12 @@ def build_parser() -> argparse.ArgumentParser:
     # They are top-level rather than nested under a noun, because there is no
     # noun that covers them - ``account signup`` would suggest the others act
     # on an account too, and logging out discards a token rather than touching
-    # one. And they are *four* rather than three now, which is the first thing
-    # an address change added to this file: ``confirm-email`` is authorised by a
-    # code mailed to the address being moved to, so it needs no session and
-    # belongs here rather than beside ``change-email``.
+    # one. And they are *six* rather than three now, which is what an address
+    # change and then a password reset added to this file: ``confirm-email`` and
+    # ``confirm-password-reset`` are each authorised by a code mailed out, so
+    # neither needs a session and both belong here rather than beside the command
+    # that asks for them - and ``reset-password`` is here because the person
+    # running it is locked out and has no session to offer.
     signup_parser = subparsers.add_parser(
         "signup",
         help="register an address, with a password to prove it later",
@@ -596,9 +623,32 @@ def build_parser() -> argparse.ArgumentParser:
         "confirm-email",
         help="apply a requested address change, using the code that was mailed",
     )
-    # No --token argument, and its absence is deliberate. See ``_prompt_token``:
+    # No --token argument, and its absence is deliberate. See ``_prompt_code``:
     # this one moves an account and expires in fifteen minutes, so the history
     # file is the last place it should be.
+
+    # ``reset-password`` and ``confirm-password-reset`` are the fifth and sixth
+    # members of this group, and they are the two commands a person runs when they
+    # cannot log in at all - which is why they are here and not below the actor
+    # line. ``reset-password`` is the only command in this file that runs as
+    # nobody *and* has nothing to prove: the caller is a stranger by construction,
+    # and the address they type is the whole of the input. ``confirm-password-reset``
+    # is the fourth command authorised by a mailed code, and the first whose code
+    # replaces a secret rather than moving an account.
+    reset_parser = subparsers.add_parser(
+        "reset-password",
+        help="ask for a code that lets this account set a new password",
+    )
+    reset_parser.add_argument("email", help="the address of the account to reset")
+
+    confirm_reset_parser = subparsers.add_parser(
+        "confirm-password-reset",
+        help="set a new password, using the code that was mailed",
+    )
+    # No --token and no --password, and both absences are deliberate. See
+    # ``_prompt_code`` and ``_prompt_password``: the first replaces an account's
+    # password and expires in fifteen minutes, the second is a secret that must
+    # never be an argument. Nothing is taken from argv by this command at all.
 
     change_parser = subparsers.add_parser(
         "change-email",
@@ -1064,7 +1114,7 @@ def _confirm_email(args, factory, settings) -> int:
     """
     result = build_confirm_email_change(
         unit_of_work_factory=factory, settings=settings
-    ).execute(_prompt_token(), datetime.now())
+    ).execute(_prompt_code("confirmation code: "), datetime.now())
 
     print(f"email changed to {result.user.email} | was {result.previous_email}")
     if result.notice_sent:
@@ -1078,6 +1128,118 @@ def _confirm_email(args, factory, settings) -> int:
         print(
             f"note: this installation has no email configured, so "
             f"{result.previous_email} was not told"
+        )
+    return 0
+
+
+def _reset_password(args, factory, settings) -> int:
+    """Ask for a code that lets this account set a new password.
+
+    **This reads no session file and proves nothing at all**, and it is the only
+    command in this file of which both are true. ``confirm-email`` reads no session
+    either, but it presents a code somebody was mailed; this one presents an
+    address and nothing else, because the person running it cannot authenticate -
+    that is what a forgotten password is. Placing it above the actor line is what
+    makes it work on a machine nobody has ever logged in on.
+
+    **What it prints differs from the API on purpose, and this is the one place the
+    two presentations genuinely disagree.** A terminal that can write to this
+    database is not a public surface - its operator could run ``sqlite3`` and read
+    the ``users`` table - so withholding "no account reads mail at that address"
+    would protect nobody and strand the person who cannot tell a typo from a
+    delivery failure. The API answers identically for both cases because a stranger
+    with a list of addresses is a different caller entirely; here, the honest answer
+    is the useful one.
+
+    **The no-mail refusal is not handled here.** ``build_request_password_reset``
+    composes the reason from the environment and the use case raises it with the
+    variable named, which ``main``'s existing ``except (MoneyError, CliError)``
+    renders as ``error: ...`` and exit 1 - the same code path every other refusal
+    takes, so there is nothing to write here for it.
+
+    A **failed send propagates**, exactly as the API's does, and the exit code is 1
+    for the same reason: the person is locked out, and telling them a code is on its
+    way when it is not would leave them waiting for a mail that will never come.
+    """
+    outcome = build_request_password_reset(
+        unit_of_work_factory=factory, settings=settings
+    ).execute(args.email, datetime.now())
+
+    if not outcome.requested:
+        # Not an error: it is the answer to a typo, and the person needs to know
+        # which of the two things happened to act on it. See the docstring for why
+        # this sentence exists in this presentation and not in the API's.
+        print(f"no account reads mail at {args.email} | nothing was sent")
+        return 0
+
+    print(
+        f"reset code sent to {args.email} | "
+        f"expires {_moment(outcome.expires_at)}"
+    )
+    print("run 'confirm-password-reset' and enter the code to set a new password")
+    return 0
+
+
+def _confirm_password_reset(args, factory, settings) -> int:
+    """Set a new password, using the code that was mailed, and sign every device out.
+
+    **It reads no session file, and the argument is ``confirm-email``'s** - the code
+    was mailed to the address the account holds, so presenting it proves something a
+    session cannot, and requiring a login to answer the mail would refuse exactly the
+    person who asked on a laptop and read the mail on a phone. There is a second
+    reason here that has no counterpart in the change flow: this command *ends every
+    session on the account*, so a person who ran it while signed in is signed out by
+    it, and a command that demanded a live session would be deleting the credential
+    it had just required.
+
+    **The new password is asked for twice**, where the code is asked for once, and
+    the asymmetry is deliberate. A mistyped code is refused by the lookup; a
+    mistyped *password* is accepted, stored, and silently replaces the one the
+    person thought they were setting - which recreates the lockout this whole
+    command exists to end, and does it while reporting success. That is the same
+    failure ``signup`` guards against with the same prompt, with more at stake: an
+    account created with an unknown password has never been used, and this one has
+    an owner who is trying to get back into it.
+
+    **The policy is not checked here.** ``PlainPassword`` owns it, and a weak
+    password is refused by the use case *before* the code is spent - so a person who
+    types six characters can present the same code again. A check in this file would
+    be a second copy of the rule, and it would move the refusal to a place that
+    cannot know whether the code was spent.
+
+    **The output reports the password change first**, because the two things after
+    it are commentary on something that has already happened. The session count is
+    printed rather than kept quiet - a person who was signed in on a phone will find
+    it signed out, and that is the fact that makes the revocation visible rather
+    than a surprise. A notice that bounced is a footnote and never a failure, for
+    the reason the API documents: the password has already changed, and exiting
+    non-zero would report a reset that happened as one that did not.
+    """
+    result = build_confirm_password_reset(
+        unit_of_work_factory=factory, settings=settings
+    ).execute(
+        _prompt_code("reset code: "),
+        _prompt_password(confirm=True),
+        datetime.now(),
+    )
+
+    print(f"password changed for {result.user.email}")
+    if result.sessions_revoked:
+        print(
+            f"{result.sessions_revoked} "
+            f"{'session' if result.sessions_revoked == 1 else 'sessions'} signed out"
+        )
+    else:
+        print("no sessions were signed in, so none had to be ended")
+
+    if result.notice_sent:
+        print(f"{result.user.email} was told about the change")
+    elif result.notice_error is not None:
+        print(f"note: {result.user.email} could not be told: {result.notice_error}")
+    else:
+        print(
+            f"note: this installation has no email configured, so "
+            f"{result.user.email} was not told"
         )
     return 0
 
@@ -2099,6 +2261,13 @@ def main(argv=None) -> int:
         # actor first, as this function used to do unconditionally, would have
         # made a scheduler that requires a login - and an address change that
         # cannot be answered from a second machine.
+        #
+        # The two password-reset commands are here for the strongest version of
+        # that argument: ``reset-password`` cannot resolve an actor because the
+        # person running it is locked out, and ``confirm-password-reset`` resolves
+        # none because answering the mail is what proves the account - and because
+        # it *ends every session*, so demanding a live one would be deleting the
+        # credential it had just required.
         if args.command == "signup":
             return _signup(args, factory)
         if args.command == "login":
@@ -2107,6 +2276,10 @@ def main(argv=None) -> int:
             return _logout(args, factory)
         if args.command == "confirm-email":
             return _confirm_email(args, factory, settings)
+        if args.command == "reset-password":
+            return _reset_password(args, factory, settings)
+        if args.command == "confirm-password-reset":
+            return _confirm_password_reset(args, factory, settings)
         if args.command == "plan" and args.plan_command == "tick":
             return _plan_tick_command(args, factory, settings, deferred_reason)
         if args.command == "reconcile":

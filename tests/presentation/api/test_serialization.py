@@ -30,7 +30,13 @@ from app.domain.planning.cadence import Cadence
 from app.domain.planning.planSource import PlanSource
 from app.domain.planning.planStatus import PlanStatus
 from app.domain.planning.plannedAction import PlannedAction
-from app.presentation.api.schemas import LogInIn, SignUpIn
+from app.presentation.api.schemas import (
+    ConfirmEmailChangeIn,
+    ConfirmPasswordResetIn,
+    EmailChangeIn,
+    LogInIn,
+    SignUpIn,
+)
 from app.presentation.cli import main
 from tests.conftest import log_in_as
 
@@ -309,11 +315,14 @@ class TestTheTwoPresentationsAgree:
 class TestThePasswordIsNotInTheRepr:
     """A secret in a repr is a secret in a log, and ``schemas.py`` claims otherwise.
 
-    ``SignUpIn`` and ``LogInIn`` set ``Field(repr=False)`` on ``password``, and their
-    docstring says what it buys: without it, a model caught in an unexpected error
-    writes the secret into whatever records the exception - the same hazard
-    ``PlainPassword.__repr__`` closes one layer down. That is a claim about a leak,
-    so it gets a test rather than a comment.
+    Six fields across five models set ``Field(repr=False)``, and their docstrings say
+    what it buys: without it, a model caught in an unexpected error writes the secret
+    into whatever records the exception - the same hazard ``PlainPassword.__repr__``
+    closes one layer down. That is a claim about a leak, so it gets a test rather
+    than a comment. The fields are ``SignUpIn.password``, ``LogInIn.password``,
+    ``EmailChangeIn.password``, ``ConfirmEmailChangeIn.token`` and both fields of
+    ``ConfirmPasswordResetIn`` - and the last three arrived with the two
+    mailbox-credential flows rather than with the first two.
 
     It lives in this file because this is where the request and response *shapes* are
     pinned, and because it is otherwise easy to read as covered: the API's own tests
@@ -321,8 +330,8 @@ class TestThePasswordIsNotInTheRepr:
     is in-process - a traceback, a debugger, a ``repr`` in a log line - and nothing
     that goes through ``client`` can see it.
 
-    ``pydantic`` emits an ``UnsupportedFieldAttributeWarning`` for these two fields,
-    and it is **expected rather than a symptom**. The warning is about the attribute
+    ``pydantic`` emits an ``UnsupportedFieldAttributeWarning`` for these fields, and
+    it is **expected rather than a symptom**. The warning is about the attribute
     being meaningless in the *standalone* context FastAPI builds -
     ``TypeAdapter(Annotated[SignUpIn, field_info])``, at ``fastapi/_compat.py:111`` -
     which is a validator and never produces a model repr. ``BaseModel.__repr_args__``
@@ -330,6 +339,12 @@ class TestThePasswordIsNotInTheRepr:
     assert. Silencing the warning would be the wrong fix: it is pydantic correctly
     reporting that one particular use of the attribute does nothing, and a filter
     would hide the same warning the day it meant something.
+
+    That the warning means no harm is read off the source rather than guessed from
+    the message - ``pydantic/main.py``, ``__repr_args__``, yields a field only
+    ``if field and field.repr`` - because the message alone is the sort of warning
+    that reads as "your redaction is not working" and invites a fix that changes
+    nothing but three docstrings.
     """
 
     def test_the_signup_model_hides_the_password(self):
@@ -337,6 +352,39 @@ class TestThePasswordIsNotInTheRepr:
 
     def test_the_login_model_hides_the_password(self):
         assert "THE-SECRET" not in repr(LogInIn(email="ada@example.com", password="THE-SECRET"))
+
+    def test_the_email_change_hides_the_password_it_proves_the_owner_with(self):
+        """The request half of the address change, and the only password in it.
+
+        Worth its own test rather than a share of one above: this is the field whose
+        absence is what keeps a stolen session from walking an account to another
+        mailbox, so a repr that printed it would leak the second factor of a flow
+        that exists because one factor is not enough.
+        """
+        assert "THE-SECRET" not in repr(
+            EmailChangeIn(email="ada@example.com", password="THE-SECRET")
+        )
+
+    def test_the_mailed_code_models_hide_the_code(self):
+        """**Two models with no field that is not a secret, which is the point.**
+
+        ``ConfirmEmailChangeIn`` and ``ConfirmPasswordResetIn`` are the shapes where
+        the whole body is the credential - the first holds a code and nothing else,
+        the second a code and the password it authorises. There is no control
+        available here the way ``test_and_the_address_is_still_there`` is a control
+        above, because there is no non-secret field to survive: a repr that showed
+        nothing at all would pass this test, and that repr would be correct.
+
+        The stakes are the reason to assert it anyway. A password is a secret the
+        account's owner chose and can choose again; these codes are bearer
+        credentials with a fifteen-minute life whose bearer can replace the password
+        outright, so a code in a traceback is a code in somebody's log file, and the
+        window it opens is the window the account is least defended in.
+        """
+        assert "THE-SECRET" not in repr(ConfirmEmailChangeIn(token="THE-SECRET"))
+        assert "THE-SECRET" not in repr(
+            ConfirmPasswordResetIn(token="THE-SECRET", password="THE-SECRET")
+        )
 
     def test_and_the_address_is_still_there(self):
         """The control. Without it both tests above pass for a repr that says nothing.
@@ -347,6 +395,9 @@ class TestThePasswordIsNotInTheRepr:
         """
         assert "ada@example.com" in repr(SignUpIn(email="ada@example.com", password="THE-SECRET"))
         assert "ada@example.com" in repr(LogInIn(email="ada@example.com", password="THE-SECRET"))
+        assert "ada@example.com" in repr(
+            EmailChangeIn(email="ada@example.com", password="THE-SECRET")
+        )
 
     def test_the_password_is_in_the_model_all_the_same(self):
         """Hidden from the repr, not from the code that has to read it.
@@ -355,6 +406,16 @@ class TestThePasswordIsNotInTheRepr:
         reachable - this is a repr rule and not an access rule, and asserting the
         difference is what keeps somebody from "fixing" the leak by making the field
         private, which would break the endpoint while keeping these tests green.
+
+        The same has to hold for the two reset fields, for a blunter reason: the
+        confirm has to read ``body.token`` to claim the row and ``body.password`` to
+        hash it, so a redaction that made either unreachable would not be a leak
+        fixed but a feature deleted.
         """
         assert SignUpIn(email="ada@example.com", password="THE-SECRET").password == "THE-SECRET"
+
+        body = ConfirmPasswordResetIn(token="THE-SECRET", password="THE-SECRET")
+
+        assert body.token == "THE-SECRET"
+        assert body.password == "THE-SECRET"
         assert LogInIn(email="ada@example.com", password="THE-SECRET").password == "THE-SECRET"

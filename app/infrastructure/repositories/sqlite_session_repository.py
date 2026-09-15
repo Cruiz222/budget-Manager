@@ -87,6 +87,38 @@ class SqliteSessionRepository(SessionRepository):
             "DELETE FROM sessions WHERE token_hash = ?", (token_hash,)
         )
 
+    def delete_by_user_id(self, user_id) -> int:
+        """Remove every session this account holds, returning the count.
+
+        **One statement, and the whole of "sign every device out" is that it is
+        one.** A loop over ``delete_by_token_hash``, or a read of the account's
+        sessions followed by a delete of each, would be a revocation that could be
+        interleaved: a login committing between the reading and the last delete
+        would survive the sweep and stay signed in under a password that has just
+        been replaced, which is the exact outcome a reset exists to prevent. Since
+        the caller holds the write lock of the surrounding transaction, a single
+        ``DELETE ... WHERE user_id = ?`` makes "no session of this account remains"
+        a fact rather than an intention.
+
+        ``user_id`` arrives as a ``uuid.UUID`` and is converted here rather than at
+        the call site, matching ``save``: what a caller has is an id, and how this
+        store spells one is this store's business. ``text_to_uuid`` in the other
+        direction is the ``_row_to_session`` convention.
+
+        ``rowcount`` is returned rather than discarded, unlike
+        ``delete_by_token_hash`` - not to make a missing match an error (a second
+        call gets ``0`` and must not raise; the postcondition is already true), but
+        because the number is a fact the use case reports: the notice tells the
+        person that every device was signed out, and the count is what distinguishes
+        that sentence from a hope. Note the one thing it does *not* measure: a
+        session that was already deleted is absent from it, so the number is "how
+        many were ended by this call", never "how many the account had".
+        """
+        cursor = self._connection.execute(
+            "DELETE FROM sessions WHERE user_id = ?", (uuid_to_text(user_id),)
+        )
+        return cursor.rowcount
+
     def _row_to_session(self, row) -> Session:
         """Rebuild a session from its row.
 

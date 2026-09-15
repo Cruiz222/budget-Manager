@@ -45,6 +45,16 @@ answered by a token mailed to the address being moved to, which is a better
 warrant than the session that asked for it. Everything else here is "the services
 built for them"; those three are what is left when "them" is the wrong question.
 Their docstrings carry the arguments.
+
+**The two password-reset services make that four**, and they are the first pair
+added together rather than one at a time. Neither has an actor, and the asymmetry
+between them is the interesting part: the confirm joins the group above, since its
+warrant is a mailed code, while the *request* has no warrant at all and cannot have
+one - the caller is here precisely because they cannot log in. It is the only
+service in this module built for somebody the request has not identified, and the
+only one whose honest answer to "who is asking?" is "a stranger, about an address".
+See ``request_password_reset_service``, which is where that stops being alarming
+and becomes a design.
 """
 
 from datetime import datetime
@@ -52,9 +62,11 @@ from datetime import datetime
 from fastapi import Depends, Request
 
 from app.application.identity.confirm_email_change import ConfirmEmailChange
+from app.application.identity.confirm_password_reset import ConfirmPasswordReset
 from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
 from app.application.identity.request_email_change import RequestEmailChange
+from app.application.identity.request_password_reset import RequestPasswordReset
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.payments.initiate_deposit import InitiateDeposit
@@ -63,11 +75,13 @@ from app.application.plan_service import PlanService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
     build_confirm_email_change,
+    build_confirm_password_reset,
     build_initiate_deposit,
     build_log_in,
     build_log_out,
     build_plan_service,
     build_request_email_change,
+    build_request_password_reset,
     build_resolve_actor,
     build_settler,
     build_sign_up,
@@ -183,7 +197,7 @@ def plan_service(
 
 
 def sign_up_service(request: Request) -> SignUp:
-    """Registration, which is one of the two things reachable without a token.
+    """Registration, which is one of the five things reachable without a token.
 
     No ``current_actor`` parameter, and it cannot have one: signing up is how a
     person comes to be able to authenticate, so demanding a token would make the
@@ -207,7 +221,8 @@ def sign_up_service(request: Request) -> SignUp:
 
 
 def log_in_service(request: Request) -> LogIn:
-    """Login, the other thing reachable without a token, for the same reason.
+    """Login, the second of the five things reachable without a token, and the other
+    one that is a way in.
 
     **This endpoint is slow on purpose and must stay off the event loop.** It is
     a plain ``def``, so FastAPI runs it in its threadpool, which is what makes
@@ -277,7 +292,7 @@ def confirm_email_change_service(request: Request) -> ConfirmEmailChange:
     session on top would add a way for the person who asked to be refused without
     adding a check. See ``ConfirmEmailChange``, which argues this at length.
 
-    That makes it the API's second unauthenticated write, and the reason it is not
+    That makes it the API's third unauthenticated write, and the reason it is not
     a hole is worth stating where the missing dependency is visible: what it can
     write is one account's address, and the only way to reach the write is to
     present a value this system posted to that address.
@@ -288,6 +303,66 @@ def confirm_email_change_service(request: Request) -> ConfirmEmailChange:
     """
     return build_confirm_email_change(
         unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.settings,
+    )
+
+
+def request_password_reset_service(request: Request) -> RequestPasswordReset:
+    """Asking for a reset, which is built for nobody and cannot be built for anybody.
+
+    **No ``current_actor``, and unlike every other absence in this module this one
+    is not a statement about warrant - it is the situation.** The caller cannot
+    authenticate; that is what a forgotten password *is*. A dependency that
+    demanded a token would refuse every request this endpoint exists to serve, and
+    there is no substitute proof available: an address and nothing else is the
+    entire input.
+
+    So the honest description of what is built here is a service that will send one
+    mail to one address if that address names an account, and will say nothing that
+    distinguishes the two cases. The containment is not in this function - it is in
+    the use case, which is where the argument is written down; what this function
+    guarantees is that no token is consulted, so a caller cannot even *try* to make
+    the request be about somebody.
+
+    **``settings`` is passed even though the builder may refuse**, and the
+    difference from ``request_email_change_service`` above is worth reading as a
+    pair. That one hands over mail settings that may resolve to no channel, and the
+    use case treats that as an instruction to apply the change immediately. Here a
+    missing channel is a refusal, and the sentence it refuses with is composed by
+    the builder from the environment - which is why this dependency hands over the
+    settings and reads nothing itself. Nothing in this module ever calls
+    ``describe_configuration``; if it did, the CLI would need a second copy.
+    """
+    return build_request_password_reset(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.settings,
+    )
+
+
+def confirm_password_reset_service(request: Request) -> ConfirmPasswordReset:
+    """Answering a reset, which has no actor for ``confirm_email_change_service``'s reason.
+
+    **The fourth service here built without one**, and it belongs to the group
+    whose absence is about *proof*: a reset is answered by a code mailed to the
+    address the account already holds, so possession of that mailbox is a better
+    warrant than a session would be. A session on top would not add a check - it
+    would add a way for the person who asked on a laptop and read the mail on a
+    phone to be refused by exactly the operation that exists to let them back in.
+
+    It takes the hasher where the confirm above does not, because this is the one
+    use case in the identity group that *writes* a credential rather than reading
+    one - see ``build_confirm_password_reset``. The hasher comes off
+    ``app.state``, exactly as ``sign_up_service``'s does, so the argon2 adapter is
+    still constructed in exactly one place.
+
+    ``settings`` for the notice that the password changed. A missing channel here
+    is *not* a refusal, and the asymmetry with the request above is deliberate:
+    this call has already spent the code, so refusing would leave the account with
+    a dead code and an unchanged password. The result reports the notice instead.
+    """
+    return build_confirm_password_reset(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        password_hasher=request.app.state.password_hasher,
         settings=request.app.state.settings,
     )
 

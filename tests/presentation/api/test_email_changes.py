@@ -18,10 +18,10 @@ the absence in the strongest available form: the *literal code* is not a substri
 of the response text.
 
 **The confirm is authorised by that code and by nothing else.** It is the API's
-second unauthenticated write, so this file asserts the property from both sides -
-a confirm with no ``Authorization`` header succeeds, and one carrying a nonsense
-bearer token also succeeds, which is what rules out a dependency that reads a
-session when it is offered.
+third unauthenticated write, after ``POST /users`` and ``POST /sessions``, so this
+file asserts the property from both sides - a confirm with no ``Authorization``
+header succeeds, and one carrying a nonsense bearer token also succeeds, which is
+what rules out a dependency that reads a session when it is offered.
 """
 
 from datetime import datetime, timedelta

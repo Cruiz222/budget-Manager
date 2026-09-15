@@ -14,14 +14,23 @@ as they come up:
     409  the resource is there, and its current state refuses this
     400  something in the request is not acceptable
     422  the request did not have the shape the endpoint declares (FastAPI's own)
+    503  this installation cannot serve this request, whoever asks
     500  a bug
 
-Four of those six are defaults rather than lists. ``UNAUTHORIZED``,
-``NOT_FOUND`` and ``CONFLICT`` are the three exceptions worth naming, and
-everything else that is a ``MoneyError`` is a 400 - which is the safe direction
-to be wrong in. A refusal this module has never heard of is far more likely to be
-about a value the caller sent than about a resource's state, and a 400 tells the
-caller to look at their request rather than to retry.
+Four of those seven are defaults rather than lists. ``UNAUTHORIZED``,
+``NOT_FOUND``, ``CONFLICT`` and ``UNAVAILABLE`` are the four exceptions worth
+naming, and everything else that is a ``MoneyError`` is a 400 - which is the safe
+direction to be wrong in. A refusal this module has never heard of is far more
+likely to be about a value the caller sent than about a resource's state, and a
+400 tells the caller to look at their request rather than to retry.
+
+**``UNAVAILABLE`` was added late and is the only list that is not about the
+caller at all**, which is worth marking because it changes what this module is
+for: three of the four grades answer a question about the request, and the fourth
+answers a question about the deployment. It exists because a forgotten-password
+request cannot be honoured without a mailbox, and a domain refusal for that fact
+would otherwise have fallen through to the 400 - telling somebody their address
+was malformed when the address was fine and the mail server was not configured.
 
 **401 sits above 404 because it is a different kind of question.** The three
 below it are all answers about a resource - there, not there, refusing - and they
@@ -56,7 +65,11 @@ from app.domain.identity.exception import (
     EmailUnchangedError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
+    InvalidPasswordResetTokenError,
     InvalidSessionError,
+    NoMailAccountError,
+    PasswordResetAlreadyUsedError,
+    PasswordResetExpiredError,
     UserNotFoundError,
 )
 from app.domain.money.exception import (
@@ -120,10 +133,20 @@ from app.domain.payments.exception import DepositAlreadyInitiatedError
 #: noticing that this is where it is most obviously right: a client cannot
 #: *satisfy* a challenge for a code it was mailed, so a header naming a scheme
 #: would be pointing at something that does not exist.
+#:
+#: ``InvalidPasswordResetTokenError`` is the newest member and the exact counterpart
+#: of the one above, one flow over. It is the same three-way collapse for the same
+#: reason - no such code, a code naming a deleted account - and it is a 401 for the
+#: same reason: the request presented a credential, the credential was looked up,
+#: and it was not good enough. The three refusals a reset can make map onto the
+#: grades identically to a change's, which is the point worth checking rather than
+#: assuming: **the pairing is the test of whether the two flows really do share a
+#: lifecycle**, and `tests/presentation/api/test_password_resets.py` asserts it.
 UNAUTHORIZED = (
     InvalidSessionError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
+    InvalidPasswordResetTokenError,
 )
 
 #: The resource is not there for the actor asking. One status, one body, whatever
@@ -198,6 +221,15 @@ NOT_FOUND = (
 #: the account is already in the state it is asking for - so the honest answer is
 #: "not from where you are standing" rather than a 400 blaming a value that is
 #: fine, and definitely not a 200 reporting a change that did not happen.
+#:
+#: ``PasswordResetExpiredError`` and ``PasswordResetAlreadyUsedError`` are the
+#: reset flow's pair, and they are the change flow's pair restated: the same two
+#: classes, the same two remedies, the same refusal to collapse them into the 401
+#: above. The reason the resemblance is worth stating rather than assuming is that
+#: the *consequence* differs even though the grading does not - a spent or lapsed
+#: code here means a password that was not changed, so "ask again" is the remedy for
+#: somebody who is still locked out rather than for somebody whose address is still
+#: the old one.
 CONFLICT = (
     InsufficientFundsError,
     WalletFrozenError,
@@ -222,6 +254,8 @@ CONFLICT = (
     EmailUnchangedError,
     EmailChangeExpiredError,
     EmailChangeAlreadyUsedError,
+    PasswordResetExpiredError,
+    PasswordResetAlreadyUsedError,
 )
 
 
@@ -336,6 +370,33 @@ class PaymentsUnconfiguredError(ApiError):
     status_code = 503
 
 
+#: The installation cannot serve this request, whatever the caller does. These are
+#: statements about *this deployment* rather than about the request or the caller,
+#: and the 503 is what tells a well-behaved client to come back later instead of
+#: changing what it sent.
+#:
+#: **``NoMailAccountError`` is the newest member, and it joins the group the
+#: module's own header did not have a name for.** ``PaymentsUnconfiguredError``
+#: above is a 503 this layer makes; this is a 503 the *domain* makes, which is why
+#: it needs a grade rather than a class - and the arrival of a second member is
+#: what turns "the payment key is missing" from a one-off into a category.
+#:
+#: It is a 503 and not a 400 for exactly the reason the payment one is: the request
+#: is well formed, the address is a real address, and there is no way to prove a
+#: forgotten password on a machine that cannot send mail. Telling the caller their
+#: request was wrong would send them to look for a typo in an address that is
+#: correct.
+#:
+#: The body names the missing variable, because the use case's sentence is composed
+#: from ``describe_configuration``. That is a deliberate disclosure on an
+#: unauthenticated endpoint - it tells a stranger that this install has no SMTP -
+#: and it is the right trade: an operator who cannot see which variable is missing
+#: cannot fix it, the fact is already inferable from the 503, and nothing here is
+#: secret. The alternative, a 503 saying only "unavailable", is the failure mode
+#: ``describe_configuration`` exists to prevent.
+UNAVAILABLE = (NoMailAccountError,)
+
+
 def _grade(exc: MoneyError) -> int:
     """The status for a domain refusal, by kind rather than by name.
 
@@ -346,7 +407,17 @@ def _grade(exc: MoneyError) -> int:
     400, and it is the same grade ``InvalidUserEmailError`` gets beside it, which
     is the pair that has to agree: a person told "that is not an address" and a
     person told "that address cannot work" are being told the same kind of thing.
+
+    ``UNAVAILABLE`` is tested **first**, and the order is load-bearing rather than
+    stylistic. It is the only grade that is about the server rather than about the
+    caller, so it is the only one whose answer does not depend on anything the
+    request carried - and testing it first makes that visible: a request that is
+    simultaneously unauthenticated and unservable is answered with the state of the
+    installation, which is the fact that will still be true once the caller fixes
+    their half.
     """
+    if isinstance(exc, UNAVAILABLE):
+        return 503
     if isinstance(exc, UNAUTHORIZED):
         return 401
     if isinstance(exc, NOT_FOUND):

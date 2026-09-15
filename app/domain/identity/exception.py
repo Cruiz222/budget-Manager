@@ -253,3 +253,108 @@ class EmailChangeAlreadyUsedError(IdentityError):
 #: instance of the aggregate ever being stored in it.
 class EmailChangeExpiredError(IdentityError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Resetting a forgotten password
+# ---------------------------------------------------------------------------
+#
+# The same three groups as above, one aggregate further along, and the split
+# between them is the same split for the same reason. What is *not* here is worth
+# counting: an ``EmailChange`` needs a class for a new address carried on the row,
+# and this row carries no payload at all - the password a reset authorises is
+# never written down, so there is nothing on it to validate.
+#
+# Every one of these is a type-guard rather than a policy, and in practice means a
+# repository that mapped a column wrongly.
+class InvalidPasswordResetIDError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetUserIDError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetTokenHashError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetStatusError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetRequestedAtError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetExpiresAtError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetWindowError(IdentityError):
+    pass
+
+
+class InvalidPasswordResetSettledAtError(IdentityError):
+    pass
+
+
+#: The reset token is unknown, or names an account that is gone.
+#:
+#: One class for both, for ``InvalidEmailChangeTokenError``'s reason exactly: a
+#: caller who can tell "no such code" from "a code whose account vanished" has an
+#: oracle, and the remedy is the same either way.
+#:
+#: **Deliberately not shared with the two below and not shared with the email
+#: change trio either.** The three refusals of a reset are the same three a change
+#: has, but a caller that catches one is catching a fact about *this* request, and
+#: a shared vocabulary across two features would mean a change to one had to be
+#: reasoned about in terms of the other. See ``EmailChangeStatus`` for the same
+#: argument one layer down.
+class InvalidPasswordResetTokenError(IdentityError):
+    pass
+
+
+#: The reset has already been answered.
+#:
+#: Reachable only because the row survives being spent - deleting it on use would
+#: collapse this into ``InvalidPasswordResetTokenError`` and lose the difference
+#: between "you already did this" and "that code means nothing". It is worth more
+#: here than an email change's equivalent: a person who has already reset their
+#: password and presents the same code again has, in all likelihood, simply
+#: forgotten which mail they answered.
+class PasswordResetAlreadyUsedError(IdentityError):
+    pass
+
+
+#: The reset's window closed before it was answered.
+#:
+#: Derived and never written, exactly as ``EmailChangeExpiredError`` is.
+class PasswordResetExpiredError(IdentityError):
+    pass
+
+
+#: This installation has no mail account, so a forgotten password cannot be reset.
+#:
+#: **The member of this module that is not a fact about an account**, and it earns
+#: its place by being the only honest answer available. The address change has a
+#: fallback for a mail-less install - it applies on the password proof alone - and
+#: a forgotten password has no equivalent proof, because the whole premise is that
+#: the caller cannot demonstrate the one secret the account holds. So refusing is
+#: not a missing feature; it is the only thing that is true.
+#:
+#: It is raised by the use case rather than by a presentation dependency, and that
+#: is a deliberate departure from the arrangement ``dependencies.payment_provider``
+#: uses for the payment settings. There is one mail configuration for the whole
+#: installation and *two* presentations that need this refusal, and a guard written
+#: into the HTTP layer would have to be written again in the CLI - which is the
+#: shape ``fold_email`` exists to end. So the sentence is composed once, by the
+#: builder that knows the settings, and both presentations render it through the
+#: handlers they already have.
+#:
+#: The reason string names the missing variable, which is
+#: ``describe_configuration``'s whole purpose: the failure mode of a misconfigured
+#: notifier is silence, and "SMTP_HOST is not set" is the difference between a
+#: two-minute fix and an afternoon of guessing.
+class NoMailAccountError(IdentityError):
+    pass

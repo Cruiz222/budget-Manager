@@ -48,15 +48,17 @@ import pytest
 #: the safe side of the line - or deciding the line has moved.
 EXPECTED_OPERATIONS = {
     ("get", "/health"),
-    # Two of the three unauthenticated writes, and the only routes on this list
+    # Two of the five unauthenticated writes, and the only routes on this list
     # that need nobody: they are how a caller comes to have a credential at all.
-    # (The third arrived with the email change, and it is at the end of this set
-    # rather than here because it is authorised by something else entirely - a
-    # code mailed to the address being moved to. What it has in common with these
-    # two is only the absence of a bearer token.) They are listed here like
-    # everything else rather than held, because the boundary is about what is
-    # *routable*, and the question of whether they should be rate limited is a
-    # different one that lives in the README's open list.
+    # (The other three arrived later - the email change's confirm and, last, the
+    # two password-reset routes. They sit at the end of this set rather than here
+    # because they are authorised by something else entirely: a code mailed to an
+    # address. What they have in common with these two is only the absence of a
+    # bearer token, and what they have in common with *each other* is a feature.)
+    # They are listed here like everything else rather than held, because the
+    # boundary is about what is *routable*, and the question of whether they should
+    # be rate limited is a different one that lives in the README's open list -
+    # where the reset request has now joined it as the entry that most needs one.
     ("post", "/users"),
     ("get", "/users/me"),
     ("post", "/sessions"),
@@ -160,14 +162,17 @@ EXPECTED_OPERATIONS = {
     # an account means "you must be that account to touch it". The confirm is not
     # under it, and takes no token at all.
     #
-    # **The confirm is the third unauthenticated write in this API**, after
-    # ``POST /users`` and ``POST /sessions``, and the only one authorised by a
-    # thing mailed rather than presented at the time. It is not a hole, and the
-    # argument is short: the code exists only because somebody already presented
-    # the account's password to mint it, and it was mailed to the address being
-    # moved to - so the proof is already spent on this change, and requiring a
-    # session on top would refuse the person who asked at a desk and opened the
-    # mail on a phone. See ``routes/email_changes.py``.
+    # **The confirm used to be the third unauthenticated write in this API and the
+    # only one authorised by a thing mailed rather than presented at the time.**
+    # Both halves of that sentence are now out of date, and the two entries below
+    # are why: there are five unauthenticated writes rather than three, and the
+    # reset confirm is authorised by a mailed code in the same sense this one is.
+    # What is still true, and is the part that matters, is that the code exists
+    # only because somebody already presented the account's password to mint it,
+    # and it was mailed to the address being moved to - so the proof is already
+    # spent on this change, and requiring a session on top would refuse the person
+    # who asked at a desk and opened the mail on a phone. See
+    # ``routes/email_changes.py``.
     #
     # It is a *write*, unlike the ``GET`` on a confirmation above, and the reason
     # is the same one that makes the comparison worth drawing: looking at a
@@ -175,6 +180,50 @@ EXPECTED_OPERATIONS = {
     # ``EmailChangeStatus.CONFIRMED`` means.
     ("post", "/users/me/email-changes"),
     ("post", "/email-changes/confirm"),
+    # --- setting a forgotten password, added last ---------------------------
+    #
+    # Two routes for one feature, on **bare plural prefixes**, and unlike every
+    # other entry on this page that absence is the decision rather than an
+    # oversight. ``/users/me`` and ``/wallets/{id}`` both answer "whose is this?"
+    # somewhere in their paths; these two cannot, because the caller is a person
+    # who cannot log in. The account is inferred from an address and the mail goes
+    # to whatever mailbox that address names, so a path claiming ``/users/me``
+    # would promise a check this feature is unable to perform.
+    #
+    # **The request is the fifth unauthenticated write in this API and the first
+    # aimed at an account its caller has no claim on.** Rank the five and the ranking
+    # is the argument:
+    # ``POST /users`` creates an account nobody had, ``POST /sessions`` exchanges a
+    # secret the caller already knows, ``POST /email-changes/confirm`` acts on an
+    # account the caller proved by password and then by mailbox, and
+    # ``POST /password-resets/confirm`` does the same by mailbox alone - and the
+    # last two differ only in which secret the mailbox lets its reader replace.
+    # This one is different in kind: it takes an address, proves nothing, writes a
+    # row against an account, and causes a mail. What it cannot do is read an
+    # account, change one, or learn whether one exists - the response is
+    # byte-identical either way - and every consequence of it requires the mailbox
+    # the mail arrived in.
+    #
+    # It is also the route that most needs rate limiting, and it is named in the
+    # README's open list for that rather than quietly shipped. The honest gap is
+    # that the response is identical and the *latency* is not: an SMTP round trip
+    # happens on one arm and not the other. No status code could close that, and a
+    # limiter is the thing that would.
+    ("post", "/password-resets"),
+    #
+    # The confirm, which answers with a replacement password rather than a new
+    # address. Same lifecycle, same three refusals mapped to the same three
+    # statuses, and the sharpest thing in this API a mailed value authorises: every
+    # session on the account is deleted by it. The test beside this file's
+    # ``test_the_old_bearer_token_is_refused`` is the claim in one line - the token
+    # a client is holding stops working at the door.
+    #
+    # Note what it does not do, because it is the temptation the shape invites:
+    # the account it acts on is read off the claimed row and never off the request,
+    # so there is no id to substitute. The absence of a ``current_actor`` here is
+    # not "authentication is optional"; it is that the code *is* the authorisation,
+    # and a client holding a stale token must be neither helped nor refused by it.
+    ("post", "/password-resets/confirm"),
 }
 
 #: Balance changes that are still held, each one because the movement's far end

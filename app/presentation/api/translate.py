@@ -26,8 +26,10 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from app.application.identity.confirm_email_change import ConfirmedEmailChange
+from app.application.identity.confirm_password_reset import ConfirmedPasswordReset
 from app.application.identity.log_in import LoggedIn
 from app.application.identity.request_email_change import EmailChangeOutcome
+from app.application.identity.request_password_reset import PasswordResetOutcome
 from app.application.payments.initiate_deposit import InitiatedDeposit
 from app.application.wallet_service import ConfirmedOperation
 from app.domain.identity.user import User
@@ -376,6 +378,55 @@ def email_change_confirmed_out(
     return schemas.EmailChangeConfirmedOut(
         user=user_out(confirmed.user),
         previous_email=confirmed.previous_email,
+        notice_sent=confirmed.notice_sent,
+        notice_error=confirmed.notice_error,
+    )
+
+
+def password_reset_accepted_out(
+    outcome: PasswordResetOutcome,
+) -> schemas.PasswordResetAcceptedOut:
+    """That a reset was asked for, saying nothing about whether an account was found.
+
+    **``outcome`` is deliberately not read**, and that is the whole of this
+    function. It carries a ``requested`` flag the CLI reads and this must not:
+    branching on it here - to vary a word, a status or a code - is exactly the
+    enumeration oracle the endpoint is built to avoid, and it would be a branch
+    nobody could see from the response because the response would be right in both
+    arms. So the parameter is accepted and dropped, which is more honest than a
+    signature with no argument at all: the route has a value in hand, and this is
+    the line where it stops.
+
+    The alternative shape - a route that called the service and built the schema
+    inline, never touching the outcome - was rejected for a narrower reason than
+    security: every other route in this API goes through a translator, and one that
+    quietly did not would be the file a reader has to check to find out whether the
+    rule above is kept. Here it is kept in the one place the rule would be broken.
+
+    The ``status`` field's default comes from the schema rather than from this
+    argument, so there is not even a word here that could depend on the account.
+    """
+    return schemas.PasswordResetAcceptedOut()
+
+
+def password_reset_confirmed_out(
+    confirmed: ConfirmedPasswordReset,
+) -> schemas.PasswordResetConfirmedOut:
+    """A replaced password, with the count and the notice's outcome passed through.
+
+    The count is forwarded rather than interpreted, matching ``previous_email`` in
+    the translator above: it is a fact about what happened, and whether a client
+    should show it, phrase it, or ignore it is the client's business. What this
+    layer guarantees is that the number it sends is the number of rows the confirm
+    actually deleted, never a fixed one or a guess.
+
+    The notice's outcome is likewise forwarded unread, for the reason
+    ``email_change_confirmed_out`` gives: three states in two fields, and deciding
+    what a bounced warning means belongs to the interface that shows it.
+    """
+    return schemas.PasswordResetConfirmedOut(
+        user=user_out(confirmed.user),
+        sessions_revoked=confirmed.sessions_revoked,
         notice_sent=confirmed.notice_sent,
         notice_error=confirmed.notice_error,
     )

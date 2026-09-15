@@ -315,9 +315,10 @@ Transaction
 
 ## Signing in
 
-Every command except `signup`, `login`, `logout`, `confirm-email` and `plan tick`
-acts as somebody, and that somebody is proved by a token rather than named by a
-flag. So a fresh install starts here:
+Every command except `signup`, `login`, `logout`, `confirm-email`,
+`reset-password`, `confirm-password-reset` and `plan tick` acts as somebody, and that
+somebody is proved by a token rather than named by a flag. So a fresh install starts
+here:
 
 ```
 .venv/bin/python -m app.presentation.cli --db budget.db signup me@example.com
@@ -371,6 +372,35 @@ trade decision 165 records.
 **With no mail account configured the second command is not needed.** `change-email`
 applies the change on the password proof alone and says which variable is missing,
 so a fresh install can still fix an address no provider will bill (decision 173).
+
+**Forgetting the password takes two commands of the same shape, and here neither acts
+as somebody.** `reset-password` takes an address and asks for nothing; the second
+takes the code that was mailed *to* that address:
+
+```
+.venv/bin/python -m app.presentation.cli --db budget.db reset-password me@example.com
+    # nothing is asked for; the code goes to whatever that address names
+.venv/bin/python -m app.presentation.cli --db budget.db confirm-password-reset
+    # the code, then the new password twice
+```
+
+Both are dispatched above the actor line, and that is the feature rather than a
+convenience: a person who has forgotten their password cannot log in, so a command
+that needed a session would refuse exactly the person it exists for. The new password
+is asked for **twice** where the code is asked for once, because a mistyped password
+here is accepted, stored, and silently becomes the one they have - which recreates
+the lockout the command was run to end, while reporting success (decision 191).
+
+Two differences from `change-email` are deliberate and worth knowing before either
+surprises you. `reset-password` **prints whether an account was found** - the API
+answers identically either way and cannot afford not to, but a terminal that can write
+to this database is not a public surface, and the person who mistyped their own address
+is the one who would otherwise be left guessing (decision 185). And confirming a reset
+**signs every session on the account out**, including the one on the machine running
+it, because the premise of the whole flow is that somebody else may know the old
+password (decision 188). Both commands need a mail account; with none configured the
+first refuses and names the variable, which is the one place this flow is stricter than
+the address change (decision 186).
 
 Three commands are worth knowing by name when something goes wrong. `whoami` says
 who the current token belongs to, which is the first question anybody debugging an
@@ -575,6 +605,70 @@ the one claim the whole entry rule rests on (decision 162). If the second ever
 fails, the rule is wrong in the direction that matters - it would have let somebody
 move an account to an address the provider still refuses - and the remedy is the
 pair of `curl`s that found the rule, run again.
+
+**The fourth recipe is a forgotten password, and it is the only one that needs no
+`curl` to do the thing it is about.** Both halves are terminal commands, which is the
+feature rather than a shortcut: the person running it cannot log in, so a recipe that
+began by obtaining a session would be watching a different flow.
+
+```
+# 1. signed in on a laptop, so that the sign-out below is a real one
+.venv/bin/python -m app.presentation.cli --db budget.db login me@example.com
+
+# 2. ask, with no password and from a machine that has never logged in
+.venv/bin/python -m app.presentation.cli --db budget.db reset-password me@example.com
+#   reset code sent to me@example.com | expires 2026-09-13T14:22
+#   run 'confirm-password-reset' and enter the code to set a new password
+
+# 3. read the code out of the delivered message and answer it
+.venv/bin/python -m app.presentation.cli --db budget.db confirm-password-reset
+#   reset code: <paste it, whitespace and all>
+#   password: <the new one, twice>
+#   password changed for me@example.com
+#   1 session signed out
+#   me@example.com was told about the change
+
+# 4. what the single-use claim and the revocation did
+.venv/bin/python -m app.presentation.cli --db budget.db whoami
+#   not signed in: ... - run 'login' first
+.venv/bin/python -m app.presentation.cli --db budget.db login me@example.com
+#   the OLD password is refused; the new one signs in
+
+# 5. the same request again, which supersedes rather than accumulating
+.venv/bin/python -m app.presentation.cli --db budget.db reset-password me@example.com
+#   one row for the account, and the code from step 2 is now refused as one that
+#   never existed
+```
+
+Four things are worth watching, and **the suite asserts the shape of all four** - what
+a run against real infrastructure adds is the parts a test cannot hold: a live SMTP
+conversation rather than a fake channel, a paste typed at an actual terminal rather
+than a monkeypatched `getpass`, and a transcript somebody can read. That a code pasted
+with the whitespace a terminal selection carries is *accepted* - decision 180's fix,
+demonstrated when that decision was written and shipped with this slice. That the mail
+arrives at whatever address the account holds, which is the reason this endpoint is not
+an account-takeover: the request proves nothing, so everything it can do depends on a
+mailbox the caller either owns or has already compromised (decision 189). That the
+old password stops working while the *new* one signs in, which is the whole flow in
+two commands. And that asking twice leaves one row rather than two, which is the `ON
+CONFLICT(user_id)` upsert doing what the schema says rather than a check anybody
+enforces.
+
+**Then the half that cannot be seen, and is worth looking for anyway.** With the API
+running,
+
+```
+curl -sX POST localhost:8000/password-resets -H 'content-type: application/json' \
+     -d '{"email":"me@example.com"}'
+curl -sX POST localhost:8000/password-resets -H 'content-type: application/json' \
+     -d '{"email":"nobody@unknown.invalid"}'
+```
+
+answers with the same bytes both times - the same 202, the same
+`{"status": "accepted"}`, no header or length to tell them apart (decision 184). What
+differs is how long each one takes, and the difference is an SMTP round trip rather
+than a rounding error. That gap is the open item decisions 184 and 189 name, and this
+pair of calls is where somebody can watch it rather than read about it.
 
 ## Decisions
 
@@ -2045,6 +2139,26 @@ an unauthenticated caller can spend server resources here, and the resource is a
 SMTP round trip plus a 256-bit token comparison. See decision 167 for why that
 token is 256 bits rather than six digits, which is this entry's own argument
 reaching the next endpoint.
+
+**Amended once more: the count is five, and the fifth is the first that aims at an
+account its caller has no claim on.** Both password-reset routes joined this family
+after the change flow, and
+between them they split the two ways of being a member. `POST
+/password-resets/confirm` is the third entry's twin - authorisation arrives by mail,
+the caller proves nothing at the time, and the only thing it can do is spend what a
+mailbox delivered - and it differs from the address change's confirm only in which
+secret the mailbox lets its reader replace; it is the sharper of the two for exactly
+that reason, since every session on the account is deleted by it (decision 188).
+`POST /password-resets` is unlike all four of the others, because it needs no proof
+of anything at all. It takes an address, writes a row against an account, and
+causes a mail - and it answers identically whatever it is given, so it
+cannot be used to read an account, change one, or learn whether one exists (decision
+184). That is not a hole: every consequence of it requires the mailbox the mail
+arrived in, which the caller either owns or has already compromised. But it is the
+first route in this list that a stranger can point at somebody else's account and
+make this server do work, and it is the strongest argument yet for the rate limiter
+this entry has been asking for since 1b. The honest gap is the one decision 189 names
+- the response is identical and the *latency* is not.
 
 **87. The grade table gains a 401, and `MissingActorHeaderError` becomes
 `MissingCredentialsError`.** Its own docstring had already promised exactly this —
@@ -3828,6 +3942,193 @@ supplied, and this error is not in that class: it is reached by a row, not by a
 request. That is a question rather than a fix, because both answers cost something,
 and it is in `### Still open` with the two of them.
 
+### The password somebody has forgotten, and the way back in
+
+This is the last item of Phase 2c, and it closes one half of the `### Still open`
+entry decision 156's slice left standing: an address could be moved, and a password
+could not. The other half - *verification* of an address an account already holds,
+as distinct from changing one - is still open and still not this.
+
+It is **the address change with the proof removed**, and that one subtraction is the
+whole of the design. Everything the change flow took from `Confirmation` comes across
+unchanged: a 256-bit token hashed at rest, one atomic claim that spends it, three
+refusals distinguished by that claim, a row that survives being spent, a mail that
+must arrive and a notice that must not be able to undo anything (decisions 166-172).
+What does not come across is the authority the *request* is made under. A change
+takes a session **and** the current password (decision 165); a reset cannot, because
+the caller's entire problem is that they hold neither.
+
+```
+POST /password-resets          ──►  look the address up, and answer the same either way
+                                     └─ resets.save(row)         the row before the mail
+                                          └─ a code mailed to whatever that address names
+
+POST /password-resets/confirm  ──►  claim_by_token_hash()       one statement, the spend
+                                     └─ credentials.save(...)   the new password
+                                          └─ sessions.delete_by_user_id()
+                                               └─ one commit ──► best-effort notice
+```
+
+**183. A second aggregate, not a generalised one.** The question this entry said to
+answer first was whether `EmailChange` generalises, and the answer is no - for
+decision 168's own reason, restated because the pressure to generalise is stronger
+here than it was there. The two rows share a lifecycle and share no field: an
+`EmailChange` carries a `new_email`, because the new address is the fact the request
+authorises and it must be on the row before the mail goes out; a `PasswordReset`
+carries nothing of the kind, and **the field's absence is the design**. A password
+must never be on the row at all, so the row authorises "set a new password" and the
+password itself arrives with the confirm, living only in a local variable for the
+length of that call. A shared base class would have to be a base class with the one
+field the child needs in a subclass - which is a generalisation that pays for nothing
+and couples two flows whose next changes will be different.
+
+What carries across is copied rather than inherited, exactly as decision 168 argued
+for the first of the two: `AWAITING` / `CONFIRMED` / `EXPIRED` as its own enum,
+`PASSWORD_RESET_LIFETIME = timedelta(minutes=15)` as its own constant - two numbers
+agreeing today is a coincidence of two arguments, not one decision - `EXPIRED`
+derived and never written, and `settled_at` and the status required to agree. The
+store is the same two methods and no `find`, because a request is written once and
+answered once and both operations already end holding the row they acted on. `save`
+upserts `ON CONFLICT(user_id)`, which makes "one pending reset per account"
+structural rather than checked - decision 169's rule, one table over - and it is what
+makes asking twice supersede: the second request's row replaces the first's, so the
+first code is refused as a code that never existed rather than as one that was
+superseded, which is the same choice decision 168 made about rows that survive.
+
+**184. The request answers 202, and the body is byte-identical whatever address it is
+given.** This is the decision the route is built around, and 202 rather than 201 is
+only the visible half of it. `POST /users/me/email-changes` answers 201 because
+something is always created: the caller proved the account and the row is theirs.
+Here an unknown address creates nothing, so a 201 would be a lie in half the cases -
+and **a status that differs between the two cases is an enumeration oracle**, which
+is a worse failure than the small lie it would tell. A stranger who can post a list
+of addresses and read the status has a membership test for this installation, and the
+answer to that is one response shape for both arms, with the sentence the body cannot
+carry ("if that address names an account, a code has been sent") living in the
+OpenAPI description where a client reads it once rather than per request. The tests
+assert it on the raw bytes: `test_an_unknown_address_gets_the_same_bytes` compares
+the two responses' text *and* content, because a difference in headers or in a
+trailing newline is the same oracle by another route.
+
+**185. The CLI prints the truth, and the two presentations disagree on purpose.** The
+terminal says `no account reads mail at ada@example.com | nothing was sent`, and that
+is not a leak of what the API is at pains to hide. A terminal that can write to this
+database is not a public surface: its operator can open `sqlite3` and read the `users`
+table, so withholding the answer would protect nobody while leaving the person who
+mistyped their own address unable to tell a typo from a delivery failure - and a typo
+is how a good share of legitimate requests arrive. The API's caller is a stranger with
+a list; the CLI's caller is somebody who already holds the database and wants to know
+which of two things just happened. The two presentations are the same use case with
+the same behaviour and two honest reports, and it is worth writing down as a decision
+rather than leaving as an inconsistency, because "the CLI and the API say different
+things here" reads like a bug in either direction and is the correct answer in both.
+
+**186. With no mail account the request refuses, and decision 173's fallback does not
+transfer.** The change flow applies immediately when there is no channel, which is
+sound there and unsound here for one reason: it is authorised by the password proof,
+which the request already carries, so applying without a mail is a smaller act than
+what was asked for. A forgotten password has no equivalent proof - the caller cannot
+demonstrate the one secret the account holds, which is the whole premise - so
+"apply anyway" has no meaning, and a privileged local path was considered and rejected
+as a second way into every account in the installation. The refusal therefore has to
+be a refusal, and the only thing it owes the operator is the name of the variable
+that is missing, which is `describe_configuration`'s entire purpose: the failure mode
+of a misconfigured notifier is silence, and "SMTP_HOST is not set" is the difference
+between a two-minute fix and an afternoon of guessing.
+
+It is raised by the **use case** rather than by an API dependency, and that is a
+deliberate departure from the arrangement `dependencies.payment_provider` uses. There
+is one mail configuration for the whole installation and *two* presentations that
+need this refusal, so a guard written into the HTTP layer would have to be written a
+second time in the CLI - the shape `fold_email` exists to end. Instead the *builder*
+composes the reason once and hands it down, both presentations render
+`NoMailAccountError` through the handlers they already have, and the API grades it to
+a 503 while the CLI exits 1 with the same sentence. See decisions 83 and 176 for the
+two rules that keep the credential out of the argument list on the way there: it is
+read with `getpass` and never passed as an argument, and it travels in a body rather
+than in a path.
+
+**187. A weak new password does not spend the code, and this is decision 170's
+opposite on purpose.** Decision 170 spends a request on the attempt, and the case it
+decides is a change to the *world*: the address was taken while the request waited, so
+a retry cannot succeed and the token is dead weight. A password that fails
+`PlainPassword`'s policy is a statement about the string the caller typed, and a retry
+succeeds - so the remedy is "type a longer one" rather than "go and find another
+mail". This is decision 171's own principle applied rather than contradicted: what can
+change between the request and the answer is checked twice, what cannot is checked
+once, and **nothing about this flow can change in the window**. The password is
+therefore validated before the claim, which puts the refusal where it belongs - a 400
+in the domain's vocabulary, from `WeakPasswordError`, rather than a 409 about a row -
+and at a terminal it reads as the same code working on the second attempt. The tests
+pin it by reusing one code across two invocations, the first refused and the second
+accepted, because a version that spent the code would still answer the first
+invocation identically.
+
+**188. Every session on the account is deleted, which is decision 175's opposite
+answer, and the two questions really are different.** An address change leaves
+sessions alone, because `Session` is bound to `user_id` rather than to an address, so
+a change breaks nothing and a person who changes an address because they believe the
+old one is compromised does not thereby log the old holder out - which is named as a
+known limitation in `### Still open` rather than as an oversight. A reset is the
+mirror image. Its entire premise is that somebody else may know the old password, so
+leaving the old sessions alive leaves the attacker holding a live token under a
+password that has just been changed *because* it was the suspect thing. The delete is
+`SessionRepository.delete_by_user_id`, which returns the count so the caller can
+report it, and it is deletion rather than a flag per decision 49. It is also the
+reason the CLI prints how many ended: a person who was signed in on a phone will find
+it signed out, and a command that did that silently would leave them reading a closed
+tab as a bug.
+
+The three writes - the claim, the new credential, the revoked sessions - are **one
+transaction**, and that is the correctness boundary rather than tidiness. "The code
+was spent", "the password is new" and "the old sessions are gone" have to be one fact,
+or a crash between them leaves sessions alive under a password that no longer works.
+`test_the_writes_land_together` injects a failure between them and asserts the
+surviving state is the *old* one: the code unspent, the old password still valid.
+
+**189. The timing oracle is real, is not closed, and is named where someone would look
+for a claim that it is.** `POST /password-resets` mails on one arm and not the other,
+and an SMTP round trip is far more measurable than the hash work decision 81
+equalised - so the endpoint leaks account existence *by latency* even though its
+response is identical. Nothing available closes it. The mail cannot be queued, because
+a code that dies in fifteen minutes cannot go through an outbox whose whole premise
+is that late is acceptable (decision 30, and `passwordResetMessage` says so at the
+top). A mail cannot be composed for a nonexistent address, because there is no address
+to compose for. And there is no rate limiter (decision 86), which is the thing that
+would actually answer it - not by making the two arms equal, but by making the number
+of probes a stranger gets small enough that the leak stops being a list. It is
+recorded in `### Still open` as the strongest argument for building rate limiting
+next, rather than as a comment claiming it is handled.
+
+**190. An account that has never had a password can gain its first one this way.** The
+credential is looked for and its absence does not change the answer: the mail goes
+out, and presenting the code writes a `PasswordCredential` for an account that had
+none. Refusing would have to be *silent* - saying "this account has no password" is
+the enumeration oracle returning by a different door - so the choice is between
+mailing a person who can then use their account and telling nobody anything while
+leaving them with no way in at all. Mailing is both the more useful answer and the
+more honest one, since the mailbox is exactly the evidence that they own the account.
+This is unreachable today, because `SignUp` writes both rows in one unit and no other
+path creates a `User`; it becomes reachable when Google OIDC lands and `LogIn`'s
+branch for a credential-less account stops being dead code. Written down now because
+it is a decision the flow already encodes, and it would otherwise be re-derived
+against a live account.
+
+**191. `_prompt_code` is extracted and strips, which closes decision 180's unshipped
+fix.** That decision recorded the paste problem, demonstrated the fix in a wrapper
+written to measure it, and said in as many words that `cli.py` still passed a pasted
+code through untouched - and this slice is where the second caller appeared, so the
+fix ships here rather than being restated. One function now serves `confirm-email`
+and `confirm-password-reset`, and its label is a parameter because the two commands
+prompt for two different codes: "confirmation code" belongs to an address change and
+"reset code" to a password reset, and a person looking at a prompt naming the other
+one would reasonably wonder whether they were in the right command. The stripping
+argument is unchanged and is the alphabet's (`[A-Za-z0-9_-]` cannot contain
+whitespace), and `_prompt_password` deliberately still does not strip - so the pair
+keeps one shape and two dispositions, and the tests assert both halves by pasting a
+code wrapped in whitespace and by setting a password with a trailing space that must
+survive to the login prompt.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**
@@ -3945,10 +4246,12 @@ and it is in `### Still open` with the two of them.
   kept the one that looks like a real one. The single seam the entry predicted -
   "`ResolveUserByEmail` is the single thing both doors call, so that commit has one
   place to change and not two" - is exactly how it went. See decisions 80 and 89.
-- **Rate limiting on `POST /users` and `POST /sessions`** (decision 86). They are
-  the only unauthenticated writes in the API, which is inherent to being the way in
-  - and it makes them the only endpoints where an unauthenticated caller can spend
-  server resources. Two things ride on this: the argon2 work a login costs, and
+- **Rate limiting on `POST /users` and `POST /sessions`** (decision 86). They were
+  the only unauthenticated writes in the API when this entry was written; there are
+  five now, and the pair here is still the pair that matters most - they are the way
+  in, and they are the two endpoints where an unauthenticated caller can make this
+  server do its most expensive work, an argon2 hash on one side and an argon2 verify
+  on the other. Two things ride on this: the argon2 work itself, and
   **the timing gap decision 81 documents**, where an unknown address returns without
   hashing anything and so answers measurably faster than a wrong password. The fix
   for the second is four lines - verify against a dummy hash when no credential is
@@ -3965,6 +4268,31 @@ and it is in `### Still open` with the two of them.
   over a six-digit code, and the reason this entry has moved up the list rather
   than down: the brute-force defence is still "the token is too long to guess",
   and a rate limiter is what would let it be something friendlier.
+
+  **A fourth endpoint, and it is the strongest case on this list.**
+  `POST /password-resets` is the one route in this API that a stranger can point at
+  somebody else's account and make this server work for them. It takes an address and
+  nothing else - no session, no password, nothing to prove - it writes a row against
+  whatever account that address names, and it puts an SMTP round trip in flight. The
+  change request above is the same shape of cost and is *authenticated* twice over;
+  this one is the actorless version of it, and the only thing between a stranger and
+  a person's inbox is how many requests they can afford to make.
+
+  **And it leaks account existence by latency, which no status code can fix.**
+  Decision 184 answers identically for a known and an unknown address, so the *bytes*
+  are not an oracle. The clock still is: one arm does an SMTP round trip and the
+  other returns as soon as a `SELECT` misses, and that difference is not subtle - it
+  is milliseconds against microseconds, and measurable from outside without any
+  privileged position. Nothing available closes it. The mail cannot be queued behind
+  an outbox, because a code that expires in fifteen minutes cannot tolerate a queue
+  whose premise is that late is acceptable; a mail cannot be composed for an address
+  that names no account, because there is nothing to send to; and sending one anyway
+  to a fabricated address would be this system mailing strangers on a stranger's
+  word. A rate limiter does not make the two arms equal either - what it does is make
+  the number of probes small enough that the difference stops being a list, which is
+  the honest description of why this entry is the answer to that one. Named here
+  rather than only in the decision, because it is the argument for doing this work
+  next rather than after the next feature.
 - **Purging settled `email_changes` rows, as with sessions.** Every confirmed
   change leaves a row behind on purpose - decision 168, because deleting it would
   collapse "already used" into "never existed" - and nothing ever removes one. The
@@ -3980,11 +4308,19 @@ and it is in `### Still open` with the two of them.
   a decision rather than an oversight (decision 175). `Session` is bound to
   `user_id`, not to an address, so nothing breaks by leaving it alone - but it does
   mean that somebody who changes their address because they believe the old one is
-  compromised does not thereby log the old holder out. Revoking would need a
-  `delete_by_user_id` that does not exist, and would buy little against the threat
-  that matters (an attacker holding both the password and the token logs in again
-  anyway). Named here because "my sessions still work" is the kind of thing a person
-  discovers at the wrong moment.
+  compromised does not thereby log the old holder out. Named here because "my
+  sessions still work" is the kind of thing a person discovers at the wrong moment.
+
+  **Half of this bullet's stated cost is now out of date, and the decision is not.**
+  It used to say that revoking "would need a `delete_by_user_id` that does not
+  exist". The password reset needed exactly that method for its own reasons - a
+  reset's whole premise is that somebody else may know the old password (decision
+  188) - so `SessionRepository` has it now, and closing *this* gap would be one call
+  in `ConfirmEmailChange` rather than a new method. What is unchanged is the
+  argument: the threat that matters is an attacker holding both the password and a
+  token, and they log in again the moment the change is applied. So it is cheap and
+  still not done, which is worth saying plainly rather than leaving a stale reason
+  standing in for the real one.
 - **Neither of the two mails identifies its own request** (decision 181). Five
   requests landed in one inbox inside an hour, the two subject lines are fixed
   strings, and no body carries the `email_change_id` - so arrival order is the only
@@ -4056,32 +4392,49 @@ and it is in `### Still open` with the two of them.
   commands and `plan tick` are now dispatched above the line that resolves an actor,
   so a fresh database no longer grows a `dev@localhost` row on the way past a tick -
   there is no default identity left for anything to create.
-- **Password reset, and address *verification* as a thing distinct from address
-  change.** Neither blocks the design: an account that cannot reset its password is
-  inconvenient, an account that cannot exist is a non-starter. But a password that
-  is forgotten today is an account that is gone.
+- ~~**Password reset, and address *verification* as a thing distinct from address
+  change.**~~ **Password reset is done** (decisions 183-191), and the prediction this
+  entry made about it was right in the part that mattered. It said a password reset
+  "will want this exact mailed-token machinery", and it did: the 256-bit token hashed
+  at rest, the single-use windowed claim, the three distinguishable refusals, the mail
+  that must arrive and the notice that must not be able to undo anything all came
+  across whole. It also named the question to answer first - whether `EmailChange`
+  generalises - and the answer was a second aggregate rather than a shared base
+  (decision 183).
 
-  **This entry's own prediction has now half come true, and the machinery is the
-  reason to read it again.** It said a password reset "will want this exact
-  mailed-token machinery", and the email-change slice built it: a 256-bit token
-  hashed at rest, a single-use windowed claim, three distinguishable refusals, a
-  mail that must arrive and a notice that must not be able to undo anything. A
-  password reset is the same shape with one field changed - the thing the token
-  authorises is a new *password* rather than a new *address* - and it should
-  **reuse** rather than re-derive, which means the question to answer first is
-  whether `EmailChange` generalises or whether a second aggregate with the same
-  lifecycle is the honest answer. That is a decision about naming and about the
-  table, not about the flow.
+  What this entry could not have seen is that *removing* the password proof from the
+  request does not leave a smaller address change. It leaves a route that a stranger
+  can point at somebody else's account (decision 184), a response that therefore has
+  to be byte-identical for a known and an unknown address, a refusal where the change
+  flow has a fallback (decision 186), a session revocation where the change flow
+  deliberately has none (decision 188), and a timing gap that no status code can close
+  and that is written up below as the strongest argument for the next piece of work.
+  Every one of those is a decision rather than a line of code, and the prediction was
+  silent about all of them.
 
-  What is *not* covered by that machinery is verification of an address an account
-  already holds. A change proves the new address; nothing has ever proved the one
-  somebody registered with, so "verified" is a fact this system cannot state about
-  any account that predates this slice. That is a narrower claim than it sounds -
-  proving somebody reads a mailbox would not have stopped `nobody@localhost`, which
-  is why the deposit courtesy (decision 157) is a separate thing - but "this
+  Two smaller things went the other way, and both were already on this list. An
+  account holding no credential can gain its first password through this flow, which
+  no account can reach until Google OIDC lands (decision 190); and the paste fix
+  decision 180 recorded and did not ship has now shipped, because the reset is the
+  second caller that made extracting `_prompt_code` worth doing (decision 191).
+
+- **Address *verification* as a thing distinct from address change, which is the half
+  that is still open.** A change proves the new address; nothing has ever proved the
+  one somebody registered with, so "verified" is a fact this system cannot state about
+  any account that predates the address-change slice. That is a narrower claim than it
+  sounds - proving somebody reads a mailbox would not have stopped `nobody@localhost`,
+  which is why the deposit courtesy (decision 157) is a separate thing - but "this
   address was proved at some point" is a column that does not exist, and an
   installation that wanted to refuse an unverified address a payout would find
   nothing to read.
+
+  **The reset flow makes this more visible rather than less.** It proves the mailbox
+  at the moment a password is replaced and then forgets, exactly as the change flow
+  does - because a proof that has to be spent to be useful is not a column, and
+  writing one down would be asserting a fact about an account that nothing had
+  checked. So the gap is now named in two features instead of one, and the shape any
+  fix would take is the same in both: a `verified_at` on the account, written by
+  whichever flow proves the mailbox, and a decision about what reads it.
 
 - Putting the instruction `label` into `Transaction.narration`, so the ledger
   reads "salary" instead of a bare internal reference.
@@ -4397,8 +4750,15 @@ is left with no exit (decision 106). Both were closed in 3a.
   branch for an account with no password credential.
 - Rate limiting on the auth endpoints first - login and signup are the ones worth
   brute-forcing - then on the API generally. It also carries the timing fix
-  decision 81 documents.
-- Password reset and email verification.
+  decision 81 documents. **And it is now the next thing owed rather than the next
+  thing wanted**: `POST /password-resets` joined this list as the strongest case on
+  it, because it is the only route a stranger can point at somebody else's account
+  to make this server work for them, and it leaks account existence by latency in a
+  way no response shape can fix (decisions 184 and 189).
+- ~~Password reset and email verification.~~ The reset shipped as decisions 183-191.
+  Email verification is a different question and is still open: it is about proving
+  an address an account *already* holds, which no flow does today. See
+  `### Still open`.
 - Session listing and per-device revocation. The store already supports it, since a
   session is a row and revocation is a deletion; what is missing is the endpoints.
 - TLS. Non-negotiable, and the reason a reverse proxy sits in Phase 4.
@@ -4407,6 +4767,18 @@ is left with no exit (decision 106). Both were closed in 3a.
 of the two phases it sits between: it is a property of the money endpoints 2b built
 rather than a new surface, and it was worth doing while that surface was still the
 thing being thought about. See decisions 113-123.
+
+**The password reset was built first of what remains here**, and it is the one item on
+this list that was waiting on nothing. Rate limiting and OIDC are each a decision
+about a technology, session listing is an endpoint over a store that already supports
+it, and TLS is a reverse proxy; the reset needed only the mailed-token machinery the
+address change had already built and proved in a live run, so the whole of its design
+was the question of what changes when the password proof is *removed* from a flow that
+had one. The answer is nine decisions' worth of change and no new machinery, which is
+the strongest evidence this file has that the address-change slice was built at the
+right level of generality - and the reason it went first rather than after the
+limiter is that it is the flow whose open defect makes the limiter urgent. See "The
+password somebody has forgotten, and the way back in" (decisions 183-191).
 
 ### Phase 3 - Paystack
 
@@ -4517,9 +4889,12 @@ bad one".
   presentations say so rather than being quietly less safe.
 
 What it deliberately does not do, with entries under `### Still open`: **rate limit
-the second endpoint that mails a credential** (decision 86 now has three members),
-**purge settled `email_changes` rows**, and **revoke sessions on a change** (decided
-against, decision 175). And the read-only audit it was asked for turned up five more
+the endpoints that mail a credential** (decision 86 - it had two members when this
+paragraph was written, three by the end of the slice, and five after the password
+reset), **purge settled `email_changes` rows**, and **revoke sessions on a change**
+(decided against, decision 175 - and note that the password reset decided the other
+way for its own reasons, which is what makes the pair worth reading together). And
+the read-only audit it was asked for turned up five more
 entry points of the same shape, one of which - a plan edited into a currency its
 wallet does not hold - takes down a whole tick rather than one request. Those are in
 `### Still open` in full, with the line numbers, and none of them was changed.
@@ -4571,3 +4946,35 @@ also, honestly, **months** of part-time work for someone learning as they go, no
 weeks. The order is arranged so that this sentence becomes true as early as it
 can: Phase 3 is what a user would call the product, and Phases 1 and 2 are what
 make it safe to let anyone near it.
+
+
+
+## Key Implememtations
+double-entry accounting
+
+transaction ledgers
+
+idempotency
+
+payment processing
+
+reconciliation
+
+audit trails
+
+authorization
+
+fraud/risk controls
+
+concurrency handling
+
+database transaction boundaries
+
+encryption/key management
+
+event sourcing
+
+immutable financial records
+
+regulatory reporting
+

@@ -1,9 +1,11 @@
 from uuid import UUID
 
 from app.application.identity.confirm_email_change import ConfirmEmailChange
+from app.application.identity.confirm_password_reset import ConfirmPasswordReset
 from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
 from app.application.identity.request_email_change import RequestEmailChange
+from app.application.identity.request_password_reset import RequestPasswordReset
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.notifications.deliver_notifications import DeliverNotifications
@@ -21,7 +23,11 @@ from app.application.unit_of_work import UnitOfWorkFactory
 from app.application.wallet_service import WalletService
 from app.domain.identity.password_hasher import PasswordHasher
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
-from app.infrastructure.settings import EmailSettings, PaystackSettings
+from app.infrastructure.settings import (
+    EmailSettings,
+    PaystackSettings,
+    describe_configuration,
+)
 from app.infrastructure.notifications.smtp_notification_channel import (
     SmtpNotificationChannel,
 )
@@ -445,6 +451,25 @@ def build_notification_deliverer(
 # a login tells nobody. An address change is the first identity operation that
 # speaks to the outside world, and the two mails it sends are the reason - one to
 # prove the new address, one to warn the old one. They are still the only two.
+#
+# The two password-reset builders at the end are now the fourth and fifth members
+# of the no-actor group - after ``build_settler``, ``build_notifier`` and
+# ``build_confirm_email_change`` - and the first pair whose absence of an actor is
+# not a story about authorisation at all. A reset is authorised by a mailed code,
+# exactly as a change is, but the *request* half has nothing standing behind it:
+# the whole premise is that the caller has lost the password and holds no session,
+# so there is no actor to be told and no proof to demand. It is the loosest entry
+# point in the file and it is argued on ``RequestPasswordReset``.
+#
+# ``settings`` reaches all four of the mail-sending builders now, and this is
+# where the count stops being a curiosity and becomes a rule: an installation has
+# one SMTP configuration and every message in the system leaves through it. What
+# is new with the reset pair is that ``None`` stops meaning "do without mail" and
+# starts meaning "refuse", because there is nothing a forgotten password can be
+# proved by when there is no mailbox to prove it with. That difference is not
+# visible in these signatures - both builders take the same optional settings and
+# the same optional channel - so it is implemented once, through the reason
+# composed below.
 
 
 def build_sign_up(
@@ -595,5 +620,113 @@ def build_confirm_email_change(
     """
     return ConfirmEmailChange(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        channel=_channel_for(settings, channel),
+    )
+
+
+def build_request_password_reset(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: EmailSettings | None = None,
+    channel=None,
+) -> RequestPasswordReset:
+    """Wire up asking for a reset, which is the one mail-sending builder with no proof.
+
+    No hasher and no actor, and both absences are the same fact: there is no
+    password here to verify and nobody to verify one *as*. ``build_log_out`` and
+    ``build_confirm_email_change`` have no actor because the token is the
+    authorisation; this one has none because the caller is a stranger by
+    construction - they cannot log in, which is why they are here. Demanding a
+    session would refuse exactly the person the endpoint exists for.
+
+    **This builder is where "no mail account" stops meaning "do without it".**
+    ``build_request_email_change`` takes the same two arguments and treats a
+    missing channel as an instruction to apply the change immediately, which works
+    there because the account's own password was just proved. Nothing here can be
+    proved, so ``_channel_for`` returning ``None`` is a refusal - and the refusal
+    has to name the setting that is missing, which means asking
+    ``describe_configuration`` what it is.
+
+    That question is asked *here* rather than in the use case or in a presentation,
+    and the placement is the point. ``settings.py`` is the only module in the
+    system that reads the real environment, and the CLI and the API must both
+    refuse with the same sentence - so the sentence is composed once, where the
+    configuration is read, and handed down as an argument. A dependency in
+    ``presentation.api`` could not serve the CLI, and a use case that read
+    ``os.environ`` would break the rule the settings module exists to keep. The
+    injected ``channel`` is checked *after* ``_channel_for`` rather than before it,
+    so a test that passes a fake channel never causes the environment to be looked
+    at at all - which is the same reason the fake wins over the settings one level
+    up.
+    """
+    resolved = _channel_for(settings, channel)
+    return RequestPasswordReset(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        channel=resolved,
+        unconfigured_reason=_no_mail_account_reason(resolved),
+    )
+
+
+def _no_mail_account_reason(resolved) -> str | None:
+    """Why a password cannot be reset here, in the one sentence both presentations say.
+
+    **Two halves, and neither is decoration.** ``describe_configuration`` names the
+    variable that would fix this, which is the actionable fact; the prefix says what
+    is *impossible* until it is set, which is the fact a person who just typed
+    ``reset-password`` needs and cannot infer from a bare variable name - "SMTP_HOST is
+    not set" is true of every mail-sending feature in this system, and the reason it
+    matters *here* is the third ruling behind this feature: an address change falls
+    back to the password proof when there is no mail, and a forgotten password has no
+    proof to fall back on.
+
+    ``None`` when there is a channel, because there is nothing to explain. When there
+    is not, the prefix stands alone if ``describe_configuration`` has nothing to add -
+    which happens only when the environment is complete and yet no settings and no
+    channel reached this function, i.e. a caller that bypassed ``from_environment``.
+    That is the case the old ``or`` here was written for, and it is kept: refusing with
+    "so a password cannot be reset: None" would be worse than refusing with the prefix
+    on its own.
+    """
+    if resolved is not None:
+        return None
+    missing = describe_configuration()
+    reason = "this installation has no mail account, so a password cannot be reset"
+    return f"{reason}: {missing}" if missing else reason
+
+
+def build_confirm_password_reset(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    password_hasher: PasswordHasher | None = None,
+    settings: EmailSettings | None = None,
+    channel=None,
+) -> ConfirmPasswordReset:
+    """Wire up answering a reset, which needs the hasher and no actor.
+
+    The hasher is here for the **hash** direction, which makes this builder the
+    fourth to take it and the second to take it for writing rather than checking -
+    ``build_sign_up`` is the other. That is worth naming because the argument is
+    identical and the stakes are not: a sign-up hashes a password the person chose
+    while looking at a form, and this hashes one typed into a terminal after a
+    lockout, where a silent transcription error recreates the lockout the whole
+    command exists to end. The CLI asks twice for that reason; nothing at this
+    layer can.
+
+    No actor, and the argument is ``build_confirm_email_change``'s unchanged: the
+    mailed code is the authorisation, and the account it acts on is the one the
+    claimed row names rather than one a request supplied. What this one does that
+    that one does not is *end sessions* - see ``SessionRepository.delete_by_user_id``
+    for why a reset revokes where an address change deliberately does not.
+
+    ``settings`` and ``channel`` are the same pair every mail-sending builder takes,
+    and ``None`` means something different here again: the notice is simply not
+    attempted, and the result says so in ``notice_sent``/``notice_error``. It is
+    deliberately *not* a refusal, because by the time this builder is reached a
+    channel already existed - a confirm is only reachable through a request that
+    required one - so a missing channel can only mean the installation was
+    reconfigured in the window. Refusing then would leave a spent code and an
+    unchangeable password, which is the worst state this feature can produce.
+    """
+    return ConfirmPasswordReset(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        password_hasher=password_hasher or Argon2PasswordHasher(),
         channel=_channel_for(settings, channel),
     )

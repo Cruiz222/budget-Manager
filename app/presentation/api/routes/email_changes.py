@@ -103,14 +103,14 @@ def confirm_email_change(
     """Apply the change the mailed code names, and tell the address being left.
 
     **No ``Authorization`` header, and there is no ``current_actor`` dependency to
-    supply one.** This is the API's second unauthenticated write, after
-    ``POST /users``, and the reason it is not a hole is the shape of the
-    credential: the code exists only because somebody already presented the
-    account's password to mint it, and it was mailed to the address being moved
-    to. So the password proof is already spent on this change, and what a session
-    would add is a second way for the person who asked to be refused - the one who
-    asked on a laptop and opened the mail on a phone is exactly the person this
-    operation exists for. See ``ConfirmEmailChange``.
+    supply one.** This is the API's third unauthenticated write, after
+    ``POST /users`` and ``POST /sessions``, and the reason it is not a hole is the
+    shape of the credential: the code exists only because somebody already
+    presented the account's password to mint it, and it was mailed to the address
+    being moved to. So the password proof is already spent on this change, and
+    what a session would add is a second way for the person who asked to be
+    refused - the one who asked on a laptop and opened the mail on a phone is
+    exactly the person this operation exists for. See ``ConfirmEmailChange``.
 
     **201, because the account moved.** The address is a different one than it was
     before this request, and the resource that changed - the user - is the one the

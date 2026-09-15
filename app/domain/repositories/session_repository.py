@@ -62,3 +62,41 @@ class SessionRepository(ABC):
         would turn "sign out twice" into an error.
         """
         pass
+
+    @abstractmethod
+    def delete_by_user_id(self, user_id) -> int:
+        """Remove every session this account holds, returning how many there were.
+
+        **The one scoped method in this package whose scope is an account rather
+        than an actor, and it is not the hole that makes it look like.** Every
+        other scoped write takes its owner from a resolved actor, which is what
+        makes a caller unable to name somebody else. Here the caller *is* the
+        account being acted on more directly than any actor could express: the
+        account's id is read off a row this system wrote and mailed, never off a
+        request - see ``ConfirmPasswordReset``, which is given a token and nothing
+        else. So the rule the scoped repositories protect - "you cannot name
+        another account" - is kept, and kept by a stronger argument than a session
+        can make.
+
+        **A password reset is the only caller**, and it is the reason this exists.
+        ``EmailChange`` deliberately does *not* revoke anything (decision 175),
+        because a session is bound to a ``user_id`` and a change of address cannot
+        orphan one - and because an attacker who holds both the mailed token and
+        the password simply logs in again. Neither half of that holds for a reset.
+        The premise of a reset is that somebody else may know the old password, so
+        the sessions opened with it are exactly the sessions that are no longer
+        trustworthy; and every device signed in as the account outlives the change
+        unless something ends it. So this is not a measure that fails to measure
+        much - it is the one place in the system where revocation is the point.
+
+        The count is returned rather than ignored, and it is not decoration: the
+        use case reports it to the person ("every device has been signed out"),
+        which is the fact that makes a stolen session's disappearance visible
+        rather than silent.
+
+        **It mirrors ``delete_by_token_hash`` on the one thing that matters**:
+        deleting nothing is not an error. An account with no sessions, or one whose
+        sessions were already ended, gets ``0`` and no exception - the postcondition
+        is "this account holds no sessions", and it is already true.
+        """
+        pass

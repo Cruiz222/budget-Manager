@@ -357,35 +357,59 @@ class FakeChannel(NotificationChannel):
         self.sent.append(message)
 
 
-def code_in(message) -> str:
+#: The sentence above the code in ``verification_message``, and the default label.
+#:
+#: A constant rather than a literal inside ``code_in`` for the reason the parameter
+#: below exists: with two messages in the suite there are two labels, and both
+#: belong in one place where a reader can see that they differ by one verb.
+CHANGE_CODE_LABEL = "present this code to confirm it"
+
+#: The sentence above the code in ``reset_message``.
+#:
+#: **Deliberately a second constant rather than a loosened match.** The two bodies
+#: are otherwise so alike that ``"present this code"`` would find either, and that
+#: is exactly the failure this pair of names rules out: a test about a password
+#: reset that silently read a code out of an *address change* - which is what a
+#: shared prefix plus a mixed-up ``sent`` list would produce - would not be told
+#: apart from a passing one.
+RESET_CODE_LABEL = "present this code to choose a new password"
+
+
+def code_in(message, label: str = CHANGE_CODE_LABEL) -> str:
     """The code out of a verification message, the way a person would read it.
 
-    **Here rather than in one of the three test modules that need it**, and the
-    placement is the argument: the *text* belongs to
-    ``emailChangeMessage.verification_message``, the envelope belongs to
-    ``FakeChannel`` just above, and what is left - four lines that find the line
-    under a label - is neither module's to own. Three copies of it would be three
-    things to change when the message changes, and the two that nobody thought
-    about would fail with an ``IndexError`` in a test about something else.
+    **Here rather than in one of the modules that need it**, and the placement is
+    the argument: the *text* belongs to ``emailChangeMessage.verification_message``,
+    the envelope belongs to ``FakeChannel`` just above, and what is left - four
+    lines that find the line under a label - is nobody else's to own. A copy per
+    module would be a copy to change when a message changes, and the ones nobody
+    thought about would fail with an ``IndexError`` in a test about something else.
 
     Recovered from the text rather than from a returned value, and that is the
     point rather than an inconvenience: ``RequestEmailChange`` deliberately returns
     no token - it is not in the outcome, not in the response, not in a log - so the
     mailbox is the only place one exists. A test that wants to answer a request is
     under the same constraint the person is: it has to be holding the envelope.
+    ``RequestPasswordReset`` behaves the same way, which is why it needs this too.
 
     Found by its *label* rather than by matching the token alphabet, which would be
     ambiguous. ``budget-manager`` appears two lines below the code and is spelled
     entirely in characters a urlsafe token may contain, so "the longest
     token-looking run in the body" would sometimes return the wrong line.
+
+    ``label`` defaults to the address change's sentence, so the three callers that
+    predate this parameter are untouched and the reset tests pass
+    :data:`RESET_CODE_LABEL` explicitly. It is a parameter rather than a second
+    function because everything below the label lookup is identical - and the
+    ``+ 2`` is the part that must not be copied: both messages put a blank line and
+    then an indented code under their sentence, and a second copy of that offset is
+    a second thing to fix if either body is ever reworded.
     """
     lines = message.body.splitlines()
-    label = next(
-        index
-        for index, line in enumerate(lines)
-        if "present this code to confirm it" in line
+    index = next(
+        position for position, line in enumerate(lines) if label in line
     )
-    return lines[label + 2].strip()
+    return lines[index + 2].strip()
 
 
 @pytest.fixture
