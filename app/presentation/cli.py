@@ -122,25 +122,32 @@ import uuid
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
+from app.application.identity.log_in import LoggedIn
 from app.application.plan_service import PlanService
+from app.application.profile_service import ProfileStanding
 from app.application.wallet_service import WalletService
 from app.composition_root import (
     build_confirm_email_change,
     build_confirm_password_reset,
+    build_confirm_phone_sign_up,
     build_deliverer,
     build_log_in,
     build_log_out,
     build_notification_deliverer,
     build_notifier,
     build_plan_service,
+    build_profile_service,
     build_reconciler,
     build_request_email_change,
     build_request_password_reset,
+    build_request_phone_verification,
     build_resolve_actor,
     build_scheduler,
     build_sign_up,
     build_wallet_service,
 )
+from app.domain.identity.profile import Profile
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.identity.user import User
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.currency import Currency
@@ -169,6 +176,7 @@ from app.infrastructure.settings import (
     from_environment,
     paystack_from_environment,
     session_path as configured_session_path,
+    termii_from_environment,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
@@ -501,6 +509,25 @@ def _date(value: str) -> date:
         raise argparse.ArgumentTypeError(f"invalid date (expected YYYY-MM-DD): {value!r}")
 
 
+def _optional_date(value: str) -> date | None:
+    """A date, or nothing at all - for a flag whose value can also be cleared.
+
+    ``set-profile``'s ``--birth-date`` and the only reason this wrapper exists.
+    ``_date("")`` is an argparse refusal, so a command typed with an empty flag
+    would exit 2 with a usage line rather than reaching the handler - which would
+    leave a birth date typed in wrong with no way to remove it, while every text
+    field beside it could be cleared by passing nothing. Empty means absent, the
+    same way it does for those fields and for the same reason.
+
+    An empty *default* is not affected: ``--birth-date`` defaults to
+    ``_NOT_PASSED``, which never reaches a parser, so this function only ever
+    sees a value somebody actually typed.
+    """
+    if not value.strip():
+        return None
+    return _date(value)
+
+
 def _datetime(value: str) -> datetime:
     """A moment, from ``YYYY-MM-DDTHH:MM`` - or from a bare date, meaning midnight.
 
@@ -547,6 +574,36 @@ def _wait(until: timedelta) -> str:
     return f"{minutes} {unit}"
 
 
+class _NotPassed:
+    """The absence of a flag, as a value - which is not the same as an empty one.
+
+    Only ``set-profile`` uses this, and it exists because that command *edits* a
+    record whose fields each have three possible requests against them: leave it
+    alone, clear it, or set it. ``None`` already means the middle one everywhere
+    else in this codebase, so a field left off the command line cannot also
+    arrive as ``None`` without the command losing the ability to tell the two
+    apart - and the cost of getting it wrong is that
+    ``set-profile --display-name Ada`` silently drops a complete profile's tier
+    by clearing the six fields it was not asked about.
+
+    A class rather than ``object()`` so that a debugging session printing a
+    parsed namespace shows ``<not passed>`` instead of a memory address, and so
+    that ``is`` comparisons in tests can name what they are looking for.
+    """
+
+    def __repr__(self) -> str:
+        return "<not passed>"
+
+
+#: The default for every ``set-profile`` flag. See ``_NotPassed``.
+#:
+#: Deliberately *not* used as a *value* for a flag that was passed: argparse
+#: ``type=`` callables never see it, because a default is used as-is when the
+#: flag is absent. So the only way to arrive at the handler holding this object
+#: is for the user not to have typed the flag at all.
+_NOT_PASSED = _NotPassed()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="budget-manager",
@@ -584,12 +641,14 @@ def build_parser() -> argparse.ArgumentParser:
     # They are top-level rather than nested under a noun, because there is no
     # noun that covers them - ``account signup`` would suggest the others act
     # on an account too, and logging out discards a token rather than touching
-    # one. And they are *six* rather than three now, which is what an address
-    # change and then a password reset added to this file: ``confirm-email`` and
-    # ``confirm-password-reset`` are each authorised by a code mailed out, so
-    # neither needs a session and both belong here rather than beside the command
-    # that asks for them - and ``reset-password`` is here because the person
-    # running it is locked out and has no session to offer.
+    # one. And they are *eight* rather than three now, which is what an address
+    # change of its own, then a password reset, then a phone signup added to this
+    # file: ``confirm-email`` and ``confirm-password-reset`` are each authorised by
+    # a code mailed out, so neither needs a session and both belong here rather
+    # than beside the command that asks for them - ``reset-password`` is here
+    # because the person running it is locked out and has no session to offer, and
+    # ``signup-phone``/``confirm-phone`` are here because the account is what
+    # answering the texted code creates, so there is nothing yet to log in as.
     signup_parser = subparsers.add_parser(
         "signup",
         help="register an address, with a password to prove it later",
@@ -604,10 +663,54 @@ def build_parser() -> argparse.ArgumentParser:
         "generate it, where a second typing proves nothing)",
     )
 
+    # ``signup-phone`` sits beside ``signup`` rather than beside ``login``, because
+    # the two are the same act through two identifiers - and the account it creates
+    # is the subject of both. ``confirm-phone`` is the second half of *this* flow
+    # and is declared next to it rather than beside ``confirm-email``, where it
+    # would belong by the shape of its authorisation: reading the pair together is
+    # worth more than grouping by "which commands take a code".
+    phone_parser = subparsers.add_parser(
+        "signup-phone",
+        help="ask for a code that will let this number create an account",
+    )
+    phone_parser.add_argument(
+        "phone",
+        help="the number to prove - any spelling, since it is folded before use",
+    )
+    # No --password: the password is chosen at the confirm, by whoever read the
+    # text. Nothing is taken from argv here at all.
+
+    confirm_phone_parser = subparsers.add_parser(
+        "confirm-phone",
+        help="create the account, using the code that was texted",
+    )
+    # No --code and no --password, and both absences are deliberate - the pair
+    # ``confirm-password-reset`` documents. The code is a credential that creates
+    # an account and expires in ten minutes; the password is a secret that must
+    # never be an argument. Nothing is taken from argv by this command at all.
+
     login_parser = subparsers.add_parser(
         "login", help="obtain a session token and store it at --session"
     )
     login_parser.add_argument("email", help="the address to sign in as")
+
+    # ``login-phone`` sits beside ``login`` rather than replacing it with an
+    # argument that could be either, and the reason is the one ``LogInIn`` gives
+    # at the other boundary: an identifier that arrives as one string has to be
+    # classified, and the only available test is a guess about its shape. Here the
+    # command name is the statement, so a person typing the wrong one is typing
+    # the wrong *command* - and the two are listed together by ``--help``, which
+    # is where that mistake gets caught.
+    login_phone_parser = subparsers.add_parser(
+        "login-phone",
+        help="obtain a session token for a number, and store it at --session",
+    )
+    login_phone_parser.add_argument(
+        "phone",
+        help="the number to sign in as - any spelling, since it is folded before use",
+    )
+    # No --password, for the reason every other command here omits it: an argument
+    # lands in the history file. See ``_prompt_password``.
 
     subparsers.add_parser(
         "logout", help="discard the stored token and end the session"
@@ -696,6 +799,96 @@ def build_parser() -> argparse.ArgumentParser:
     # which account it belongs to when the answer is yes.
     subparsers.add_parser(
         "whoami", help="show the user this invocation acts as"
+    )
+
+    # ``profile`` and ``set-profile`` are the two commands about who the account
+    # holder *is*, as opposed to which account they hold - and they sit beside
+    # ``whoami`` rather than near ``balance`` because that is the pair they are
+    # the other half of. ``whoami`` answers "which account is this", which is
+    # security-shaped; these answer "who is this person", which is what a tier is
+    # derived from. Neither touches money and neither takes a wallet.
+    #
+    # Two commands rather than one with a ``--show`` flag: reading a profile and
+    # replacing one are different enough to be different verbs, and the read is
+    # the one a person runs to find out what this system thinks they are - which
+    # includes the ceilings they are under, and which they should be able to ask
+    # for without passing anything at all.
+    subparsers.add_parser(
+        "profile",
+        help="show your own details, your tier and the limits it imposes",
+    )
+
+    set_profile_parser = subparsers.add_parser(
+        "set-profile",
+        help="give your details, which is what raises your tier",
+    )
+    # Every flag defaults to ``_NOT_PASSED``, which is the whole reason that
+    # sentinel exists. The default cannot be ``None``, because ``None`` already
+    # means something here - "this field is not given", which for an *edit* is a
+    # request to clear it. With a ``None`` default the two requests "leave my
+    # phone number alone" and "delete my phone number" would arrive as the same
+    # value, and the command would have to pick one; it would pick wrongly for
+    # half its callers, and the wrong choice for a *complete* profile is that
+    # omitting a flag silently drops the person's tier. Three states, three
+    # spellings: not passed at all (the sentinel), passed empty (clear it), and
+    # passed a value (set it).
+    #
+    # REQUIRED only when there is nothing to edit yet, which is why it has no
+    # ``required=True`` here: ``--display-name`` is the one field a profile must
+    # have and the one field an existing profile cannot lose, so it is needed
+    # exactly on the first invocation. argparse cannot express "required
+    # conditionally", so the handler checks and says which case it is in. See
+    # ``_set_profile``.
+    #
+    # No ``--tier`` flag, and its absence is the feature rather than an omission.
+    # A tier is derived from which of these fields are present and is stored
+    # nowhere, so there is no value to set and no command that could set one -
+    # which is what makes "complete your profile" the only way up. A ``--tier``
+    # here would be a client-supplied tier, and the API does not accept one
+    # either.
+    set_profile_parser.add_argument(
+        "--display-name",
+        default=_NOT_PASSED,
+        help="the name to show; required the first time, since a profile "
+        "with nothing in it is a row that exists to say nothing",
+    )
+    set_profile_parser.add_argument(
+        "--first-name",
+        default=_NOT_PASSED,
+        help="your legal first name, as an identity check would read it; "
+        "pass an empty string to clear it",
+    )
+    set_profile_parser.add_argument(
+        "--last-name",
+        default=_NOT_PASSED,
+        help="your legal surname; pass an empty string to clear it",
+    )
+    # ``_optional_date`` rather than ``_date``: this is the one flag whose parser
+    # would otherwise swallow the empty string, and a birth date typed wrong is
+    # the field most likely to need deleting.
+    set_profile_parser.add_argument(
+        "--birth-date",
+        default=_NOT_PASSED,
+        type=_optional_date,
+        help="your date of birth as YYYY-MM-DD; a date, not a moment. "
+        "Pass an empty string to clear it",
+    )
+    set_profile_parser.add_argument(
+        "--phone",
+        default=_NOT_PASSED,
+        help="a number that reaches you, e.g. +2348000000000; pass an empty "
+        "string to clear it",
+    )
+    set_profile_parser.add_argument(
+        "--country",
+        default=_NOT_PASSED,
+        help="a two-letter country code, e.g. NG; pass an empty string to "
+        "clear it",
+    )
+    set_profile_parser.add_argument(
+        "--address",
+        default=_NOT_PASSED,
+        help="one line of your address; pass an empty string to clear it",
     )
 
     # Not in OPERATIONS below: a payout takes a destination as well as an
@@ -1034,12 +1227,105 @@ def _signup(args, factory) -> int:
     return 0
 
 
-def _login(args, factory) -> int:
-    """Obtain a token and put it where every later command will look for it.
+def _signup_phone(args, factory, termii) -> int:
+    """Ask for a code that will let a number create an account.
 
-    **This is the only command that writes the session file**, which is worth
-    knowing when something goes wrong with the CLI's identity: there is exactly
-    one place a token can come from, and it is a password typed at a prompt.
+    **This reads no session file and proves nothing at all** - the second command
+    in this file of which both are true, after ``reset-password`` - and it is the
+    one that goes one step further out. ``reset-password`` is run by somebody who
+    cannot authenticate; this is run by somebody who may not *be* anybody in this
+    system, because the account is what answering the code creates. Placing it above
+    the actor line is what makes it work on a machine nobody has ever logged in on,
+    which is the only kind of machine a signup has ever been run on.
+
+    **The number is not echoed back as it was typed, and the difference is worth
+    knowing before it looks like a bug.** ``PhoneVerification.issue`` folds whatever
+    arrives, so ``0801 234 5678`` and ``+2348012345678`` are one number and the row
+    holds one spelling - the one the provider will be handed. Printing the folded
+    value is therefore the truth about which handset the code goes to, and it is the
+    value the person will need to type at the confirm if they want to check
+    anything. ``_reset_password`` prints ``args.email`` instead, which is the same
+    choice made the other way, and the reason it differs is that an address has no
+    fold a user would not recognise.
+
+    **The no-SMS refusal is not handled here**, following ``_reset_password`` exactly:
+    ``build_request_phone_verification`` composes the reason from the environment -
+    naming ``TERMII_API_KEY`` or ``TERMII_SENDER_ID`` - and the use case raises it,
+    which ``main``'s ``except (MoneyError, CliError)`` renders as ``error: ...`` and
+    exit 1. The same path every other refusal takes, so there is nothing to write
+    here for it.
+
+    A **failed send propagates**, and the exit code is 1 for the reason the API
+    documents: the row is already committed and holds a hash of a code nobody has,
+    so reporting success would leave the person waiting on a handset for a text that
+    is not coming.
+    """
+    verification = build_request_phone_verification(
+        unit_of_work_factory=factory, settings=termii
+    ).execute(args.phone, datetime.now())
+
+    print(
+        f"verification code sent to {verification.phone} | "
+        f"expires {_moment(verification.expires_at)}"
+    )
+    print("run 'confirm-phone' and enter the code to create the account")
+    return 0
+
+
+def _confirm_phone(args, factory) -> int:
+    """Create the account, using the code that was texted, and hold that number.
+
+    **It reads no session file, and the argument is ``confirm-email``'s** - the code
+    was texted to the number being claimed, so presenting it proves something no
+    session could, and there is no session to require anyway: the account does not
+    exist until this command succeeds. It is the only command in this file that
+    creates something from a credential a *third party* delivered.
+
+    **The password is asked for twice**, exactly as ``confirm-password-reset`` asks
+    for its own and with the same argument, which is worth restating because the
+    stakes here are the mirror image: a mistyped password is accepted, stored, and
+    becomes the secret on a brand-new account, which is a lockout created at the
+    moment of creation. That person has no address on the account, so the way back
+    in is a text rather than a mailbox - and until the reset-by-SMS slice lands,
+    that way back is designed and not yet reachable, which makes a mistyped
+    password here the worse of the two versions of the same mistake.
+
+    **The policy is not checked here.** ``PlainPassword`` owns it, and a weak
+    password is refused by the use case *before* the code is spent, so a person who
+    types six characters can present the same code again rather than asking for
+    another text.
+
+    **What it prints next changed when ``login-phone`` arrived, and the history is
+    worth a sentence.** Until that command existed this printed no "next" line at
+    all, because ``signup``'s - "run 'login'" - would have sent the operator to a
+    command that resolves an address, and the account created here has none. The
+    line is back in its own form now that there is a command that works, and the
+    warning it used to carry stays because it is still true: the account holds no
+    address, and a deposit from it is refused until one is set. That address is
+    reachable in principle - ``request_email_change`` treats a ``None`` as "set
+    one" rather than "move one" - and not yet from this command, whose subject is
+    always an actor with a session. What is printed is the number, so that whoever
+    needs it can find it in the output afterwards.
+    """
+    user = build_confirm_phone_sign_up(unit_of_work_factory=factory).execute(
+        _prompt_code("verification code: "),
+        _prompt_password(confirm=True),
+        datetime.now(),
+    )
+    print(f"registered {user.phone} ({user.user_id})")
+    print("no address is on this account yet, so deposits are refused until one is set")
+    print("next: run 'login-phone' to start a session")
+    return 0
+
+
+def _login(args, factory) -> int:
+    """Obtain a token for an address and put it where every later command looks.
+
+    **The commands that write the session file are this one and ``login-phone``**,
+    which is worth knowing when something goes wrong with the CLI's identity:
+    there is exactly one place a token can come from, and both of them reach it
+    through ``_start_session`` below. It is a password typed at a prompt, and
+    which of the two commands asked for it changes only which lookup ran.
 
     Overwriting an existing session is not refused. Logging in as somebody else
     while already signed in is a normal thing to want, and the alternative - a
@@ -1049,16 +1335,76 @@ def _login(args, factory) -> int:
     simultaneous logins: it expires on its own, and nothing here decides that a
     person only has one device.
     """
-    logged_in = build_log_in(unit_of_work_factory=factory).execute(
-        args.email, _prompt_password(confirm=False), datetime.now()
+    return _start_session(
+        args,
+        build_log_in(unit_of_work_factory=factory).execute(
+            args.email, _prompt_password(confirm=False), datetime.now()
+        ),
     )
+
+
+def _login_phone(args, factory) -> int:
+    """Obtain a token for a number, and put it where every later command looks.
+
+    ``_login``'s sibling, and the command that closes the gap ``_confirm_phone``
+    used to print a warning about: an account created from a texted code has no
+    address, so until this existed there was no way to start a session as one, and
+    the account could hold a wallet it could not reach.
+
+    **It is a separate command rather than an argument to ``login``**, for the
+    reason the parser gives one screen up: the kind of identifier is stated by
+    which command was run, not reconstructed from what the string looks like.
+
+    What it does *not* do is guess. A number that was never registered, a number
+    belonging to somebody whose password is different, and an address typed into
+    this command instead of the other one all produce the same ``error:`` line and
+    the same exit code 1, because all three are ``InvalidCredentialsError`` - see
+    ``LogIn``. A person who ran the wrong command finds out from ``--help`` rather
+    than from a message that confirmed a number is registered.
+    """
+    return _start_session(
+        args,
+        build_log_in(unit_of_work_factory=factory).execute_for_phone(
+            args.phone, _prompt_password(confirm=False), datetime.now()
+        ),
+    )
+
+
+def _start_session(args, logged_in: LoggedIn) -> int:
+    """Write the token to the session file and report what was signed in as.
+
+    **The one place a token reaches the disk**, which ``_login``'s docstring
+    claimed for itself for as long as it was the only command that could produce
+    one. It is a function now rather than a paragraph because there are two, and
+    the guarantee has to survive the second: a session file written somewhere else
+    would be a second answer to "who is this machine signed in as", free to
+    disagree with the first.
+
+    The token goes in whole and the *session* is not written at all - only the
+    expiry is printed, because it is the one fact about a session a person needs
+    before it stops working. See ``_write_token`` for the file's shape.
+    """
     _write_token(args.session, logged_in.token)
     print(
-        f"logged in as {logged_in.user.email} | "
+        f"logged in as {_who(logged_in.user)} | "
         f"expires {_moment(logged_in.session.expires_at)} | "
         f"token stored at {args.session}"
     )
     return 0
+
+
+def _who(user: User) -> str:
+    """The identifier this account signs in by, as a person would say it.
+
+    ``User`` holds an address, a number, or both - never neither - so this always
+    names something, and it prefers the address when there are two because that is
+    the one a person gave first. It exists because the two login commands print the
+    same line and a phone-only account is a case where the obvious
+    ``user.email`` renders as ``None``: a signed-up account being reported as
+    ``logged in as None`` is the kind of output that gets read as a bug in the
+    password check.
+    """
+    return user.email or user.phone
 
 
 def _logout(args, factory) -> int:
@@ -1327,9 +1673,202 @@ def _open(service: WalletService, args) -> int:
 
 
 def _whoami(args, actor: User) -> int:
-    """Print the identity this invocation acts as."""
-    print(f"email: {actor.email}")
+    """Print the identity this invocation acts as.
+
+    **An account with no address can now hold a session, which is what makes
+    these lines conditional rather than fixed.** ``login-phone`` is the command
+    that made that reachable, and ``email: None`` is the output a person would
+    read as a bug in the login rather than as the fact it is - there is no address
+    on this account, and the number is what identifies it.
+
+    So each line is printed when the account holds that identifier, and the ones
+    it does not hold are left out rather than filled in. ``_given``'s "not given"
+    is deliberately *not* reused, although it is this file's word for an empty
+    profile field: nothing was withheld here by a person filling in a form, and
+    the account is fully identified by what is printed. At least one line always
+    appears, because ``User`` refuses to exist without an identifier.
+    """
+    if actor.email is not None:
+        print(f"email: {actor.email}")
+    if actor.phone is not None:
+        print(f"phone: {actor.phone}")
     print(f"user_id: {actor.user_id}")
+    return 0
+
+
+def _given(value) -> str:
+    """Render a profile field that may never have been filled in.
+
+    ``str`` rather than a type check, because the seven fields are four shapes -
+    a string, a country code, a ``date``, and ``None`` - and all four already
+    render the way a person reads them. A ``date`` prints as ISO, which is the
+    same spelling the flag that set it takes.
+    """
+    return "not given" if value is None else str(value)
+
+
+def _ceiling(limit: Money | None) -> str:
+    """Render one ceiling, including the one that is not there.
+
+    ``None`` is a real value in ``TierLimits``: it means this tier has no ceiling
+    of this kind, which is a rule rather than a missing number. Printing the word
+    ``None`` for it would read as a value somebody forgot to fill in. No tier
+    lifts a ceiling today - the branch is here because the type allows it, and a
+    tier that did lift one must not render as a bug.
+    """
+    return "no limit" if limit is None else str(limit)
+
+
+def _print_standing(standing: ProfileStanding) -> None:
+    """Print a profile, the tier it puts somebody at, and every ceiling that implies.
+
+    Shared by ``profile`` and ``set-profile`` rather than written out twice, and
+    the sharing is the feature: ``set-profile`` answers "did my tier move, and
+    which limits moved with it?" by printing the same block ``profile`` prints,
+    so the two commands cannot come to describe a tier two different ways.
+
+    **The ceilings are printed for every currency**, matching ``ProfileOut`` on
+    the HTTP side and for the reason argued there: the limits table is one
+    published rule keyed by ``(tier, currency)`` and a profile carries no
+    currency to narrow it to. The terminal has even less to narrow it *with* -
+    no command here lists a person's wallets - so a version of this that guessed
+    a currency would print a limit that might not be the one that applies, which
+    is worse than printing five.
+
+    **The note is printed only when the tier is not the top one**, and it names
+    the four fields rather than saying "your profile is incomplete". Somebody who
+    has just given a first name and nothing else needs to know what is still
+    owed, and "incomplete" is a status they can already read on the line above.
+    """
+    profile: Profile | None = standing.profile
+
+    print(f"user_id: {standing.user_id}")
+    print(f"tier: {standing.tier.value}")
+    if profile is None:
+        # The ordinary state, not an error - see ``ProfileStanding``. Every
+        # account that predates this command is in exactly this state, and
+        # ``profile`` has to be readable by them or it is not readable at all.
+        print("profile: none given yet")
+    else:
+        print(f"display name: {profile.display_name}")
+        print(f"first name: {_given(profile.legal_first_name)}")
+        print(f"last name: {_given(profile.legal_last_name)}")
+        print(f"date of birth: {_given(profile.date_of_birth)}")
+        print(f"phone: {_given(profile.phone)}")
+        print(f"country: {_given(profile.country)}")
+        print(f"address: {_given(profile.address_line)}")
+
+    if not standing.is_complete:
+        # Spelled from the enum rather than typed out, so this sentence cannot
+        # disagree with the tier it is describing.
+        print(
+            f"note: the tier becomes {Tier.IDENTIFIED.value} once a legal first "
+            "and last name, a date of birth, a phone number and a country are "
+            "all given"
+        )
+
+    print("limits:")
+    for currency in Currency:
+        limits = limits_for(standing.tier, currency)
+        print(
+            f"  {currency.value}  "
+            f"per transaction {_ceiling(limits.per_transaction)}  "
+            f"daily outflow {_ceiling(limits.daily_outflow)}  "
+            f"max balance {_ceiling(limits.max_balance)}"
+        )
+
+
+def _profile(args, factory, actor: User) -> int:
+    """Print this account's details, its tier, and what that tier allows.
+
+    The terminal's ``GET /users/me/profile``, and it prints the ceilings rather
+    than only the details on purpose. The reason to ask who this system thinks
+    you are is to find out what you are therefore allowed to move, and a person
+    who learns their limit by being refused has learned it too late.
+
+    No wallet id and no amount, unlike every money command below it, because
+    nothing here is about money: one row is read and printed.
+    """
+    service = build_profile_service(
+        unit_of_work_factory=factory, actor=actor.user_id
+    )
+    _print_standing(service.standing())
+    return 0
+
+
+def _set_profile(args, factory, actor: User) -> int:
+    """Give or change this account's details, leaving unmentioned fields alone.
+
+    The terminal's ``PUT /users/me/profile`` with one deliberate difference, and
+    the difference is a terminal's: **every flag is optional and omitting one
+    keeps the value already stored.** The HTTP body carries all seven fields, so
+    a ``PUT`` cannot be ambiguous - but a command line is typed from memory, and
+    the failure mode of a whole-replacement version here is that
+    ``set-profile --display-name Ada`` would clear six fields the person never
+    mentioned and drop them a tier. Merging before the call costs a read and
+    removes that failure. What reaches ``ProfileService.save`` is still the whole
+    profile, still validated by ``Profile.__post_init__`` in one place, still
+    replaced wholesale - the merge is this function's, not the domain's.
+
+    The three states a flag can be in are ``_NOT_PASSED`` (not typed at all -
+    keep what is stored), an empty string (clear the field), and a value (set
+    it). See ``_NOT_PASSED`` for why the first cannot be spelled ``None``.
+
+    **The read and the write are two units**, and this is the one place in the
+    feature where that is worth stating plainly rather than defended: the merge
+    is computed from a profile read a moment before the call that stores it, so
+    two ``set-profile`` invocations racing in one terminal window can lose one of
+    the two edits. The HTTP path cannot, because its body carries every field.
+    What is *not* at risk is a half-applied profile - the write itself is a
+    single validated replacement inside one unit, so a refusal leaves the stored
+    row exactly as it was, and a merge computed from a stale row is a whole
+    profile that happens to be slightly old rather than a torn one.
+
+    There is no ``--tier``, and there is no method below that could take one: a
+    tier follows from which of these fields are filled in. Giving details is the
+    only thing that raises one.
+    """
+    service = build_profile_service(
+        unit_of_work_factory=factory, actor=actor.user_id
+    )
+    current: Profile | None = service.standing().profile
+
+    if current is None and args.display_name is _NOT_PASSED:
+        # The one flag that is required, and only on the first invocation - the
+        # condition argparse cannot state. See the parser, above.
+        raise CliError(
+            "no profile yet, so --display-name is required: a display name is "
+            "the one field a profile must have, and a profile with nothing in "
+            "it would be a row that exists to say nothing"
+        )
+
+    def kept(value, field):
+        """What to store for one field: what was passed, or what is already there.
+
+        ``field`` is the aggregate's own attribute name, which is what makes
+        this short - the six optional fields differ in nothing but their name
+        here, and six hand-written ternaries would be six chances to point one
+        of them at the wrong attribute.
+        """
+        if value is not _NOT_PASSED:
+            return value
+        return None if current is None else getattr(current, field)
+
+    standing = service.save(
+        display_name=kept(args.display_name, "display_name"),
+        legal_first_name=kept(args.first_name, "legal_first_name"),
+        legal_last_name=kept(args.last_name, "legal_last_name"),
+        date_of_birth=kept(args.birth_date, "date_of_birth"),
+        phone=kept(args.phone, "phone"),
+        country=kept(args.country, "country"),
+        address_line=kept(args.address, "address_line"),
+        # The one clock reading for this invocation, at the boundary - the same
+        # line ``_current_actor`` draws and for the same reason. It becomes
+        # ``updated_at``, and ``created_at`` on a first save.
+        now=datetime.now(),
+    )
+    print(f"saved profile for {standing.user_id}")
+    _print_standing(standing)
     return 0
 
 
@@ -2246,6 +2785,15 @@ def main(argv=None) -> int:
     # about *this* installation's environment, and the deliverers - which only
     # see messages - have no way to know it.
     deferred_reason = describe_configuration() if settings is None else None
+    # One read of the SMS configuration, and it is a *second* read rather than part
+    # of the one above because the two installations are configured separately: an
+    # operator may have SMTP and no Termii, or the reverse, and a single merged
+    # settings object would have to invent a way to say which half was missing.
+    # There is no ``deferred_reason`` beside it, and the asymmetry is the point:
+    # a missing mail account is a thing this installation works around, and a
+    # missing SMS account is a refusal composed by the builder that needs one - see
+    # ``_signup_phone``.
+    termii = termii_from_environment()
     try:
         # --- the commands that need nobody ----------------------------------
         #
@@ -2268,10 +2816,22 @@ def main(argv=None) -> int:
         # none because answering the mail is what proves the account - and because
         # it *ends every session*, so demanding a live one would be deleting the
         # credential it had just required.
+        #
+        # The two phone commands are here because the account they are about does
+        # not exist yet: ``signup-phone`` is run by somebody who may hold no account
+        # at all, and ``confirm-phone`` is what creates one. There is no token for
+        # either to read, which is what makes this the one flow in the file whose
+        # subject is a number rather than a person.
         if args.command == "signup":
             return _signup(args, factory)
+        if args.command == "signup-phone":
+            return _signup_phone(args, factory, termii)
+        if args.command == "confirm-phone":
+            return _confirm_phone(args, factory)
         if args.command == "login":
             return _login(args, factory)
+        if args.command == "login-phone":
+            return _login_phone(args, factory)
         if args.command == "logout":
             return _logout(args, factory)
         if args.command == "confirm-email":
@@ -2299,6 +2859,15 @@ def main(argv=None) -> int:
         )
         if args.command == "whoami":
             return _whoami(args, actor)
+        # Next to ``whoami`` because they are the same question asked one step
+        # further in - it answers which account this is, these answer who holds
+        # it. Neither takes ``service``: it is built above for the commands that
+        # move money, and these two move none, so each builds the one service it
+        # needs instead. See ``ProfileService``.
+        if args.command == "profile":
+            return _profile(args, factory, actor)
+        if args.command == "set-profile":
+            return _set_profile(args, factory, actor)
         if args.command == "change-email":
             return _change_email(
                 args, factory, settings, actor, deferred_reason

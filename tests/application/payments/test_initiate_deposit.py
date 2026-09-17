@@ -34,12 +34,17 @@ validates and the writing unit that records - and a test that shared a factory
 with something else could not say which of them a row came from.
 """
 
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
 import pytest
 
 from app.application.payments.initiate_deposit import InitiateDeposit
+from app.domain.identity.exception import TierLimitExceededError
+from app.domain.identity.limitKind import LimitKind
+from app.domain.identity.profile import Profile
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.money.currency import Currency
 from app.domain.money.exception import (
     CurrencyMismatchError,
@@ -54,6 +59,7 @@ from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.payments.exception import (
     DepositAlreadyInitiatedError,
+    PayerEmailMissingError,
     PayerEmailRefusedError,
     PaymentProviderError,
 )
@@ -66,6 +72,18 @@ NGN = Currency.NGN
 USD = Currency.USD
 
 ACTOR = TEST_USER_ID
+
+#: The most an account with no profile may hold, in the wallet's own currency.
+#:
+#: Read from the table rather than typed out, for the reason every limit test in
+#: this suite reads it: a test that hard-coded the number would go on passing -
+#: and asserting a refusal that no longer happens - after somebody raised the cap.
+CAP = limits_for(Tier.UNVERIFIED, NGN).max_balance
+
+#: The moment every synthetic row in this file is stamped with, for the reason
+#: ``tests/conftest.POT_MOMENT`` exists: a stored value a test asserts about should
+#: not depend on when the suite ran.
+MOMENT = datetime(2026, 1, 1)
 
 #: A second account, for the test that a deposit cannot be opened against
 #: somebody else's wallet.
@@ -128,6 +146,31 @@ def stored(factory, wallet):
         return uow.wallets.get_owned(wallet.wallet_id, wallet.user_id)
     finally:
         uow.rollback()
+
+
+def store_profile(factory, user_id=ACTOR, **overrides):
+    """Give an account a profile - complete unless a field is knocked out.
+
+    Written straight to the repository rather than through ``ProfileService``, and
+    the reason is the one that keeps these tests about deposits: the service has
+    its own tests and its own argument for what a save does. What matters here is
+    only the state it leaves behind, which is what ``tier_for`` reads.
+    """
+    fields = dict(
+        display_name="Ada",
+        legal_first_name="Adaeze",
+        legal_last_name="Okafor",
+        date_of_birth=date(1990, 5, 17),
+        phone="+2348000000000",
+        country="NG",
+        address_line="12 Marina Road, Lagos",
+    )
+    fields.update(overrides)
+    uow = factory.start()
+    uow.profiles.save(
+        Profile(user_id=user_id, created_at=MOMENT, updated_at=MOMENT, **fields)
+    )
+    uow.commit()
 
 
 @pytest.fixture
@@ -306,6 +349,95 @@ class TestTheRefusals:
 
         assert provider.requests == []
         assert rows(factory, wallet) == []
+
+    def test_a_deposit_that_would_leave_the_wallet_above_its_cap_is_refused(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """**The refusal that saves a payer a pointless payment.**
+
+        A collection opened for money this wallet could not accept would send
+        somebody to a checkout page to buy a rejection. Nothing about the request
+        is wrong - the amount is positive, in the wallet's own currency, and the
+        wallet is open - so it is refused for the only reason it can be: the
+        account is not allowed to hold that much.
+
+        The empty ``requests`` list is the claim rather than the exception. "It
+        raised" and "it never called out" are different statements, and only the
+        second one is worth anything to the person who would have been billed.
+        """
+        wallet = build_wallet(available=str(CAP.amount))
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(TierLimitExceededError) as refused:
+            service.execute(wallet.wallet_id, Money(1, NGN), "invoice-7")
+
+        assert refused.value.kind is LimitKind.MAX_BALANCE
+        assert provider.requests == []
+        assert rows(factory, wallet) == []
+
+    def test_a_deposit_that_lands_exactly_on_the_cap_is_allowed(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The boundary, at this door as well as in the domain.
+
+        ``check_credit`` refuses a balance that would be *above* the cap, so a
+        wallet that lands exactly on it is within its limits. The comparison is
+        pinned here because this check is a courtesy and a courtesy is exactly the
+        kind of code that quietly becomes ``>=`` - the deposit would simply be
+        refused while it fitted, and nothing else would notice.
+        """
+        wallet = build_wallet(available=str(CAP.amount - Decimal("5000")))
+        service, factory = a_deposit_service(tmp_path, build_payment_provider())
+        seed(factory, wallet, payer)
+
+        result = service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")
+
+        assert result.status is TransactionStatus.PENDING
+
+    def test_a_pot_counts_toward_the_cap(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """Locked money is money this account still holds.
+
+        A deposit into a wallet whose pot already reaches the cap is refused even
+        though the *available* balance is zero. The cap is a statement about what
+        the wallet holds, and a pot is inside the wallet, so reading only the
+        available balance would make a fully-locked wallet the one way past the
+        ceiling - which is the shape of hole a second, hand-written comparison
+        would leave and ``check_credit`` cannot.
+        """
+        wallet = build_wallet(available="0", locked=str(CAP.amount))
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(TierLimitExceededError):
+            service.execute(wallet.wallet_id, Money(1, NGN), "invoice-7")
+
+        assert provider.requests == []
+
+    def test_the_cap_is_the_owners_and_a_completed_profile_raises_it(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The tier comes off the actor's own profile and from nowhere else.
+
+        The same wallet that is refused above accepts a smaller deposit here, and
+        the only thing that changed between the two is a row on the actor's own
+        account. Nothing in the request carries a tier, so there is no field a
+        caller could set to reach the higher ceiling - which is the property the
+        whole control rests on.
+        """
+        wallet = build_wallet(available=str(CAP.amount))
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+        store_profile(factory)
+
+        result = service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")
+
+        assert result.status is TransactionStatus.PENDING
 
     def test_a_frozen_wallet_is_allowed(
         self, tmp_path, build_wallet, payer, build_payment_provider
@@ -610,6 +742,76 @@ class TestThePayerAddressTheProviderWouldRefuse:
         service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
 
         assert provider.requests[0]["email"] == PAYER
+
+
+class TestAnAccountWithNoAddress:
+    """A phone-only account, and the refusal that has to exist before the 500.
+
+    An address became optional on an account so that somebody can sign up with a
+    number alone, and such an account reaches this use case complete: a wallet, a
+    password, a session, money it can receive. What it cannot do is be *billed*,
+    because a provider is handed the payer's address.
+
+    **The order of the two payer checks is the whole of what this class pins.**
+    The courtesy below asks a question about an address - ``has_real_domain``,
+    which calls ``rpartition`` on what it is given - so ``None`` does not fail that
+    check, it raises ``AttributeError`` inside it and reports as a 500. A refusal a
+    person can act on and a crash are very different answers to the same request.
+    """
+
+    def test_a_deposit_from_an_account_with_no_address_is_refused(
+        self, tmp_path, build_wallet, build_user, build_payment_provider
+    ):
+        wallet = build_wallet()
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, build_user(email=None, phone="08012345678"))
+
+        with pytest.raises(PayerEmailMissingError):
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
+
+        assert provider.requests == []
+        assert rows(factory, wallet) == []
+
+    def test_the_refusal_names_the_remedy(
+        self, tmp_path, build_wallet, build_user, build_payment_provider
+    ):
+        """The sentence has to be actionable, because the person can act on it.
+
+        Nothing is wrong with this account and nothing is wrong with the request;
+        there is one field missing, and the operation that supplies it is the email
+        change request. Telling somebody "no address" without telling them what to
+        do about it leaves them holding an account that works for everything except
+        the one thing they came to do.
+        """
+        wallet = build_wallet()
+        service, factory = a_deposit_service(tmp_path, build_payment_provider())
+        seed(factory, wallet, build_user(email=None, phone="08012345678"))
+
+        with pytest.raises(PayerEmailMissingError) as refused:
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
+
+        assert "add an email" in str(refused.value)
+
+    def test_the_missing_address_is_refused_rather_than_the_stranger(
+        self, tmp_path, build_wallet, build_user, build_payment_provider
+    ):
+        """Ownership is checked first, so this refusal cannot be an oracle.
+
+        The wallet exists and belongs to somebody else; the actor is a bystander
+        who has their own phone-only account. A check that reported the missing
+        address before proving the wallet was theirs would answer "does this wallet
+        exist" for a stranger - the same ordering claim the closed-wallet test
+        makes, one branch over, and the reason the branch below it is reachable at
+        all only for the wallet's actual owner.
+        """
+        wallet = build_wallet()
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider, actor=uuid4())
+        seed(factory, wallet, build_user(email=None, phone="08012345678"))
+
+        with pytest.raises(WalletNotFoundError):
+            service.execute(wallet.wallet_id, Money(5000, NGN), "order-42")
 
 
 class TestWhenTheProviderFails:

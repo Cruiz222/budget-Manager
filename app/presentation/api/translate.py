@@ -31,7 +31,10 @@ from app.application.identity.log_in import LoggedIn
 from app.application.identity.request_email_change import EmailChangeOutcome
 from app.application.identity.request_password_reset import PasswordResetOutcome
 from app.application.payments.initiate_deposit import InitiatedDeposit
+from app.application.profile_service import ProfileStanding
 from app.application.wallet_service import ConfirmedOperation
+from app.domain.identity.phoneVerification import PhoneVerification
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.identity.user import User
 from app.domain.money.confirmation import Confirmation
 from app.domain.money.currency import Currency
@@ -317,9 +320,25 @@ def user_out(user: User) -> schemas.UserOut:
     future sign-in would match on, and no client of this API has a use for it.
     What a client needs from this endpoint is "which account am I", and an id and
     an address answer that.
+
+    **An absent address is passed through rather than filled in**, because there
+    is nothing honest to fill it with: the account genuinely holds none, and
+    inventing a placeholder would be the same mistake as giving a phone-only
+    account a synthetic address in the column. See ``schemas.UserOut``.
+
+    ``phone`` is passed through on exactly those terms one identifier over, and it
+    is here rather than withheld on the argument above run backwards: an address is
+    not a secret and neither is a number - both are identifiers the caller handed
+    over - and the thing that *is* withheld is ``google_subject``, which the caller
+    never chose and never sees. Both fields are ``User.phone``/``User.email`` and
+    never ``Profile.phone``, which is free-form KYC data reported by
+    ``profile_out``.
     """
     return schemas.UserOut(
-        user_id=user.user_id, email=user.email, created_at=user.created_at
+        user_id=user.user_id,
+        email=user.email,
+        phone=user.phone,
+        created_at=user.created_at,
     )
 
 
@@ -409,6 +428,39 @@ def password_reset_accepted_out(
     return schemas.PasswordResetAcceptedOut()
 
 
+def phone_verification_accepted_out(
+    verification: PhoneVerification,
+) -> schemas.PhoneVerificationAcceptedOut:
+    """That a code was texted, to which number, and when it stops working.
+
+    **This function reads its argument, and the contrast with the translator above
+    is the interesting part.** ``password_reset_accepted_out`` takes an outcome and
+    drops it, because that endpoint asks the store whether an identifier names an
+    account and the answer must not reach the client. This one asks the store
+    nothing at all - the number is an address being dialled rather than a key being
+    looked up - so there is no hit and no miss for a response to betray, and every
+    field here is a fact about the *request* the caller just made: the number they
+    typed, folded, and the deadline counted from the moment it was recorded. A
+    reader who wonders why one of these two is silent and the other is not needs
+    only to look at what each use case reads off the store.
+
+    ``phone`` is ``verification.phone`` rather than anything a caller passed, which
+    is what makes this the folded spelling - the same string the row holds, the
+    same string the provider was handed, and the same string the ``UNIQUE`` slot
+    will be held by if the person answers. Reporting the typed spelling instead
+    would be a comfort that agrees with nothing.
+
+    ``expires_at`` is the row's own deadline rather than ``now + lifetime``
+    recomputed here, for ``reset_message``'s reason: one reading of the clock, so
+    the deadline the person is shown and the deadline the claim enforces cannot be
+    counted from two different moments.
+    """
+    return schemas.PhoneVerificationAcceptedOut(
+        phone=verification.phone,
+        expires_at=verification.expires_at,
+    )
+
+
 def password_reset_confirmed_out(
     confirmed: ConfirmedPasswordReset,
 ) -> schemas.PasswordResetConfirmedOut:
@@ -429,6 +481,95 @@ def password_reset_confirmed_out(
         sessions_revoked=confirmed.sessions_revoked,
         notice_sent=confirmed.notice_sent,
         notice_error=confirmed.notice_error,
+    )
+
+
+def tier_limits_out(tier: Tier) -> list[schemas.TierLimitOut]:
+    """Every ceiling this tier imposes, one row per currency.
+
+    **Every currency rather than the ones an account holds**, which is the
+    decision ``ProfileOut`` argues: the limits table is keyed by
+    ``(tier, currency)``, it is the same table for everybody at that tier, and
+    there is nothing in it that belongs to a person. It is also the only version
+    this layer *can* build - a wallet is reachable only by its own id in this
+    API, so there is no list of wallets to scope by.
+
+    Iterating ``Currency`` rather than ``LIMITS`` is deliberate and it is the
+    completeness test's own shape read from the other end: a currency added to
+    the enum with no row in the table would be a ``KeyError`` here, at the
+    translation, which is loud. Iterating the table would silently send a
+    shorter list and a client rendering a KES wallet would find no row and have
+    nothing to say.
+    """
+    return [
+        schemas.TierLimitOut(
+            currency=currency.value,
+            per_transaction=_optional_money_out(limits_for(tier, currency).per_transaction),
+            daily_outflow=_optional_money_out(limits_for(tier, currency).daily_outflow),
+            max_balance=_optional_money_out(limits_for(tier, currency).max_balance),
+        )
+        for currency in Currency
+    ]
+
+
+def _optional_money_out(money: Money | None) -> schemas.MoneyOut | None:
+    """A ``Money`` that may be absent, as an amount that may be null.
+
+    ``None`` is a real value on ``TierLimits`` - it is how a tier says a ceiling
+    does not apply - so this function exists to carry that across honestly
+    rather than to substitute a zero. A zero would be the worst possible
+    translation: it reads as "you may not move anything", which is the opposite
+    of what an absent ceiling means.
+
+    Private, and the only one of its kind here, because ``money_out``'s callers
+    are all dealing with amounts that a movement cannot be recorded without
+    (``wallet_out``'s balance, ``transaction_out``'s amount, an instruction).
+    This is the one place a domain amount is genuinely optional.
+    """
+    return None if money is None else money_out(money)
+
+
+def profile_out(standing: ProfileStanding) -> schemas.ProfileOut:
+    """An account's standing, as the client sees it.
+
+    **The three parts are forwarded, and only one of them is derived.** ``tier``
+    and ``is_complete`` come straight off the outcome, because the derivation is
+    ``tier_for``'s and it already happened inside the service's unit - re-deriving
+    here would be a second opinion about the one rule this feature exists to keep
+    in one place. ``limits`` is looked up from the tier, which is not a second
+    derivation but the *consequence* of it.
+
+    ``profile`` becomes ``None`` when the account has never filled one in, and the
+    nesting is what makes that legible rather than a null name inside an object
+    that appears to exist. See ``ProfileOut``.
+
+    ``created_at`` and ``updated_at`` are forwarded on ``ProfileFieldsOut`` and
+    deliberately *not* hoisted onto the outer model: they are facts about the
+    profile row, and an account with no profile has no such facts. Hoisting them
+    would mean rendering two nulls whose nullness meant nothing, which is the
+    shape this whole nesting exists to avoid.
+    """
+    profile = standing.profile
+    return schemas.ProfileOut(
+        user_id=standing.user_id,
+        profile=(
+            None
+            if profile is None
+            else schemas.ProfileFieldsOut(
+                display_name=profile.display_name,
+                legal_first_name=profile.legal_first_name,
+                legal_last_name=profile.legal_last_name,
+                date_of_birth=profile.date_of_birth,
+                phone=profile.phone,
+                country=profile.country,
+                address_line=profile.address_line,
+                created_at=profile.created_at,
+                updated_at=profile.updated_at,
+            )
+        ),
+        tier=standing.tier.value,
+        is_complete=standing.is_complete,
+        limits=tier_limits_out(standing.tier),
     )
 
 
@@ -544,3 +685,35 @@ def end_date_in(payload: schemas.CreatePlanIn) -> date | None:
 
 def source_in(text: str) -> PlanSource:
     return _member(PlanSource, text, InvalidPlanSourceError, "plan source")
+
+
+def profile_fields_in(payload: schemas.ProfileIn) -> dict:
+    """A profile body as the keyword arguments ``ProfileService.save`` takes.
+
+    **A dict rather than seven positional arguments at the route**, and that is
+    the whole of this function. The service's signature and this model's fields
+    are the same seven names, so ``**profile_fields_in(body)`` cannot transpose
+    two of them - and transposing them is the failure mode a positional call
+    invites, where ``legal_first_name`` and ``legal_last_name`` are both ``str |
+    None`` and a swap produces a profile that is wrong in a way nothing rejects.
+
+    Note what is *not* here: ``now``. The clock is read at the route, beside the
+    ``datetime.now()`` every other route reads, so the moment this system thinks
+    it is enters in one visible place per request rather than inside a
+    translation.
+
+    Nothing is validated, converted or defaulted on the way through. The values
+    reach ``Profile.__post_init__`` exactly as pydantic parsed them, which is the
+    arrangement ``SignUpIn.password`` argues for: the domain answers a bad value
+    with the field's name in its own vocabulary, and a conversion here would be a
+    second opinion about the same question.
+    """
+    return {
+        "display_name": payload.display_name,
+        "legal_first_name": payload.legal_first_name,
+        "legal_last_name": payload.legal_last_name,
+        "date_of_birth": payload.date_of_birth,
+        "phone": payload.phone,
+        "country": payload.country,
+        "address_line": payload.address_line,
+    }

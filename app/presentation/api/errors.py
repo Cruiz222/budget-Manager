@@ -60,16 +60,21 @@ from fastapi.responses import JSONResponse
 
 from app.domain.identity.exception import (
     DuplicateEmailError,
+    DuplicatePhoneError,
     EmailChangeAlreadyUsedError,
     EmailChangeExpiredError,
     EmailUnchangedError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
     InvalidPasswordResetTokenError,
+    InvalidPhoneVerificationTokenError,
     InvalidSessionError,
     NoMailAccountError,
+    NoSmsAccountError,
     PasswordResetAlreadyUsedError,
     PasswordResetExpiredError,
+    PhoneVerificationAlreadyUsedError,
+    PhoneVerificationExpiredError,
     UserNotFoundError,
 )
 from app.domain.money.exception import (
@@ -142,11 +147,20 @@ from app.domain.payments.exception import DepositAlreadyInitiatedError
 #: grades identically to a change's, which is the point worth checking rather than
 #: assuming: **the pairing is the test of whether the two flows really do share a
 #: lifecycle**, and `tests/presentation/api/test_password_resets.py` asserts it.
+#:
+#: ``InvalidPhoneVerificationTokenError`` is the fourth and the third of the same
+#: shape, and it is worth noticing that the three-way collapse has now been arrived
+#: at three times independently rather than generalised. Each flow refuses "no such
+#: code", "a code whose account is gone" and - for the signup, where there is no
+#: account yet - nothing else, with one class, because a caller who could tell them
+#: apart has an oracle and the remedy is identical. The 401 is the same 401 for the
+#: same reason: a credential was presented, looked up, and was not good enough.
 UNAUTHORIZED = (
     InvalidSessionError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
     InvalidPasswordResetTokenError,
+    InvalidPhoneVerificationTokenError,
 )
 
 #: The resource is not there for the actor asking. One status, one body, whatever
@@ -230,6 +244,24 @@ NOT_FOUND = (
 #: code here means a password that was not changed, so "ask again" is the remedy for
 #: somebody who is still locked out rather than for somebody whose address is still
 #: the old one.
+#:
+#: ``PhoneVerificationExpiredError`` and ``PhoneVerificationAlreadyUsedError`` are
+#: the signup flow's pair, and they are the two pairs above restated a third time -
+#: which makes the resemblance a pattern rather than a coincidence between two
+#: flows, and is why it is worth one sentence rather than a paragraph. What differs
+#: is only what a *spent* code means here, and it is the difference that makes this
+#: pair the most useful of the three to a caller: a spent or lapsed verification
+#: means no account was created, so "ask again" is the remedy for somebody who does
+#: not have a login at all. Contrast a reset, where the same state means a password
+#: that was not changed for an account that exists.
+#:
+#: ``DuplicatePhoneError`` is ``DuplicateEmailError`` one identifier over, and it is
+#: the second 409 about a resource the caller never named. It arrives a step later
+#: than its sibling - at the confirm rather than the request - because asking at the
+#: request would turn an unauthenticated endpoint into an oracle over a space as
+#: small as a phone number's. The grade is unchanged by that: the request is well
+#: formed, the number is a real number, and it is the state of the world that
+#: refuses it.
 CONFLICT = (
     InsufficientFundsError,
     WalletFrozenError,
@@ -243,6 +275,7 @@ CONFLICT = (
     MaturityNotExtendedError,
     DuplicateFundNameError,
     DuplicateEmailError,
+    DuplicatePhoneError,
     PlanNotActiveError,
     PlanNotPausedError,
     PlanAlreadyFinishedError,
@@ -256,6 +289,8 @@ CONFLICT = (
     EmailChangeAlreadyUsedError,
     PasswordResetExpiredError,
     PasswordResetAlreadyUsedError,
+    PhoneVerificationExpiredError,
+    PhoneVerificationAlreadyUsedError,
 )
 
 
@@ -394,7 +429,20 @@ class PaymentsUnconfiguredError(ApiError):
 #: cannot fix it, the fact is already inferable from the 503, and nothing here is
 #: secret. The alternative, a 503 saying only "unavailable", is the failure mode
 #: ``describe_configuration`` exists to prevent.
-UNAVAILABLE = (NoMailAccountError,)
+#:
+#: **``NoSmsAccountError`` is the second member and the one that settles the
+#: category**, because it is the first to reach this grade from a *different
+#: channel* rather than from a different feature. The two refusals now say the same
+#: thing about two installations: this deployment cannot reach you the way the flow
+#: requires, and the body names which variable would fix it - ``describe_configuration``
+#: for one, ``describe_termii_configuration`` for the other. The disclosure argument
+#: above transfers word for word, and so does the reason it is not a 400, with one
+#: addition worth stating because it is new here: a phone signup has no fallback at
+#: all. A mail-less install can still apply an address change on the password proof;
+#: a number has no second proof, because the reason to believe somebody holds a
+#: handset *is* a message arriving on it. So the 503 is the only true answer rather
+#: than the kinder one.
+UNAVAILABLE = (NoMailAccountError, NoSmsAccountError)
 
 
 def _grade(exc: MoneyError) -> int:

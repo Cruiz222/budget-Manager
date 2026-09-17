@@ -3,8 +3,10 @@ from app.infrastructure.settings import (
     DEFAULT_PORT,
     database_path,
     describe_configuration,
+    describe_termii_configuration,
     from_environment,
     paystack_from_environment,
+    termii_from_environment,
 )
 
 
@@ -284,4 +286,105 @@ class TestThePaymentKey:
         """
         assert paystack_from_environment(environment()) is None
         assert from_environment({"PAYSTACK_SECRET_KEY": "sk_test_abc"}) is None
+
+
+class TestTheSmsProvider:
+    """The third reader, and the one whose absent case has no fallback at all.
+
+    Mail's ``None`` means "say nothing", the payment one's means "accept nothing",
+    and this one's means "this flow cannot run". That is the difference worth
+    testing here rather than the field names: an install with no Termii account
+    cannot send a signup code and has no second way to prove a number, so the use
+    case that needs this refuses rather than degrading - which makes
+    ``describe_termii_configuration`` load-bearing rather than a courtesy. It is
+    what turns "the SMS is unavailable" into "TERMII_API_KEY is not set".
+    """
+
+    def test_both_variables_are_read(self):
+        settings = termii_from_environment(
+            {"TERMII_API_KEY": "TL_test_abc", "TERMII_SENDER_ID": "BudgetMgr"}
+        )
+
+        assert settings.api_key == "TL_test_abc"
+        assert settings.sender_id == "BudgetMgr"
+
+    def test_no_key_means_no_settings(self):
+        assert termii_from_environment({"TERMII_SENDER_ID": "BudgetMgr"}) is None
+
+    def test_no_sender_id_means_no_settings(self):
+        """**Half a configuration is none of a configuration**, which is where
+        this reader differs from the two above it.
+
+        A key with no sender id describes a request Termii refuses, and a settings
+        object holding it would push the failure to send time - where the only
+        available sentence is the provider's. ``None`` is the honest answer: this
+        install cannot text anybody.
+        """
+        assert termii_from_environment({"TERMII_API_KEY": "TL_test_abc"}) is None
+
+    def test_an_empty_string_counts_as_absent(self):
+        """The variable somebody exported while clearing it."""
+        assert (
+            termii_from_environment(
+                {"TERMII_API_KEY": "", "TERMII_SENDER_ID": "BudgetMgr"}
+            )
+            is None
+        )
+
+    def test_whitespace_counts_as_absent(self):
+        assert (
+            termii_from_environment(
+                {"TERMII_API_KEY": "   ", "TERMII_SENDER_ID": "BudgetMgr"}
+            )
+            is None
+        )
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        """A sender id pasted out of a dashboard can carry a newline, and a sender
+        id with one in it is a different string to the provider than the one that
+        was registered."""
+        settings = termii_from_environment(
+            {"TERMII_API_KEY": " TL_test_abc\n", "TERMII_SENDER_ID": " BudgetMgr "}
+        )
+
+        assert settings.api_key == "TL_test_abc"
+        assert settings.sender_id == "BudgetMgr"
+
+    def test_the_missing_variable_is_named(self):
+        """The property that makes this reader worth having rather than a ``None``.
+
+        A misconfigured notifier fails by being silent, and which variable is
+        missing is the difference between a two-minute fix and an afternoon. The
+        key is reported before the sender id because it is the one an operator sets
+        first - and the order is asserted rather than incidental.
+        """
+        assert describe_termii_configuration({}) == "TERMII_API_KEY is not set"
+        assert (
+            describe_termii_configuration({"TERMII_API_KEY": "TL_test_abc"})
+            == "TERMII_SENDER_ID is not set"
+        )
+
+    def test_a_complete_configuration_has_no_reason_to_give(self):
+        assert (
+            describe_termii_configuration(
+                {"TERMII_API_KEY": "TL_test_abc", "TERMII_SENDER_ID": "BudgetMgr"}
+            )
+            is None
+        )
+
+    def test_it_is_not_a_mail_setting_and_does_not_depend_on_one(self):
+        """Stated in both directions, as the payment reader's version is.
+
+        An install configured for mail cannot text, and an install configured for
+        texts cannot mail - which is what makes it correct for the reset flow to
+        ask about the channel the request *named* rather than about whether any
+        channel is configured at all.
+        """
+        assert termii_from_environment(environment()) is None
+        assert (
+            from_environment(
+                {"TERMII_API_KEY": "TL_test_abc", "TERMII_SENDER_ID": "BudgetMgr"}
+            )
+            is None
+        )
 

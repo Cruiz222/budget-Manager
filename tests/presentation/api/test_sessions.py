@@ -7,6 +7,11 @@ endpoint in the API that returns a secret, and it returns it once. ``DELETE
 it takes a token where every other endpoint takes an actor, and the reason is that
 an expired token cannot be resolved and a client that cannot sign out is stuck.
 
+**``POST /sessions`` now takes two identifiers, and the second one is here rather
+than in a file of its own.** A number signs an account in exactly as an address
+does, so it belongs beside the address tests - what is *different* about it is
+which strings are the same account, and the class below is where that shows.
+
 ``test_actor.py`` covers what the *token* means once you have one. This file
 covers the two requests that produce one and get rid of it.
 """
@@ -24,6 +29,15 @@ from tests.presentation.api.conftest import ALICE, BOB
 
 GOOD_PASSWORD = TEST_USER_PASSWORD
 
+#: A number as it is typed, and the spelling the store holds. The trunk ``0`` is
+#: a national convention rather than part of the number, so these are not the same
+#: string and the fold is what makes them one account - see ``fold_phone``.
+TYPED = "08012345678"
+NUMBER = "2348012345678"
+
+#: A number that belongs to nobody.
+OTHER_TYPED = "08098765432"
+
 
 def register(client, email=ALICE, password=GOOD_PASSWORD):
     return client.post("/users", json={"email": email, "password": password})
@@ -31,6 +45,12 @@ def register(client, email=ALICE, password=GOOD_PASSWORD):
 
 def sign_in(client, email=ALICE, password=GOOD_PASSWORD):
     return client.post("/sessions", json={"email": email, "password": password})
+
+
+def sign_in_by_phone(client, phone=TYPED, password=GOOD_PASSWORD):
+    """``sign_in``'s sibling, and a separate function for the same reason it is a
+    separate fixture below: what differs is the request, not a value in it."""
+    return client.post("/sessions", json={"phone": phone, "password": password})
 
 
 class TestRegistering:
@@ -293,9 +313,18 @@ class TestSigningIn:
         which are registered without guessing a single password. Decision 55, at
         the login form.
 
-        Note the *timing* is not indistinguishable, and that gap is real and
-        documented on ``LogIn``: an unknown address returns without hashing
-        anything. It belongs to 2c with rate limiting.
+        Note the *timing* is not part of this assertion, and the sentence that
+        used to sit here - "an unknown address returns without hashing anything,
+        and that gap belongs to 2c with rate limiting" - is no longer true. Both
+        paths now hash: ``LogIn._settle`` verifies against ``DUMMY_HASH`` when no
+        credential was found, so the two answers cost the same order of time
+        instead of two orders apart. That was fixed in the step that made it worth
+        measuring, because a number is a small enumerable space - see ``LogIn``'s
+        class docstring, which also records the bound: the *store* lookup still
+        differs by microseconds, so rate limiting is still owed and this is not a
+        claim that the oracle is closed. ``tests/application/identity/test_log_in.py``
+        asserts the comparison itself, which is the half a stopwatch cannot state
+        reliably.
         """
         register(client)
 
@@ -343,6 +372,228 @@ class TestSigningIn:
         assert alice.json()["email"] == ALICE
         assert bob.json()["email"] == BOB
         assert alice.json()["user_id"] != bob.json()["user_id"]
+
+
+class TestSigningInWithANumber:
+    """``POST /sessions`` with ``phone`` - the second identifier, over the wire.
+
+    The class above signs in with an address, and this one is not a parametrised
+    version of it: the *request* differs, and three of the things asserted here
+    have no analogue there. The first is that a number reaches an account at all,
+    which is the half a stopwatch cannot see. The second is that the response can
+    now be *about* such an account - ``UserOut.email`` is ``None`` and is not a
+    placeholder, an omission, or an empty string. The third is the cross-identifier
+    refusal, which is a case that does not exist when there is one identifier and
+    which, if it were answered distinctly, would announce that a value is half
+    registered.
+
+    ``legacy_account`` seeds rather than ``POST /phone-verifications`` creating,
+    for the reason that fixture states - an SMS channel and a texted code are not
+    what any test here is about, and the signup is exercised end to end in
+    ``test_phone_verifications.py``.
+    """
+
+    def test_it_returns_201_and_a_token(self, client, legacy_account):
+        legacy_account(None, phone=TYPED)
+
+        response = sign_in_by_phone(client)
+
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["token"]
+        assert body["expires_at"]
+
+    def test_the_account_it_reports_holds_a_number_and_no_address(
+        self, client, legacy_account
+    ):
+        """``email`` is ``None``, and that is the honest rendering rather than a gap.
+
+        ``UserOut`` carried a required ``email`` until the aggregate allowed the
+        absence, and this is the response that makes the difference observable: a
+        phone-only account is the ordinary case the model's docstring describes,
+        not a malformed one. A placeholder - ``""``, or the number echoed into the
+        field - would be a lie in the identity column, which is the argument that
+        refused a synthetic sentinel address at the schema level.
+        """
+        legacy_account(None, phone=TYPED)
+
+        body = sign_in_by_phone(client).json()
+
+        assert body["user"]["phone"] == NUMBER
+        assert body["user"]["email"] is None
+
+    @pytest.mark.parametrize("spelling", [TYPED, NUMBER, "+2348012345678", "0801 234 5678"])
+    def test_any_spelling_of_the_number_finds_the_account(
+        self, client, legacy_account, spelling
+    ):
+        """The fold, at the boundary, which is where a person meets it.
+
+        The stored number is the typed spelling folded by ``User``; every one of
+        these folds to the same value, so all four are one account. Without the
+        fold the ``UNIQUE`` on ``users.phone`` would be decorative - one person,
+        four accounts - and this is the test that would notice, because the
+        fixture writes the typed spelling and these are not all equal to it.
+        """
+        legacy_account(None, phone=TYPED)
+
+        assert sign_in_by_phone(client, phone=spelling).status_code == 201
+
+    def test_the_returned_token_authenticates(self, client, legacy_account):
+        """The round trip, and it is not redundant with the address version.
+
+        ``/users/me`` resolves an actor out of the session, so a token issued for
+        an account with no address travels a path the address tests never take -
+        and it is the path every other endpoint in the API will take once a
+        phone-only account holds one.
+        """
+        legacy_account(None, phone=TYPED)
+
+        token = sign_in_by_phone(client).json()["token"]
+        response = client.get("/users/me", headers={"Authorization": f"Bearer {token}"})
+
+        assert response.status_code == 200
+        assert response.json()["phone"] == NUMBER
+        assert response.json()["email"] is None
+
+    def test_an_unknown_number_is_a_401(self, client):
+        response = sign_in_by_phone(client, phone=OTHER_TYPED)
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "InvalidCredentialsError"
+
+    def test_a_wrong_password_against_a_number_is_a_401(self, client, legacy_account):
+        legacy_account(None, phone=TYPED)
+
+        response = sign_in_by_phone(client, password="not-the-password")
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "InvalidCredentialsError"
+
+    def test_an_unknown_number_and_a_wrong_password_are_the_same_answer(
+        self, client, legacy_account
+    ):
+        """Decision 55 one identifier over, and the identifier where it matters most.
+
+        A number is a small, structured, enumerable space - ten digits behind a
+        known prefix - so an answer that separated "no such account" from "wrong
+        password" would let anybody walk a number range and learn which handsets
+        hold accounts, without ever guessing a password. Asserted by asking for
+        both and comparing the *whole* body, as ``test_boundary.py`` does for
+        wallets: a status and an error class that agree while a detail differs is
+        the leak, not the protection.
+        """
+        legacy_account(None, phone=TYPED)
+
+        unknown = sign_in_by_phone(client, phone=OTHER_TYPED)
+        wrong = sign_in_by_phone(client, password="not-the-password")
+
+        assert unknown.status_code == wrong.status_code == 401
+        assert unknown.json() == wrong.json()
+
+    def test_the_refusal_does_not_echo_the_number(self, client, legacy_account):
+        """The string the caller typed must not come back, in either spelling.
+
+        A refusal that quotes what it was given is a refusal a client can render -
+        and it is also the shape a *helpful* error message takes the moment
+        somebody adds "no account with the number ...". Asserted on the body text
+        rather than on a field, so a message assembled from the input anywhere in
+        the response is caught.
+        """
+        legacy_account(None, phone=TYPED)
+
+        body = sign_in_by_phone(client, password="not-the-password").text
+
+        assert TYPED not in body
+        assert NUMBER not in body
+
+    def test_a_number_for_an_address_only_account_is_a_401(self, client):
+        """The cross-identifier case, which is a case and not a fifth refusal.
+
+        The account exists and is identified by an address. Presenting a number
+        must answer exactly as an unknown number does, because anything else
+        reports that this account is *half* registered - a fact about the system
+        rather than about the guess, and one that would let a caller determine
+        which accounts lack a number without holding one.
+        """
+        register(client, email=ALICE)
+
+        unknown = sign_in_by_phone(client, phone=OTHER_TYPED)
+        cross = sign_in_by_phone(client, phone=TYPED)
+
+        assert cross.status_code == 401
+        assert cross.json() == unknown.json()
+
+    def test_an_address_for_a_number_only_account_is_a_401(self, client, legacy_account):
+        """And the same in the other direction, which is the one that looks harmless.
+
+        "This account has no address" is the message a developer would write here
+        without thinking, and it is the one that turns this endpoint into a way of
+        asking whether a number is registered.
+        """
+        legacy_account(None, phone=TYPED)
+
+        response = sign_in(client, email=ALICE)
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "InvalidCredentialsError"
+
+    def test_a_malformed_number_is_refused_as_unknown_rather_than_as_malformed(
+        self, client
+    ):
+        """No shape rule on the lookup path, per ``LogIn.execute_for_phone``.
+
+        ``checked_phone`` belongs to ``User``, and every account that exists passed
+        through it - so a value that is not a number names no account and is
+        refused as one. Restating the rule here would answer a mistyped number
+        differently from an unknown one, which is a smaller version of the oracle
+        the shared refusal exists to close.
+        """
+        response = sign_in_by_phone(client, phone="not-a-number")
+
+        assert response.status_code == 401
+        assert response.json()["error"] == "InvalidCredentialsError"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"email": ALICE, "phone": TYPED, "password": GOOD_PASSWORD},
+            {"password": GOOD_PASSWORD},
+        ],
+    )
+    def test_a_body_that_does_not_name_exactly_one_identifier_is_a_422(
+        self, client, payload
+    ):
+        """Both directions, because they are one refusal: the body names *one*.
+
+        This travels further than the shape checks around it. ``LogInIn``'s
+        validator is what makes the route's branch total - without it, a body
+        naming a number would be caught by whichever branch happened to be written
+        first, and a body naming neither would reach the use case and answer 401
+        for a request that never named anything. So the refusal is pydantic's 422
+        rather than a 401, and the message is asserted rather than only the status,
+        because a bare 422 is also what a typo in the field name produces - and
+        those are different facts about the request.
+        """
+        response = client.post("/sessions", json=payload)
+
+        assert response.status_code == 422, response.text
+        assert "give email or phone, not both" in response.text
+
+    def test_a_number_signs_in_an_account_that_also_has_an_address(
+        self, client, legacy_account
+    ):
+        """An account may hold both, and then either identifier is a way in.
+
+        This is the state the entry rule and the phone signup can both produce, and
+        the one thing worth pinning about it is that the *other* identifier keeps
+        working - the account is not "switched" to a number by the existence of
+        one, which is the reading a per-identifier lookup table with a single
+        active row would give.
+        """
+        legacy_account(ALICE, phone=TYPED)
+
+        assert sign_in(client, email=ALICE).status_code == 201
+        assert sign_in_by_phone(client).status_code == 201
 
 
 class TestSigningOut:

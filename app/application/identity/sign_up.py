@@ -3,11 +3,11 @@
 import uuid
 from datetime import datetime
 
+from app.application.identity.account_creation import record_new_account
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.domain.identity.emailAddress import refuse_unusable_email
 from app.domain.identity.exception import DuplicateEmailError
 from app.domain.identity.password import PlainPassword
-from app.domain.identity.password_credential import PasswordCredential
 from app.domain.identity.password_hasher import PasswordHasher
 from app.domain.identity.user import User, checked_email
 
@@ -30,6 +30,12 @@ class SignUp:
     reported success and the address would now be taken, so the person can
     neither use what they made nor make it again. Committing the pair together
     makes that state unreachable rather than merely unlikely.
+
+    **The pair is now written by a shared helper**, ``record_new_account``, because
+    the other way into an account - proving a number with a texted code - has to
+    write exactly the same two rows, and a second copy would be a second place for
+    "there is now an account" to mean something slightly different. See that
+    module for why it is a module rather than a private method here.
 
     **This is one of only two writes in the system nobody has to authenticate
     for**, the other being the login it feeds. That is inherent rather than a
@@ -109,6 +115,11 @@ class SignUp:
             user = User(
                 user_id=uuid.uuid4(),
                 email=email,
+                # No phone, for the reason ``google_subject`` below is ``None``:
+                # this path registers an *address*, and an account created here
+                # was not signed up with a number. The other sign-up path sets
+                # this and leaves the email absent; see ``ConfirmPhoneSignUp``.
+                phone=None,
                 # No Google identity, the same ``None`` ``ResolveUserByEmail``
                 # wrote and for the same reason: this account was not created by
                 # a Google sign-in, which is a fact rather than a missing value.
@@ -123,12 +134,7 @@ class SignUp:
             # three characters long.
             hashed = self._password_hasher.hash(PlainPassword(password))
 
-            uow.users.save(user)
-            uow.password_credentials.save(
-                PasswordCredential(
-                    user_id=user.user_id, password_hash=hashed, updated_at=now
-                )
-            )
+            record_new_account(uow, user=user, password_hash=hashed, now=now)
             uow.commit()
             return user
         finally:

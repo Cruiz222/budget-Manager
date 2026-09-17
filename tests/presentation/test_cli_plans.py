@@ -129,7 +129,25 @@ def opened_wallet_with_pot(db_path, capsys, name="Savings", kind="personal"):
     return wallet_id
 
 
-def funded_locked_wallet(db_path, capsys, amount="100000"):
+#: The arguments that complete the account holder's profile, and so move the tier
+#: from ``unverified`` to ``identified``.
+#:
+#: Written out here rather than imported from ``test_cli_profile``: the two files
+#: are about different things, and importing the set would make this file fail for
+#: a reason that belongs to that one. It is a copy of a fixture, which is the same
+#: trade the domain tests make when they write a second argument down instead of
+#: deriving it from the code under test.
+IDENTIFIED = (
+    "--display-name", "Ada",
+    "--first-name", "Ada",
+    "--last-name", "Lovelace",
+    "--birth-date", "1815-12-10",
+    "--phone", "+2348000000000",
+    "--country", "NG",
+)
+
+
+def funded_locked_wallet(db_path, capsys, amount="100000", identified=False):
     """A wallet with ``amount`` sitting in an open pot called "Savings".
 
     Depositing, opening a pot, and then locking into it - because the three are
@@ -137,8 +155,22 @@ def funded_locked_wallet(db_path, capsys, amount="100000"):
     pot. The pot has no maturity date, so it is spendable at every moment: the
     plan tests below are about plans, and a sealed pot here would make every one
     of them a test about maturity instead.
+
+    **``identified`` is asked for by the two tests that hold half a million**, and
+    that is a fact about the system rather than a fixture that outgrew its
+    ceiling: 300,000 is all an unverified account may hold, so the deposit is
+    refused - correctly, and with the balance ceiling named - until the profile
+    says who the holder is. Those two tests are about a plan run, not about the
+    ceiling, so they take the account state that lets them get to their subject.
+
+    Every other caller leaves it ``False`` deliberately. The tier-0 ceilings are
+    the tight ones (50,000 a movement, 200,000 a day) and they stay the ones in
+    force for the rest of this file, so nothing here quietly grows room it was not
+    meant to have.
     """
     wallet_id = opened_wallet_with_pot(db_path, capsys)
+    if identified:
+        assert run(db_path, "set-profile", *IDENTIFIED) == 0
     assert run(db_path, "deposit", wallet_id, amount) == 0
     assert run(db_path, "fund", "lock", wallet_id, "Savings", amount) == 0
     capsys.readouterr()
@@ -616,7 +648,7 @@ class TestTicking:
         worth in a single command.
         """
         db = str(tmp_path / "cli.db")
-        wallet_id = funded_locked_wallet(db, capsys, "500000")
+        wallet_id = funded_locked_wallet(db, capsys, "500000", identified=True)
         create_salary_plan(db, wallet_id)
 
         assert run(db, "plan", "tick", "--as-of", "2026-04-15") == 0
@@ -1154,7 +1186,7 @@ class TestTheReceiptAfterThePayout:
         monkeypatch.setenv("SMTP_USER", "me@example.com")
         monkeypatch.setenv("BUDGET_NOTIFY_TO", "chinedu@example.com")
         db = str(tmp_path / "cli.db")
-        wallet_id = funded_locked_wallet(db, capsys, "500000")
+        wallet_id = funded_locked_wallet(db, capsys, "500000", identified=True)
         create_release_plan(
             db,
             wallet_id,

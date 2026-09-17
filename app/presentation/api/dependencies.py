@@ -55,6 +55,15 @@ service in this module built for somebody the request has not identified, and th
 only one whose honest answer to "who is asking?" is "a stranger, about an address".
 See ``request_password_reset_service``, which is where that stops being alarming
 and becomes a design.
+
+**The two phone-verification services make that six**, added as a pair for the same
+reason and with the same asymmetry one step further out. ``request_phone_verification_service``
+is built for a caller who may not be anybody in this system at all - the account is
+what answering creates - which makes it the first service here whose subject does
+not yet exist rather than one whose subject cannot be proved. Its confirm joins the
+group whose warrant is a code. Read as a group, the six are one question asked four
+ways: *who is asking, and what proves it?* The answer for the newest pair is
+"nobody yet, and a text message".
 """
 
 from datetime import datetime
@@ -63,25 +72,33 @@ from fastapi import Depends, Request
 
 from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.confirm_password_reset import ConfirmPasswordReset
+from app.application.identity.confirm_phone_sign_up import ConfirmPhoneSignUp
 from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
 from app.application.identity.request_email_change import RequestEmailChange
 from app.application.identity.request_password_reset import RequestPasswordReset
+from app.application.identity.request_phone_verification import (
+    RequestPhoneVerification,
+)
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.payments.initiate_deposit import InitiateDeposit
 from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
+from app.application.profile_service import ProfileService
 from app.application.wallet_service import WalletService
 from app.composition_root import (
     build_confirm_email_change,
     build_confirm_password_reset,
+    build_confirm_phone_sign_up,
     build_initiate_deposit,
     build_log_in,
     build_log_out,
     build_plan_service,
+    build_profile_service,
     build_request_email_change,
     build_request_password_reset,
+    build_request_phone_verification,
     build_resolve_actor,
     build_settler,
     build_sign_up,
@@ -191,6 +208,38 @@ def plan_service(
     that was never created.
     """
     return build_plan_service(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        actor=actor.user_id,
+    )
+
+
+def profile_service(
+    request: Request, actor: User = Depends(current_actor)
+) -> ProfileService:
+    """The profile use cases, acting as this request's actor.
+
+    **The only dependency here whose actor is the thing being read *and* the
+    thing being written**, which is why it is worth a sentence even though it
+    looks like ``plan_service`` above. Every other scoped dependency takes an id
+    that narrows a search - a wallet id, a plan id - and the actor is a separate
+    fact used to check ownership. Here there is no id at all: the request asks
+    for "my profile" and the actor *is* the address. So the route below takes no
+    path parameter, no query parameter and no id in the body, and there is
+    deliberately nothing for it to take: a caller cannot name somebody else's
+    profile because the interface has no way to spell one.
+
+    That is a stronger version of the rule the API keeps everywhere else, and it
+    is worth noticing where it comes from. For a wallet, "not yours" and "does
+    not exist" have to be collapsed into one 404 by hand, because a wallet id can
+    be substituted. Here the substitution is unrepresentable, so there is no
+    branch to write and none to get wrong.
+
+    **It takes no ``settings``**, unlike ``request_email_change_service`` and the
+    password-reset pair, and the absence is the honest one: nothing on this path
+    sends mail. A profile write changes a tier and the person finds out from this
+    response, which is the same moment they asked.
+    """
+    return build_profile_service(
         unit_of_work_factory=request.app.state.unit_of_work_factory,
         actor=actor.user_id,
     )
@@ -364,6 +413,61 @@ def confirm_password_reset_service(request: Request) -> ConfirmPasswordReset:
         unit_of_work_factory=request.app.state.unit_of_work_factory,
         password_hasher=request.app.state.password_hasher,
         settings=request.app.state.settings,
+    )
+
+
+def request_phone_verification_service(
+    request: Request,
+) -> RequestPhoneVerification:
+    """Asking to prove a number, which is built for somebody who may not exist yet.
+
+    **No ``current_actor``, and this absence is the strongest of the group.** The
+    other unauthenticated services are built for a caller who cannot *prove* they
+    are anybody - a person who forgot a password, a person answering a mailed code.
+    This one is built for a caller who may not *be* anybody in this system: the
+    account is what answering creates, so requiring a session would not refuse a
+    stranger, it would refuse the entire flow.
+
+    **``settings`` is handed over and nothing is read here, exactly as the reset
+    dependency above does it.** ``composition_root`` composes the sentence that
+    names the missing variable from the environment; a copy of that logic in this
+    module would be a second sentence the CLI could disagree with, and the CLI is
+    the surface where an operator is most likely to see it. Nothing in this module
+    ever calls ``describe_termii_configuration``.
+
+    ``settings`` is ``app.state.termii`` and not ``app.state.settings``, and the two
+    names being adjacent is why it is worth a sentence: one is the mail installation
+    and one is the SMS installation, they are configured separately, and this is one
+    of only two places both are in scope. An install with SMTP and no Termii must
+    refuse here while still resetting passwords by mail, and it will - the builder
+    reads only what it was given.
+    """
+    return build_request_phone_verification(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.termii,
+    )
+
+
+def confirm_phone_sign_up_service(request: Request) -> ConfirmPhoneSignUp:
+    """Answering a phone signup, which has no actor because there is nobody yet.
+
+    **The shortest dependency of the identity group** - no actor, no channel, no
+    settings - and each absence means something slightly different. No actor, for
+    the reason above. No channel because this half sends nothing: there is no
+    second message to send, which ``phoneVerificationMessage`` argues at length. No
+    settings because by the time a confirm is reachable a channel already existed
+    on the request half, so there is nothing a missing one could refuse; the same
+    shape ``confirm_password_reset_service`` has for the notice it does not send.
+
+    It takes the hasher where the request above takes none, and the pair is worth
+    reading together: the password is chosen at the answer, so this is the half that
+    *writes* a credential. The hasher comes off ``app.state``, exactly as
+    ``sign_up_service``'s does, so the argon2 adapter is still constructed in
+    exactly one place.
+    """
+    return build_confirm_phone_sign_up(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        password_hasher=request.app.state.password_hasher,
     )
 
 

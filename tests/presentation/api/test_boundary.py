@@ -48,13 +48,14 @@ import pytest
 #: the safe side of the line - or deciding the line has moved.
 EXPECTED_OPERATIONS = {
     ("get", "/health"),
-    # Two of the five unauthenticated writes, and the only routes on this list
+    # Two of the seven unauthenticated writes, and the only routes on this list
     # that need nobody: they are how a caller comes to have a credential at all.
-    # (The other three arrived later - the email change's confirm and, last, the
-    # two password-reset routes. They sit at the end of this set rather than here
-    # because they are authorised by something else entirely: a code mailed to an
-    # address. What they have in common with these two is only the absence of a
-    # bearer token, and what they have in common with *each other* is a feature.)
+    # (The other five arrived later - the email change's confirm, the two
+    # password-reset routes and, last, the two phone-verification routes. They sit
+    # at the ends of this set rather than here because they are authorised by
+    # something else entirely: a code mailed to an address, or texted to a handset.
+    # What they have in common with these two is only the absence of a bearer
+    # token, and what they have in common with *each other* is a feature.)
     # They are listed here like everything else rather than held, because the
     # boundary is about what is *routable*, and the question of whether they should
     # be rate limited is a different one that lives in the README's open list -
@@ -165,7 +166,7 @@ EXPECTED_OPERATIONS = {
     # **The confirm used to be the third unauthenticated write in this API and the
     # only one authorised by a thing mailed rather than presented at the time.**
     # Both halves of that sentence are now out of date, and the two entries below
-    # are why: there are five unauthenticated writes rather than three, and the
+    # are why: there are seven unauthenticated writes rather than three, and the
     # reset confirm is authorised by a mailed code in the same sense this one is.
     # What is still true, and is the part that matters, is that the code exists
     # only because somebody already presented the account's password to mint it,
@@ -224,6 +225,64 @@ EXPECTED_OPERATIONS = {
     # not "authentication is optional"; it is that the code *is* the authorisation,
     # and a client holding a stale token must be neither helped nor refused by it.
     ("post", "/password-resets/confirm"),
+    # --- who the account holder is, added last -------------------------------
+    #
+    # Two routes, and they are the only pair here on a prefix that **is** an
+    # identity rather than naming one: the path segment is the literal word
+    # ``me``, resolved from the bearer token like every other scoped route. So
+    # there is no ``/users/{user_id}/profile`` for a caller to aim at, and the
+    # 404-for-a-foreign-resource rule every other resource needs here is not
+    # absent - it is unrepresentable, because there is no id to substitute.
+    #
+    # That matters more for this feature than for the ones above, because what
+    # these routes read is a legal name, a date of birth and a phone number, and
+    # what they publish is a *limit*. A wrongly resolved actor here would not
+    # only be a leak; it would be a ceiling applied to the wrong account, and
+    # both presentations enforce that ceiling by reading the profile at the
+    # moment money moves. See ``ProfileService``.
+    #
+    # ``PUT`` rather than ``POST``: the resource is the account's single profile
+    # row and the body carries the whole of it, so the same body sent twice
+    # leaves the same state. **No tier is accepted anywhere in either
+    # request** - it is derived from which fields a profile holds and stored
+    # nowhere, which is what makes completing a profile the only way to raise
+    # one.
+    ("get", "/users/me/profile"),
+    ("put", "/users/me/profile"),
+    # --- signing up with a number, added last --------------------------------
+    #
+    # The third feature here on bare plural prefixes, and the reason is one step
+    # further out than the reset pair's. There the caller cannot log in; here the
+    # caller may not have an account to log into, because the account is what
+    # answering the code creates. A path under ``/users/me`` would promise a check
+    # there is nothing to perform it against.
+    #
+    # **The request is the sixth unauthenticated write in this API and the only
+    # one that costs the installation money per call.** The reset request beside it
+    # sends a mail through an account the operator already pays for; this one sends
+    # a *text*, billed per message, through a provider, on an endpoint with no actor
+    # and no rate limiter. It is the strongest entry in the README's rate-limiting
+    # item, which is why it is named here rather than left to the route's own
+    # comments.
+    #
+    # What it cannot do is the half worth checking against the reset request: it
+    # cannot read anything, cannot name an account, and cannot learn whether one
+    # exists - it does not ask. What it holds is a row keyed on the number it was
+    # given, which the same number supersedes, so the state a stranger can create is
+    # one pending verification per handset and it is only answerable from that
+    # handset.
+    ("post", "/phone-verifications"),
+    #
+    # The confirm, which is the only route in this API that *creates an account* on
+    # the strength of something other than a password presented with it. The
+    # credential is a code that was texted, the number is read off the claimed row
+    # rather than off the request, and the account it makes has no address - so the
+    # next thing its holder will do is set one, which is the email-change request
+    # above and is reachable because that flow handles an account that starts with
+    # no address at all. It mints no session, on ``POST /users``' precedent: the
+    # caller holds two facts it can log in with, and the honest next step is
+    # ``POST /sessions``.
+    ("post", "/phone-verifications/confirm"),
 }
 
 #: Balance changes that are still held, each one because the movement's far end

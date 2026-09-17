@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 import uuid
+from collections.abc import Callable
+from datetime import datetime
 
 from app.domain.money.destination import Destination
 from app.domain.money.exception import InvalidAmountError, MoneyError
@@ -82,6 +84,66 @@ class WalletOperation(ABC):
     #: withholding money from a user who thinks it moved.
     settles_immediately: bool = True
 
+    #: An extra refusal to apply to the amount, before the wallet is asked to move
+    #: it. ``None`` means no ceiling faces this operation.
+    #:
+    #: **Set by whoever knows the limits, not by the operation.** An operation is
+    #: built with the wallet in hand and knows nothing about the person who owns
+    #: it, which is exactly the rule the tier checks are: a ceiling is a fact
+    #: about the *account* (see ``app.domain.identity.tier``), and the one layer
+    #: that can load a wallet and a profile at once is the application service
+    #: that builds this object. So ``WalletService._run`` attaches one and this
+    #: class only calls it. An attribute here rather than a constructor argument
+    #: because the nine concrete operations have nine different constructors and
+    #: not one of them has anything to say about it - a parameter would be nine
+    #: signatures forwarded for a fact none of them knows.
+    #:
+    #: **It runs inside ``execute``'s ``try``, and that placement is the whole of
+    #: its value.** Invoked between the PENDING row and ``_apply``, a breach it
+    #: raises is caught by the ``except MoneyError`` below, recorded as FAILED and
+    #: re-raised - so a limit refusal reaches the ledger like every other refusal,
+    #: which is ``TierLimitExceededError``'s argument for sitting under
+    #: ``MoneyError``. Checked one layer up, before ``execute`` was called, the
+    #: refusal would leave no row at all and nobody afterwards could say how many
+    #: movements a cap had turned away.
+    #:
+    #: **It runs before ``_apply`` rather than inside it**, so the wallet has not
+    #: been touched and a refusal is not a half-made movement. What the guard
+    #: reads is therefore the wallet *before* this movement - which is what both
+    #: ceilings are stated against: a balance cap is about what would be held,
+    #: and a daily total is about what has already gone.
+    guard: Callable[[Money], None] | None = None
+
+    #: The moment this movement belongs to, stamped onto the row it writes.
+    #:
+    #: **A movement judged in a limit-day has to be recorded in that limit-day.**
+    #: The daily cap is summed from the ledger's ``created_at`` (see
+    #: ``TransactionRepository.outflow_total_between``), so a row stamped by the
+    #: wall clock while its ceiling was read from the caller's own moment leaves
+    #: the two frames disagreeing - and the disagreement is *silent*, because a
+    #: total that misses a row reads as a smaller total rather than as an error.
+    #: The cap would still be enforced; it would just be enforced against the
+    #: wrong day, and every movement judged in a day that is not the clock's would
+    #: see an empty one.
+    #:
+    #: Set by whoever read the limit-day, which is the same layer that sets
+    #: ``guard`` and for the same reason: only the application service knows which
+    #: day a movement is being judged in. ``None`` means no moment was supplied
+    #: and ``Transaction`` falls back to the clock, which is all a deposit or an
+    #: internal move needs - neither is read by a day-bounded query. That is the
+    #: same asymmetry ``WalletService._ceiling`` states, arriving at the row
+    #: instead of the verdict: only a movement *out* is judged against a day, so
+    #: only a movement out is stamped against one.
+    #:
+    #: This is not a new convention, it is the existing one applied here. Every
+    #: other use case in this codebase that is handed an ``as_of`` stamps what it
+    #: writes with it, because that is what makes a replayed tick compose the same
+    #: rows (see ``NotifyUpcomingRuns``) and what lets a catch-up run record the
+    #: moment a plan was *due* rather than the moment the scheduler noticed. The
+    #: template was the outlier, and the daily cap is the first thing to depend on
+    #: the rule it was breaking.
+    now: datetime | None = None
+
     def __init__(
         self,
         wallet: Wallet,
@@ -118,10 +180,20 @@ class WalletOperation(ABC):
             internal_reference=internal_reference,
             destination=destination,
             fund_id=self.fund_id,
+            # The moment this movement is being judged in, when one was supplied
+            # - see ``now``. ``None`` here is not "no moment" but "the caller had
+            # no day to give", and ``Transaction`` reads it as the clock.
+            created_at=self.now,
         )
         self.transaction_repository.save(transaction)
 
         try:
+            # 3b. Any ceiling that faces this movement, asked after the row above
+            #     exists so that a refusal is recorded rather than merely raised.
+            #     See ``guard``.
+            if self.guard is not None:
+                self.guard(amount)
+
             # 4. The wallet decides, raising before mutating on rejection.
             self._apply(amount)
         except MoneyError:

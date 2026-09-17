@@ -36,6 +36,12 @@ from app.infrastructure.repositories.sqlite_notification_repository import (
 from app.infrastructure.repositories.sqlite_password_reset_repository import (
     SqlitePasswordResetRepository,
 )
+from app.infrastructure.repositories.sqlite_phone_verification_repository import (
+    SqlitePhoneVerificationRepository,
+)
+from app.infrastructure.repositories.sqlite_profile_repository import (
+    SqliteProfileRepository,
+)
 from app.infrastructure.repositories.sqlite_outbound_message_repository import (
     SqliteOutboundMessageRepository,
 )
@@ -71,12 +77,48 @@ SCHEMA = """
 -- for now, and the rebuild is recorded in the README as a later candidate.
 CREATE TABLE IF NOT EXISTS users (
     user_id        TEXT PRIMARY KEY,
-    email          TEXT NOT NULL UNIQUE,   -- folded to lowercase by the aggregate
+    -- Optional, and the optionality is the point rather than a relaxation: an
+    -- account is identified by an address, a number, or both. The rule that at
+    -- least one of the two is present is ``User``'s (``InvalidUserIdentifierError``)
+    -- and there is deliberately no CHECK beside it here - and this is *not* the
+    -- usual "one rule in one place" argument, because ``profiles`` below makes
+    -- the opposite call for the invariant it can hold and says why. The
+    -- difference is what SQL can see. That one compares two columns to each
+    -- other, which is a fact about the stored row and nowhere else; this one is
+    -- about values that are *normalised* before they arrive, by
+    -- ``checked_email`` and ``checked_phone``, so a CHECK could only catch the
+    -- case where both columns are literally NULL - which the constructor refuses
+    -- and no repository can write. A constraint that restates a rule and catches
+    -- less of it is worse than none, because it reads as the guard.
+    --
+    -- NULL is therefore ordinary, and SQLite's UNIQUE permits any number of them,
+    -- which is what lets every phone-only account coexist. This is the argument
+    -- ``google_subject`` below already carries, arriving for a second column.
+    email          TEXT UNIQUE,            -- folded to lowercase by the aggregate
+    -- The second identifier, and the only one this system can deliver a
+    -- credential to without a mail account. Stored in the canonical
+    -- country-code-first form ``fold_phone`` produces - digits only, no ``+`` -
+    -- so that one number has one spelling and this UNIQUE bounds what it looks
+    -- like it bounds. See ``app.domain.identity.phoneNumber``.
+    --
+    -- Note what is *not* stored here: whether the number was ever verified. A
+    -- verified number is a fact about a proof rather than about this column, and
+    -- an account is only created once that proof has happened - so an account
+    -- holding a number is one whose holder demonstrated they hold the handset.
+    -- The proof is a table of its own, which arrives with the signup flow that
+    -- produces one; it is not here, for the reason ``password_credentials``
+    -- gives about itself: every column on ``users`` is one forgotten omission
+    -- away from being rendered to whoever asks who they are.
+    phone          TEXT UNIQUE,
     -- The Google account this user signs in with, when they have one. NULL is
     -- the ordinary case for an account created any other way, and SQLite's
     -- UNIQUE permits any number of NULLs - which is exactly right here, and is
     -- why an empty string would be wrong instead: every Google-less account
     -- would collide on "" and the second signup would fail against the first.
+    --
+    -- Deliberately *not* counted as an identifier for the at-least-one rule,
+    -- because a login Google performs is not something this system can send a
+    -- credential to.
     google_subject TEXT UNIQUE,
     created_at     TEXT NOT NULL           -- ISO moment
 );
@@ -501,6 +543,143 @@ CREATE TABLE IF NOT EXISTS password_resets (
     -- row whose two halves disagree fails loudly rather than being interpreted.
     settled_at        TEXT
 );
+
+-- Proving a number belongs to the person typing it, before any account holds it.
+--
+-- **This is the one request table keyed on an identifier rather than on a ``user_id``,
+-- and that is the whole of what is different about it.** ``email_changes`` and
+-- ``password_resets`` above are requests made *by* an account about an account, so the
+-- account's id is what ties a row to everything else in the schema. A signup has no
+-- account yet - the account is what answering this request creates - so the subject is
+-- the number itself and the number is the key. There is deliberately nothing to
+-- reference and nothing that could be referenced.
+--
+-- The lifecycle is the same as the two above and is written out rather than inherited,
+-- for the reason ``email_changes`` and ``password_resets`` give about each other: three
+-- copies free to move on their own beat one shared base free to move all three at once.
+CREATE TABLE IF NOT EXISTS phone_verifications (
+    -- The request's own id, and the row's identity. **Not the key this table is
+    -- *about*** - see ``phone`` below, which is the one that carries the rule.
+    phone_verification_id TEXT PRIMARY KEY,
+    -- **UNIQUE, and this is where "one pending verification per number" lives.** One
+    -- row per number, so a second request supersedes the first rather than joining it -
+    -- which is the remedy for a text that never arrived, and the reason a second
+    -- request cannot leave two live codes racing. No REFERENCES users(phone), for the
+    -- reason every other owner column here gives, and one more that is this table's
+    -- alone: there is no such column to reference until this row is answered.
+    --
+    -- It is the UNIQUE index rather than the primary key for the SQLite reason
+    -- ``email_changes`` gives: a table may declare only one PRIMARY KEY, so an id column
+    -- and a per-number key cannot both be one. ``ON CONFLICT(phone)`` targets any unique
+    -- index and enforces the same one-row-per-number guarantee.
+    --
+    -- **Stored folded**, which the schema cannot enforce and the aggregate does: every
+    -- write goes through ``checked_phone``, so ``08012345678`` and ``+2348012345678``
+    -- cannot occupy two rows here and produce two accounts for one handset. The same
+    -- guarantee ``users.email`` gets from ``fold_email``.
+    --
+    -- That the row is keyed this way is also what lets a *spent* request stay in the
+    -- table, and its survival is what makes "this code was already used" distinguishable
+    -- from "this code never existed". See ``PhoneVerificationRepository``.
+    phone             TEXT NOT NULL UNIQUE,
+    -- The hash, never the token, and UNIQUE for ``sessions``' reason: two requests
+    -- sharing a hash cannot realistically happen, and if it did - a broken RNG, a row
+    -- copied by hand - the store refuses it rather than letting one code answer two
+    -- signups. It is also the index the claim reads through, and the *only* thing the
+    -- claim reads through: the number is taken from the claimed row rather than from
+    -- what a caller supplied.
+    --
+    -- Hashed at rest buys the same thing it buys for a session and no more: the server
+    -- hashes whatever arrives and looks *that* up, so a copy of this table holds no
+    -- token anybody can present.
+    token_hash        TEXT NOT NULL UNIQUE,
+    -- AWAITING or CONFIRMED. There is deliberately no stored EXPIRED: expiry is
+    -- *checked*, not swept, and a request past its window is reported as expired from
+    -- ``expires_at`` alone - so nothing has to write on a read. See
+    -- ``PhoneVerification.status_as_of``.
+    status            TEXT NOT NULL,
+    requested_at      TEXT NOT NULL,   -- ISO moment
+    expires_at        TEXT NOT NULL,   -- ISO moment; absolute, never extended
+    -- When the request was answered: set by the same UPDATE that sets CONFIRMED, and
+    -- NULL exactly while it is AWAITING. The pair is validated on load, so a row whose
+    -- two halves disagree fails loudly rather than being interpreted.
+    settled_at        TEXT
+);
+
+-- Who an account holder is, as opposed to which account they hold.
+--
+-- **A table of its own rather than columns on ``users``, and the reason is the
+-- same one ``password_credentials`` above gives.** ``users`` is read by every
+-- authenticated request and its row is rendered by ``translate.user_out``; every
+-- column added to it is one forgotten omission away from being served to
+-- whoever asks who they are. A legal name, a date of birth and a home address
+-- are exactly the values that must not travel that way, so they live here,
+-- keyed by the same ``user_id``, reached only by code that meant to reach them.
+--
+-- The split is not merely tidy - it is what keeps the two questions separable.
+-- ``users`` answers "which account is this", which is security-shaped, and this
+-- answers "who is this person", which is compliance-shaped. Merging them would
+-- make one row's read permissions the *wider* of the two.
+CREATE TABLE IF NOT EXISTS profiles (
+    -- The primary key, and **not a synthetic id beside it**. A person has one
+    -- profile, so a second row for the same user is not a state to be validated
+    -- against - it is a state that cannot be written. That is the difference
+    -- from ``email_changes`` and ``password_resets`` above, which need an id
+    -- column *and* a per-account unique index because a request is a thing that
+    -- happens repeatedly; a profile is a thing that exists once.
+    --
+    -- No REFERENCES users(user_id), matching every other owner column here. The
+    -- foreign key would document an intent this project has decided not to
+    -- enforce in the schema - see the note against ``wallets``.
+    user_id           TEXT PRIMARY KEY,
+    -- The one required field. A profile with nothing in it is a row that exists
+    -- to say nothing, so the aggregate refuses it and the column is NOT NULL to
+    -- agree.
+    display_name      TEXT NOT NULL,
+    -- Everything below is nullable, and that is the design rather than a stage
+    -- of work: a person fills this in over more than one sitting, and a given
+    -- name with no surname is a real state to be in the middle of. The tier is
+    -- derived from which of these are present, so "half-filled" needs no
+    -- representation of its own.
+    legal_first_name  TEXT,
+    legal_last_name   TEXT,
+    -- **The only ``date`` column in the schema, and it is stored as a date.**
+    -- Every other moment here is an ISO *datetime*, because every other moment
+    -- is a thing that happened at a time. A birth date is a calendar fact with
+    -- no time attached - nobody knows what time of day they were born, and a
+    -- stored "T00:00:00" would invent a precision that does not exist. It also
+    -- round-trips: ``text_to_datetime`` would hand the aggregate a ``datetime``,
+    -- which ``Profile.__post_init__`` refuses, so the column type and the
+    -- aggregate's check have to agree on which of the two this is.
+    date_of_birth     TEXT,             -- ISO date, e.g. "1990-01-31"
+    phone             TEXT,
+    -- A two-letter code, uppercased by the aggregate. A shape rule rather than
+    -- an ISO 3166 membership check - see ``Profile._checked_country`` - so a
+    -- row can hold a code that is shaped right and not real, and the thing that
+    -- would catch that is the identity check this system has not built.
+    country           TEXT,
+    address_line      TEXT,
+    created_at        TEXT NOT NULL,    -- ISO moment
+    updated_at        TEXT NOT NULL,    -- ISO moment; never before created_at
+    -- The one invariant the schema can hold and the aggregate also holds, which
+    -- is worth having twice: it is the pair that makes "when did this person
+    -- last change their details" answerable, and a row where the second is
+    -- before the first is a contradiction a reader could not interpret.
+    CHECK (updated_at >= created_at)
+);
+
+-- There is no migration function for this table, for the reason recorded against
+-- ``plan_notices``, ``outbound_messages``, ``users``, ``password_credentials``,
+-- ``sessions``, ``notifications``, ``confirmations``, ``email_changes``,
+-- ``password_resets`` and ``phone_verifications`` above: CREATE TABLE IF NOT EXISTS
+-- creates a missing table on a database already in the wild for free. Adding a table
+-- is not a migration; changing a table that is already on disk is.
+--
+-- **Which is what makes "Tier 0 for everyone on rollout" free.** Every account
+-- that exists today has no row here, ``ProfileRepository.find_for_user`` answers
+-- ``None`` for it, and ``tier_for(None)`` answers UNVERIFIED. There is nothing
+-- to backfill and no moment at which the answers could disagree - the absence of
+-- a row *is* the unverified state, so no write is needed to put anybody in it.
 """
 
 
@@ -912,6 +1091,91 @@ def _migrate_locked_balance_into_funds(connection: sqlite3.Connection) -> None:
     connection.execute("ALTER TABLE wallets DROP COLUMN locked_balance")
 
 
+def _migrate_make_user_email_optional(connection: sqlite3.Connection) -> None:
+    """Rebuild ``users`` so ``email`` may be NULL, with ``phone`` beside it.
+
+    **The first table rebuild in this codebase**, and it is here because SQLite
+    offers no alternative: dropping ``NOT NULL`` has no ``ALTER TABLE`` form, so
+    the only way to make an existing column optional is to build the table again
+    and move the rows across. Every other migration in this file changes a column
+    or rewrites values; this one *replaces* the table, and a reader who has read
+    the others should know that before reading this one.
+
+    Three things make it safe rather than merely necessary, and all three are
+    consequences of decisions taken elsewhere:
+
+    * **Nothing references ``users``.** Every owner column in this schema
+      deliberately omits a foreign key to it - ``savings_plans``, ``confirmations``,
+      ``email_changes``, ``password_resets`` and ``profiles`` each carry a comment
+      saying so - so the ``DROP`` below cannot strand a child row and no
+      foreign-key dance is owed. That the absence was forced by a SQLite
+      limitation, recorded above ``users``, turns out to have bought this.
+      (Note what it does *not* buy: ``wallets.user_id``'s missing foreign key is a
+      different candidate and is still open. This rebuild is of ``users``, and it
+      does not touch ``wallets``.)
+    * **The guard is ``email``'s ``notnull`` flag**, not "does ``phone`` exist".
+      A database that reached the new shape by some other route is still left
+      alone, and a second start does nothing rather than rebuilding again.
+    * **It runs as one transaction**, where every other migration here is a single
+      statement that is safe in autocommit. This is four, and a process killed
+      between the ``DROP`` and the ``RENAME`` would lose the table outright.
+      ``BEGIN IMMEDIATE`` takes the write lock at the start, so a second process
+      opening the same database waits rather than reading a half-built table.
+
+    The copy names its columns on both sides instead of using ``SELECT *``. The
+    two tables hold the same values but not in the same order, and a positional
+    copy is the kind of thing that keeps working until somebody inserts a column
+    in the middle.
+
+    ``phone`` is written as ``NULL`` for every existing row, which is the honest
+    value rather than a placeholder: an account predating phone signup has no
+    number, and inventing one would be inventing an identifier somebody could
+    later authenticate against. The column is read from the old table when it is
+    somehow already there, so a database that gained ``phone`` by hand keeps it.
+    """
+    columns = {
+        row["name"]: row["notnull"] for row in connection.execute("PRAGMA table_info(users)")
+    }
+
+    # A fresh database has the new shape from SCHEMA above and needs nothing.
+    # ``email`` present but already nullable means the rebuild has run.
+    if "email" in columns and not columns["email"]:
+        return
+
+    # One of two literals, chosen rather than interpolated from anything external:
+    # a database that already carries ``phone`` keeps its values, and one that does
+    # not gets NULL. Writing ``NULL`` unconditionally would silently discard them.
+    phone_source = "phone" if "phone" in columns else "NULL"
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE users_rebuilt (
+                user_id        TEXT PRIMARY KEY,
+                email          TEXT UNIQUE,
+                phone          TEXT UNIQUE,
+                google_subject TEXT UNIQUE,
+                created_at     TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            f"""
+            INSERT INTO users_rebuilt
+                (user_id, email, phone, google_subject, created_at)
+            SELECT user_id, email, {phone_source}, google_subject, created_at
+            FROM users
+            """
+        )
+        connection.execute("DROP TABLE users")
+        connection.execute("ALTER TABLE users_rebuilt RENAME TO users")
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     """Open a connection in autocommit mode with the schema applied.
 
@@ -941,6 +1205,12 @@ def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     # credential went into a table of its own rather than becoming three columns
     # on ``users``, and a new table costs nothing here. That was a security
     # decision first - see ``user.py`` - and this is the second thing it bought.
+    # First, and before anything else reads ``users``: this is the one migration
+    # here that replaces a table rather than changing one, and every later step in
+    # this function would otherwise be reading a shape that is about to change.
+    # It is a no-op on a fresh database, where ``executescript`` has just created
+    # the table in its new form.
+    _migrate_make_user_email_optional(connection)
     _migrate_add_destination_column(connection)
     _migrate_add_plan_name_column(connection)
     _migrate_plan_run_due_at_to_datetime(connection)
@@ -1001,6 +1271,17 @@ class SqliteUnitOfWork(UnitOfWork):
         # the use case to remember. See the attribute's declaration on
         # ``UnitOfWork``.
         self.password_resets = SqlitePasswordResetRepository(connection)
+        # Correctness, not convenience, and the pairing is this slice's own: the spend
+        # of the texted code and the creation of the account it authorises must land in
+        # one transaction, or a crash between them claims a number that no account then
+        # holds - and since ``UNIQUE(phone)`` is what stops a second person taking it,
+        # the true owner is locked out of their own number until the row expires. The
+        # two halves are written by *three* repositories - ``phone_verifications`` here,
+        # ``users`` and ``password_credentials`` above - which is why the declaration
+        # exists at all rather than being left to the use case to remember. See the
+        # attribute's declaration on ``UnitOfWork``.
+        self.phone_verifications = SqlitePhoneVerificationRepository(connection)
+        self.profiles = SqliteProfileRepository(connection)
 
     def commit(self) -> None:
         self._connection.commit()
@@ -1015,12 +1296,58 @@ class SqliteUnitOfWorkFactory:
     Every start() opens a new connection to the same database file, so
     committed work is visible to later units but no two units ever share a
     connection or a transaction.
+
+    **And no two units ever hold a write intent at once** - see ``start``, which
+    is where that is decided and where the price of it is written down.
     """
 
     def __init__(self, db_path: str = "budget.db"):
         self.db_path = db_path
 
     def start(self) -> SqliteUnitOfWork:
+        """Open a unit: a fresh connection, a fresh transaction, and the write lock.
+
+        **``BEGIN IMMEDIATE`` rather than the plain ``BEGIN`` this used to run, and
+        the difference is a rule that cannot be enforced without it.** A plain
+        ``BEGIN`` is *deferred*: it takes no lock until the first statement, a read
+        takes only a shared one, and the transaction upgrades to a write lock when
+        it first writes. So two units that each read before either writes can both
+        read the same value and both act on it:
+
+            1. confirm A reads today's outflow: 90,000 of a 100,000 cap
+            2. confirm B reads today's outflow: 90,000 of a 100,000 cap
+            3. A moves 8,000 and commits
+            4. B moves 8,000 and commits
+
+        The cap is now breached by 6,000 and neither operation did anything wrong
+        by its own reading. SQLite's single-writer rule does not save it: both read
+        *before* either wrote, so the second write does not fail - it waits for the
+        first to commit, and then succeeds. ``BEGIN IMMEDIATE`` takes the write
+        lock at the start instead, which makes the read in step 1 and the write in
+        step 3 one critical section: B cannot read until A has committed, so B
+        reads 98,000 and refuses. That is what makes a *read-then-write* rule
+        enforceable between two callers at all, and the tier ceilings are the first
+        such rule in this system.
+
+        **This is every unit in the system, not only the money ones**, and that is
+        the honest description rather than a claim about scope. ``start`` is the
+        only door and there is no way to say "this one is a movement" from here; a
+        parameter meaning that would be a parameter a future money path could
+        forget to pass, and the failure mode of forgetting is a silent over-limit
+        rather than a loud refusal. The cost, stated plainly: a unit holds the
+        write lock for its whole life including the read-only ones, so a slow read
+        delays every writer behind it. It does *not* stop readers running together
+        - a reserved lock coexists with shared ones, and these connections are in
+        the default rollback-journal mode (nothing sets ``journal_mode``) - so what
+        is removed is two units *disagreeing* about a value one of them is about to
+        write.
+
+        What it does not fix, said here so nobody has to discover it: the lock is
+        held until commit, and the wait before SQLite gives up is the connection's
+        default busy timeout. Two units that contend longer than that raise
+        ``OperationalError`` rather than writing anything inconsistent - a loud
+        failure, which is the direction a financial control may fail in.
+        """
         connection = open_sqlite_connection(self.db_path)
-        connection.execute("BEGIN")
+        connection.execute("BEGIN IMMEDIATE")
         return SqliteUnitOfWork(connection)

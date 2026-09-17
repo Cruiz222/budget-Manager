@@ -36,6 +36,15 @@ the only way it can exist. The deposit check did not become dead code when the
 entry rule landed; it became the second line, and what it catches is exactly the
 accounts the change endpoint exists to rescue.
 
+**The newest refusal was about the payer's address, and there is now one past it:
+an account with no address at all.** ``PayerEmailRefusedError`` is about an address
+a provider will not bill; ``PayerEmailMissingError`` is about there being none, and
+it became reachable over the wire when a phone number became a way to sign in -
+before that, a phone-only account existed but could not obtain a session, so the
+refusal could only be driven one layer down. The two sentences are deliberately not
+interchangeable: one caller has a field to correct and the other has a field to
+fill in, and the test below asserts the remedy is named rather than only the class.
+
 The refusal before that one is about the characters in the key. A supplied key is
 quoted into the reference Paystack is given as its idempotency key, and Paystack
 takes letters, digits and ``- . , =`` and nothing else - so a key holding anything
@@ -56,6 +65,11 @@ import pytest
 
 from tests.conftest import TEST_USER_PASSWORD
 from tests.presentation.api.conftest import ALICE, BOB
+
+#: A number as it is typed, which is the spelling a person signs in with. The
+#: store holds the folded ``234``-prefixed form; ``User`` folds on the way in and
+#: ``find_by_phone`` folds on the way out, so the two are one account.
+TYPED_PHONE = "08012345678"
 
 
 @pytest.fixture
@@ -328,6 +342,49 @@ class TestTheRefusals:
         assert response.status_code == 400, response.text
         assert response.json()["error"] == "PayerEmailRefusedError"
         assert "nobody@localhost" in response.json()["detail"]
+        assert balance_of(wallet_id, headers) == "0.00"
+
+    def test_a_phone_only_account_cannot_deposit_yet_and_is_told_how(
+        self, client, as_phone_user, open_wallet, balance_of
+    ):
+        """**The state phone signup creates, refused legibly, over the wire.**
+
+        ``PayerEmailRefusedError`` above is about an address a provider will not
+        take; this is the case with no address at all, and it is reachable now in a
+        way it was not: a phone-only account can obtain a session, open a wallet,
+        hold a balance and be signed in - it simply cannot be *billed*, because a
+        payment provider is handed the payer's address and there is nothing honest
+        to send. ``PayerEmailMissingError``, not the refusal beside it: one caller
+        has something to correct and the other has a field to fill in, and the two
+        sentences are deliberately not interchangeable.
+
+        **This is the route-level half of a test the application layer has had
+        since step 1**, and it needed this step to exist at all. Before it, a
+        phone-only account could not sign in, so there was no way to make this
+        request with a real token - the refusal was proven one layer down
+        (``tests/application/payments/test_initiate_deposit.py``) and could not be
+        driven through a route.
+
+        The remedy is asserted in the detail rather than checked for presence: the
+        whole point of naming a missing field is that the caller can act on it, and
+        an error class alone would leave a client to guess which of an account's
+        several fields was absent.
+
+        ``balance_of`` is the assertion that nothing happened. A refusal on the way
+        to a provider is worth nothing if a row was written first - and this is the
+        one flow in the system whose failure spends real money, so the "and no
+        money moved" half is not a formality.
+        """
+        headers = as_phone_user(TYPED_PHONE)
+        wallet_id = open_wallet(headers)
+
+        response = client.post(
+            deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers
+        )
+
+        assert response.status_code == 400, response.text
+        assert response.json()["error"] == "PayerEmailMissingError"
+        assert "email" in response.json()["detail"]
         assert balance_of(wallet_id, headers) == "0.00"
 
     @pytest.mark.parametrize(

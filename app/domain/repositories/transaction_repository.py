@@ -1,4 +1,8 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
+
+from app.domain.money.currency import Currency
+from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
 
 class TransactionRepository(ABC):
@@ -75,5 +79,75 @@ class TransactionRepository(ABC):
         which rows wait. Oldest-first asks about the longest-waiting payments
         first, and it means a row cannot be starved by newer ones arriving behind
         it.
+        """
+        pass
+
+    @abstractmethod
+    def outflow_total_between(
+        self,
+        wallet_id,
+        start: datetime,
+        end: datetime,
+        currency: Currency,
+    ) -> Money:
+        """How much value has left this wallet in ``[start, end)``, in ``currency``.
+
+        The read behind the daily outflow cap, and the only method on this port
+        that *aggregates* rather than returning rows. It returns a ``Money``
+        because that is what the rule compares - ``check_outflow`` adds the
+        movement being attempted to this total and refuses if the sum is over the
+        tier's ceiling - and a count of rows or a bare ``Decimal`` would leave the
+        caller to build the ``Money`` itself, which is a currency decision made
+        twice.
+
+        **The filter is one rule with one spelling: a row counts when its money is
+        not in the wallet.** Concretely, ``WITHDRAWAL`` and ``PAYOUT`` rows -
+        the two types that move value across the system's edge, as against
+        ``DEPOSIT`` which brings it in and ``LOCK_FUNDS``/``UNLOCK_FUNDS`` which
+        move it between the wallet's own two balances - and of those, the
+        ``PENDING`` and ``SUCCESSFUL`` ones. The status half is the half worth
+        reading slowly:
+
+        - ``PENDING`` counts, because the debit has already happened: a requested
+          payout has been taken out of the available balance and is being held.
+          A cap that ignored held money would let a burst of in-flight payouts
+          each pass on its own.
+        - ``SUCCESSFUL`` counts, because the money is gone.
+        - ``FAILED`` does not, because the hold was given back. The money never
+          left.
+        - ``REVERSED`` does not, because the bank returned it. The money left and
+          came back, and what a *value* ceiling bounds is value that stayed out.
+
+        That last pair is where this method takes a position rather than
+        reporting one, and the position is worth naming because the safe-looking
+        choice is the other one: counting reversals would refuse less, and there
+        is no rate limit in this system at all, so a day in which everything was
+        reversed can be spent again. The reading is that the daily cap bounds the
+        value that leaves an account *for good*, and that bounding how *often*
+        money may move is a different control - the one the README still owes
+        under rate limiting. If that control is ever built it will need a read of
+        its own, because it will have to count the rows this one deliberately
+        does not.
+
+        **The currency is a parameter, and it is not a filter the caller can get
+        interestingly wrong.** A wallet holds one currency and its ledger is
+        written in that currency by construction, so the value a caller passes is
+        the one it has already loaded off the wallet - the same value, read from
+        the same row, that every movement against that wallet is built with. The
+        column is compared against it all the same, because the alternative is a
+        sum that would silently mix two currencies if a row were ever written
+        wrongly, and ``Money`` cannot refuse that on this side - it can only
+        refuse arithmetic between currencies it can see, and a SQL sum hands back
+        one number with no currency attached.
+
+        **``start`` is inclusive and ``end`` is exclusive**, so a movement stamped
+        exactly at midnight belongs to the day beginning rather than to the one
+        ending, and a day's two bounds partition every moment exactly once. See
+        ``limit_day_bounds`` for where the pair comes from and for the timezone
+        this deliberately does not have.
+
+        A wallet with nothing to count gets ``Money("0.00", currency)`` rather
+        than ``None``: no outflow is a total of zero, not an absent answer, and
+        the one caller adds a movement to it on every path.
         """
         pass

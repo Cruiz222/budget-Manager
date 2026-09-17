@@ -4,6 +4,7 @@ from decimal import Decimal
 import pytest
 
 from app.application.planning.execute_plan_run import ExecutePlanRun
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
@@ -1634,4 +1635,216 @@ class TestNoPayoutWithoutAReceipt:
         assert paid.status is RunStatus.SUCCEEDED
         assert paid.due_at == ANCHOR
         assert len(notifications_of(factory)) == 1
+
+
+# --- the tier ceilings -----------------------------------------------------
+
+
+#: The ceilings an account with no profile is held to.
+#:
+#: Read from the table rather than typed out, and every wallet in this file is
+#: ``ACTOR``'s with no profile stored for it - so ``tier_for(None)`` answers
+#: ``UNVERIFIED`` and *these* are the numbers in force. A test that wrote
+#: ``"50000.00"`` would keep passing after somebody raised the ceiling, which for
+#: a test about a limit is the one failure that matters.
+UNVERIFIED = limits_for(Tier.UNVERIFIED, NGN)
+
+#: One unit over the per-transaction ceiling - the smallest movement that must be
+#: refused, and so the boundary case rather than a round number that happens to
+#: be large. ``test_tier.py`` pins the same edge at the domain level; this is it
+#: arriving at the door a plan run comes through.
+OVER_THE_TRANSACTION_CEILING = str(
+    UNVERIFIED.per_transaction.amount + Decimal("1")
+)
+
+#: How many lines of exactly the per-transaction ceiling it takes to cross the
+#: daily cap on the last one, derived from the two numbers rather than written as
+#: a literal. A suite that hard-coded "five" would go on passing - and asserting
+#: a block that no longer happens - the day somebody raised the daily cap.
+LINES_TO_CROSS_THE_DAILY_CAP = (
+    int(UNVERIFIED.daily_outflow.amount // UNVERIFIED.per_transaction.amount) + 1
+)
+
+#: What one run of the plan in that test costs, and so what its wallet holds.
+CROSSING_RUN_TOTAL = str(
+    UNVERIFIED.per_transaction.amount * LINES_TO_CROSS_THE_DAILY_CAP
+)
+
+
+def crossing_lines() -> tuple[Instruction, ...]:
+    """Lines that each fit and together do not.
+
+    Every line is exactly the per-transaction ceiling, which is the *largest* a
+    line may be - so nothing here is refused on its own, and the refusal can only
+    come from the running total. That is what makes the cumulative half of the
+    rule observable at all: a plan of one oversized line would be blocked by the
+    per-transaction comparison and would say nothing about the day.
+
+    Distinct labels because a plan of five lines all called "salary" reads as a
+    copy-paste accident in a failure message, and the labels are what a person
+    would be shown.
+    """
+    return tuple(
+        payout(str(UNVERIFIED.per_transaction.amount), f"line{n}")
+        for n in range(LINES_TO_CROSS_THE_DAILY_CAP)
+    )
+
+
+class TestTheTierCeilingsBlockARun:
+    """The second door money leaves by, and why it needs a lock of its own.
+
+    ``WalletService._run`` is the chokepoint every command a person types goes
+    through, and a plan run does not touch it: ``_move_the_money`` builds its
+    operations directly, because a scheduled run has no confirmation and no
+    person in it. Without a check of its own a plan would be the one way to move
+    money with no ceiling at all - and the caps would be decorative for exactly
+    the accounts that move the most.
+
+    **A refusal here is a *block* and not a raise, and these tests are about
+    that.** Letting ``TierLimitExceededError`` out of the pre-flight would end
+    the whole scheduler tick on the first plan that met a ceiling, taking every
+    other plan that tick down with it - the failure ``RunBlockReason`` exists to
+    prevent arriving through a new door.
+    ``TestATierBlockedPlanDoesNotStopTheTick`` in ``test_run_due_plans.py`` is
+    the test for that half.
+    """
+
+    def test_a_payout_over_the_transaction_ceiling_blocks_the_run(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        wallet = build_wallet(locked=OVER_THE_TRANSACTION_CEILING)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(payout(OVER_THE_TRANSACTION_CEILING),),
+        )
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.BLOCKED
+        assert run.reason is RunBlockReason.TIER_LIMIT_EXCEEDED
+
+    def test_lines_that_each_fit_together_do_not(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """The daily cap is a total, so it can only refuse an accumulation.
+
+        Each line here is exactly the per-transaction ceiling - the largest a
+        line is allowed to be - so no line can be refused on its own and the
+        refusal can only come from the running total. Without that running total
+        this plan would pay out in full.
+        """
+        wallet = build_wallet(locked=CROSSING_RUN_TOTAL)
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=crossing_lines())
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.reason is RunBlockReason.TIER_LIMIT_EXCEEDED
+
+    def test_a_blocked_run_moves_no_money_and_writes_no_ledger_rows(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Pre-flight runs before anything is attempted, so there are no FAILED rows.
+
+        The distinction against the wallet path is worth stating: a withdrawal
+        refused by a ceiling leaves a FAILED row, because the refusal happens
+        inside an operation that had already claimed a reference. A plan run
+        refused here never got as far as an operation, so the ledger is untouched
+        - and no half-run is left behind either, which is the whole point of
+        judging the run as a whole.
+        """
+        wallet = build_wallet(locked=CROSSING_RUN_TOTAL)
+        plan = build_plan(wallet_id=wallet.wallet_id, instructions=crossing_lines())
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        executor.execute(plan.plan_id, ANCHOR)
+
+        after = wallet_after(factory, wallet.wallet_id)
+        assert after.locked_balance == Money(Decimal(CROSSING_RUN_TOTAL), NGN)
+        assert ledger_of(factory, wallet.wallet_id) == []
+
+    def test_the_ceiling_is_reported_ahead_of_the_balance(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Both are true here, and the ceiling is the one that is named.
+
+        500 locked against a payout over the transaction ceiling: the run is short
+        of money *and* over a limit. The reason reported is the limit, because
+        topping up cannot fix it - an account that funded this plan would meet the
+        same refusal on the next tick. The ceiling is the thing it can act on, so
+        it is the thing it is told.
+        """
+        wallet = build_wallet(locked="500")
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(payout(OVER_THE_TRANSACTION_CEILING),),
+        )
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.reason is RunBlockReason.TIER_LIMIT_EXCEEDED
+
+    def test_a_release_only_plan_is_not_judged_by_the_cap(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """Moving money between the wallet's own balances is not spending it.
+
+        The release below is larger than the whole daily cap, and it runs: nothing
+        leaves the wallet, so there is nothing for a ceiling on *outflow* to
+        measure. The same rule holds on the wallet path - a ``LOCK_FUNDS`` or
+        ``UNLOCK_FUNDS`` movement faces no ceiling there either - which is what
+        makes the two doors agree rather than merely both existing.
+        """
+        amount = str(UNVERIFIED.daily_outflow.amount + Decimal("1"))
+        wallet = build_wallet(available="0", locked=amount)
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release(amount),),
+            ends_on=RELEASE_ENDS_ON,
+        )
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.SUCCEEDED
+        after = wallet_after(factory, wallet.wallet_id)
+        assert after.available_balance == Money(Decimal(amount), NGN)
+        assert after.locked_balance == Money(Decimal("0"), NGN)
+
+    def test_only_the_lines_that_send_value_out_are_counted(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        """A mixed plan is judged on its payouts and not on its releases.
+
+        The release line here is over the per-transaction ceiling, so a version of
+        the check that walked the whole instruction list would block this run -
+        which is exactly the mistake this test exists to catch. It is judged on
+        the payout alone, and the payout fits.
+
+        ``locked`` is the sum of the two lines rather than either one, because the
+        pre-flight that runs *after* this check compares the whole run against the
+        balance: a wallet funded for the payout alone would be blocked one method
+        later for insufficient funds, and the test would be passing for the wrong
+        reason.
+        """
+        over = UNVERIFIED.per_transaction.amount + Decimal("1")
+        wallet = build_wallet(available="0", locked=str(over + Decimal("2000")))
+        plan = build_plan(
+            wallet_id=wallet.wallet_id,
+            instructions=(release(str(over), "unsweep"), payout("2000")),
+            ends_on=RELEASE_ENDS_ON,
+        )
+        executor, factory = build_executor(tmp_path)
+        seed(factory, wallet, plan)
+
+        run = executor.execute(plan.plan_id, ANCHOR)
+
+        assert run.status is RunStatus.SUCCEEDED
 

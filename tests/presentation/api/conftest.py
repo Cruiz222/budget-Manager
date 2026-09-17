@@ -271,9 +271,19 @@ def legacy_account(db_path, password_hasher):
     password and present as "those details did not match an account". That is
     ``argon2_client``'s lesson from the other direction - the fixture, not the
     code, and it looks exactly like the bug it is not.
+
+    ``email`` is positional and both identifiers are otherwise dials, so a test
+    can seed a phone-only account. Seeding one rather than signing one up is the
+    same argument as the address above, one step milder: the phone signup exists
+    now - ``POST /phone-verifications`` and its confirm - so this is no longer the
+    *only* way such a row comes into being, but it is the only one that does not
+    need an SMS channel and a code to be threaded through a test whose subject is
+    something else. That signup is exercised end to end where it belongs.
     """
 
-    def _write(email: str, password: str = TEST_USER_PASSWORD) -> str:
+    def _write(
+        email: str | None, password: str = TEST_USER_PASSWORD, phone: str | None = None
+    ) -> str:
         factory = SqliteUnitOfWorkFactory(db_path)
         now = datetime.now()
         uow = factory.start()
@@ -281,6 +291,7 @@ def legacy_account(db_path, password_hasher):
             user = User(
                 user_id=uuid4(),
                 email=email,
+                phone=phone,
                 google_subject=None,
                 created_at=now,
             )
@@ -319,6 +330,38 @@ def as_existing_user(client):
     def _headers(email: str) -> dict:
         response = client.post(
             "/sessions", json={"email": email, "password": TEST_USER_PASSWORD}
+        )
+        assert response.status_code == 201, response.text
+        return {"Authorization": f"Bearer {response.json()['token']}"}
+
+    return _headers
+
+
+@pytest.fixture
+def as_phone_user(client, legacy_account):
+    """Authorization headers for an account identified by a number.
+
+    ``as_existing_user``'s sibling one identifier over, and it exists rather than
+    being a dial on that one because what differs is the *request*: this signs in
+    with ``phone`` where that signs in with ``email``, and a single fixture with a
+    switch would contain the same branch the endpoint contains - a second
+    implementation of the thing under test, free to disagree with it.
+
+    The account is seeded through ``legacy_account`` rather than registered, and
+    the reason is narrower than that fixture's: creating one over the wire means
+    ``POST /phone-verifications``, which needs an SMS channel and a texted code,
+    and every test that asks for these headers is about something else. The
+    signup itself is exercised end to end in ``test_phone_verifications.py``.
+
+    The number is folded by ``User`` on the way into the store, so passing the
+    typed spelling here and signing in with a different one is a test of the fold
+    rather than a test that happens to work.
+    """
+
+    def _headers(phone: str) -> dict:
+        legacy_account(None, phone=phone)
+        response = client.post(
+            "/sessions", json={"phone": phone, "password": TEST_USER_PASSWORD}
         )
         assert response.status_code == 201, response.text
         return {"Authorization": f"Bearer {response.json()['token']}"}

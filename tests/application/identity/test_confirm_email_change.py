@@ -83,16 +83,26 @@ def confirm(factory):
     return _build
 
 
-def seed_account(db_path, password_hasher, email, password=PASSWORD) -> User:
+def seed_account(db_path, password_hasher, email, password=PASSWORD, phone=None) -> User:
     """Write an account straight into the store, bypassing ``SignUp`` entirely.
 
     The only way an account this system would refuse can exist, which the rescue
     tests need: ``SignUp`` refuses an address with no real domain now.
+
+    ``email`` and ``phone`` are both dials, and passing ``email=None`` with a
+    ``phone`` is the phone-only account the two-identifier rule permits - the one
+    ``User`` refuses to build with neither.
     """
     factory = SqliteUnitOfWorkFactory(db_path)
     uow = factory.start()
     try:
-        user = User(user_id=uuid4(), email=email, google_subject=None, created_at=NOW)
+        user = User(
+            user_id=uuid4(),
+            email=email,
+            phone=phone,
+            google_subject=None,
+            created_at=NOW,
+        )
         uow.users.save(user)
         uow.password_credentials.save(
             PasswordCredential(

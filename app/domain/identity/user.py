@@ -7,7 +7,9 @@ from .exception import (
     InvalidUserEmailError,
     InvalidUserGoogleSubjectError,
     InvalidUserIDError,
+    InvalidUserIdentifierError,
 )
+from .phoneNumber import checked_phone
 
 
 def fold_email(email: str) -> str:
@@ -83,6 +85,24 @@ class User:
     survives all three is the one below, and it is the only part the domain has
     an opinion about. Credentials arrive with the adapter that can verify them.
 
+    **An account is identified by an email address, a phone number, or both - and
+    at least one.** The two are peers: either can be the identifier a person signs
+    up with and logs in with, either carries a ``UNIQUE`` constraint, and neither
+    is privileged over the other. What is *not* permitted is neither, because an
+    account holding no identifier cannot be reached by any flow this system has -
+    it cannot be logged into, mailed, texted or found, so its owner could never
+    prove they own it. ``InvalidUserIdentifierError`` refuses that pair.
+
+    The optionality is what makes the two-step phone signup possible: the number
+    is verified *before* an account claims it, so the ``UNIQUE`` slot is never held
+    by an account nobody has proved they own. See ``phoneNumber`` for the fold
+    that gives one number one spelling, and ``PhoneVerification`` for the proof.
+
+    ``google_subject`` is deliberately **not** counted as an identifier for that
+    rule. It is an identity Google issued and a login Google performs, so an
+    account holding only a subject is one this system could never send a
+    credential to - which is the state the pair rule exists to refuse.
+
     ``email`` is **folded to lowercase on construction**, and that is a rule
     rather than tidiness. ``Chinedu@Example.com`` and ``chinedu@example.com``
     are the same address - every mail system on earth treats them so, since the
@@ -96,7 +116,10 @@ class User:
     ``Wallet`` and ``SavingsPlan`` rather than a frozen one. Nothing else mutates
     it, and the one address move in the system is ``change_email`` below - a method
     with its checks alongside, rather than free assignment, which is what this
-    paragraph asked for before there was a method to put them in.
+    paragraph asked for before there was a method to put them in. Folding is also
+    why ``email`` accepts ``None`` on the way in: a phone-only account has no
+    address to fold, so the rule above is applied when there *is* one rather than
+    assumed.
 
     What is deliberately *not* here: an ``owns(wallet)`` method. Ownership is
     answered by the store - a scoped read either returns the wallet or reports it
@@ -105,7 +128,8 @@ class User:
     """
 
     user_id: uuid.UUID
-    email: str
+    email: str | None
+    phone: str | None
     google_subject: str | None
     created_at: datetime
 
@@ -113,7 +137,31 @@ class User:
         if not isinstance(self.user_id, uuid.UUID):
             raise InvalidUserIDError("invalid user id")
 
-        self.email = checked_email(self.email)
+        # Both identifiers are checked only when present, and that conditional is
+        # the whole of what "an email address is optional" means at this layer.
+        # ``checked_email`` itself is unchanged - the shape rule did not move,
+        # only whether it is reached.
+        if self.email is not None:
+            self.email = checked_email(self.email)
+
+        # An empty string is refused rather than normalised to ``None``, which is
+        # the opposite of what ``Profile`` does with a blank optional field, and
+        # the difference is what the value *is*. ``Profile.phone`` is a form field
+        # a person may submit empty; this is an identifier, and ``checked_email``
+        # refuses ``""`` for an address for exactly this reason. A caller that
+        # means "no phone" says ``None``.
+        if self.phone is not None:
+            self.phone = checked_phone(self.phone)
+
+        # The pair rule, and it runs *after* both members are normalised rather
+        # than before. A number that folded to nothing, or an address refused
+        # above, must not be able to satisfy "at least one identifier" on its way
+        # to being an error somewhere else - the caller would then be told about
+        # a missing identifier when what is wrong is the one they supplied.
+        if self.email is None and self.phone is None:
+            raise InvalidUserIdentifierError(
+                "a user needs an email address or a phone number"
+            )
 
         if self.google_subject is not None:
             if not isinstance(self.google_subject, str):

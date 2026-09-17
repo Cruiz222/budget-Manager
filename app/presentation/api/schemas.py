@@ -228,8 +228,38 @@ class PlanRunOut(BaseModel):
 
 
 class UserOut(BaseModel):
+    """Who the caller is, as the API reports it.
+
+    **``email`` is optional, and this is the one response where that is a fact
+    worth stating rather than a defensive annotation.** An account signed up with
+    a phone number alone exists, is signed in, and has no address to report - so
+    ``str`` here would turn a perfectly ordinary account into a validation error
+    on its own profile endpoint. ``None`` means "this account holds no address",
+    which is a state the system permits; it is not a failure to load one.
+
+    **``phone`` arrives with the flow that produces one, and it is the same
+    optionality for the same reason one identifier over.** An account signed up
+    with an address alone holds no number, and every account that existed before
+    the phone signup shipped is one of those - so ``None`` is the ordinary case
+    here rather than the exception, and it means "this account was never proved
+    against a handset".
+
+    The two are independent, and this model does **not** enforce that one of them
+    is present. ``User`` does, and it is the right place for it: a response model
+    that also refused would be a second copy of an invariant free to disagree with
+    the aggregate, and a 422 from here would name pydantic rather than the rule.
+
+    A null phone and a null email are also *not* the same kind of absence, which is
+    worth knowing before rendering them alike: a missing address is a missing
+    capability (no deposits until one is set), whereas a missing number on an
+    account created with an address means nothing was ever proved about a handset.
+    This is ``User.phone`` and not ``Profile.phone``, which is free-form KYC data
+    and lives in ``ProfileOut``.
+    """
+
     user_id: UUID
-    email: str
+    email: str | None = None
+    phone: str | None = None
     created_at: datetime
 
 
@@ -531,11 +561,13 @@ class SignUpIn(BaseModel):
     hide it on the day it meant something. The claim is pinned by
     ``TestThePasswordIsNotInTheRepr``.
 
-    A separate class from ``LogInIn`` below despite being identical today, because
-    they are different requests that happen to agree for now. Sign-up will grow
-    fields - a display name, a terms flag, an invite code - and the moment it
-    does, a shared ``CredentialsIn`` would have the login endpoint documenting
-    parameters it ignores.
+    A separate class from ``LogInIn`` below, and the two have **stopped being
+    identical**: a login now names its account by an address *or* a number, while
+    a registration mints an address and has no such choice. The original reason
+    for the split still holds and is the reason to keep it - sign-up will grow
+    fields of its own (a display name, a terms flag, an invite code) - but the
+    classes are no longer two spellings of one shape, and this paragraph said
+    "identical today" until a phone number made it false.
     """
 
     email: str = Field(examples=["ada@example.com"])
@@ -548,10 +580,58 @@ class SignUpIn(BaseModel):
 
 
 class LogInIn(BaseModel):
-    """Credentials presented to become somebody, rather than to create them."""
+    """Which account to become, and the secret that proves it is the caller's.
 
-    email: str = Field(examples=["ada@example.com"])
+    **The identifier arrives as one of two named fields rather than as one
+    string**, and that shape is the whole of the design here. A single
+    ``identifier`` field would have to be classified on the way in, and the only
+    test available is "does it contain an ``@``" - a guess about a string rather
+    than a fact about the request. An address is not obliged to contain one, so
+    the guess is wrong for accounts that exist; and a caller who knows perfectly
+    well which of the two they are holding would be sending that knowledge in a
+    form this layer has to reconstruct. Two fields make it stated instead:
+    ``phone`` present means the number, ``email`` present means the address.
+
+    **Exactly one, and the refusal is a 422.** A body naming both has not said
+    which account to become, and a body naming neither names no account at all -
+    both are incoherent before any lookup happens, so both are refused in
+    pydantic's vocabulary at the same kind of moment ``CreatePlanIn``'s
+    ``ends_on``/``term`` pair is refused. It is the *same* sentence in both
+    directions rather than two, because "which one did you mean?" is the question
+    a caller is left with either way.
+
+    **Neither field carries a shape rule**, which is ``SignUpIn``'s decision one
+    identifier over: ``fold_email``, ``fold_phone`` and the shape checks belong to
+    the domain, and a rule here would answer a malformed value with a 422 in this
+    layer's vocabulary instead of a 400 in the domain's - or, worse on this path,
+    with something *different* for a malformed identifier than for an unknown one,
+    which is a smaller version of the oracle ``InvalidCredentialsError`` exists to
+    close.
+    """
+
+    email: str | None = Field(default=None, examples=["ada@example.com"])
+    phone: str | None = Field(
+        default=None,
+        examples=["08012345678"],
+        description="An account's number, in any spelling. It is folded before "
+        "use, so a national trunk prefix, a country code and a leading '+' all "
+        "name the same account.",
+    )
     password: str = Field(repr=False, examples=["a long phrase you will remember"])
+
+    @model_validator(mode="after")
+    def _exactly_one_identifier(self):
+        """One of ``email``/``phone``, and not both and not neither.
+
+        **One message for both directions**, because they are one mistake: a body
+        that does not name exactly one account. Unlike the 401 this endpoint also
+        returns, this refusal is not vague for a reason - nothing has been looked
+        up, so it can say precisely what is wrong with the request without saying
+        anything about which accounts exist.
+        """
+        if (self.email is None) == (self.phone is None):
+            raise ValueError("give email or phone, not both")
+        return self
 
 
 class EmailChangeIn(BaseModel):
@@ -724,6 +804,106 @@ class PasswordResetConfirmedOut(BaseModel):
     notice_error: str | None = None
 
 
+class PhoneVerificationRequestIn(BaseModel):
+    """The number a verification is being asked for, and nothing else.
+
+    **One field, like ``PasswordResetRequestIn``, and for a sharper version of its
+    reason**: that flow asks for no credential because the caller has lost theirs;
+    this one asks for none because the caller may not have an account at all. It is
+    the second of only two request bodies in this API that carry no credential and
+    no session.
+
+    ``phone`` carries no shape rule here, matching ``SignUpIn.email`` and for the
+    same division of labour: ``checked_phone`` is the aggregate's, and the folded
+    spelling it produces is what the row and the ``UNIQUE`` slot agree on. A rule
+    copied into this model would answer a typo with a 422 in pydantic's vocabulary
+    rather than a 400 in the domain's - and, more than cosmetic, two copies of a
+    fold can disagree about what a number *is*, which is the one thing in this flow
+    that must not.
+
+    There is no ``repr=False``: a phone number is not a secret, it is the identifier
+    being registered, and the caller typed it a moment ago. The value that would
+    need redacting - the code that comes back - is not in any request body at all,
+    which is worth noticing: it travels one way, out.
+    """
+
+    phone: str = Field(examples=["08012345678"])
+
+
+class PhoneVerificationAcceptedOut(BaseModel):
+    """That a code was sent, to which number, and when it stops working.
+
+    **Unlike ``PasswordResetAcceptedOut``, this body can honestly say things**, and
+    the difference is worth stating because the two look like the same response
+    shape. That one is byte-identical for a hit and a miss because the endpoint
+    *asks the store a question* - "does this address name an account" - and the
+    answer is what an enumeration oracle would read. This endpoint asks nothing:
+    the number is an address being dialled rather than a key being looked up, so
+    there is no hit and no miss, and every request that produces this body produces
+    the same one for the same number. The fields are therefore not a leak but the
+    only useful thing the server can say - which number it is about to text, and
+    how long the person has to answer.
+
+    **The number reported is the folded one**, which is the value actually texted
+    and the value the ``UNIQUE`` slot will hold. Sending back the string that was
+    typed would be more comforting and less true: it is not what the provider was
+    handed, and somebody who typed ``+234 801 234 5678`` and later sees
+    ``2348012345678`` in this response has learned something about their own account
+    rather than been confused by it. It is also the one place a client can check
+    that its own normalisation agrees with the server's before a code is burned.
+
+    ``expires_at`` is an absolute moment rather than a duration, matching
+    ``SessionOut`` and ``FundOut``: a client that knows when the code dies can ask
+    for another before the person is staring at a failure.
+
+    ``status`` is a field rather than a bare 202 for ``DepositIntentOut``'s reason:
+    a client that reads a status code alone will eventually show the wrong thing,
+    and the cost of the extra field is one word. The word is deliberately not
+    ``confirmed`` or ``verified`` - nothing has been verified yet, and a client that
+    rendered this as success would be telling the person their number is theirs
+    before they have answered the text.
+    """
+
+    phone: str
+    expires_at: datetime
+    status: str = Field(default="accepted", examples=["accepted"])
+
+
+class ConfirmPhoneSignUpIn(BaseModel):
+    """The texted code and the password to create the account with, in one body.
+
+    **Two fields, and the absence of a third is the design** rather than an
+    omission to be filled in later. ``ConfirmPasswordResetIn`` has the same pair
+    for the same reason - the permission is stored on the row and the secret never
+    is, so the password has to arrive with the answer - but this flow goes one
+    further: **it does not take the phone number at all.** The claimed row carries
+    it, the account is created holding the number the code was texted to, and a
+    number in this body would be a second spelling of the same identifier free to
+    disagree with the one the code actually proves. See
+    ``PhoneVerificationRepository.claim_by_token_hash`` for what scoping the claim
+    by a caller-supplied number would break.
+
+    ``code`` is ``repr=False`` for ``ConfirmEmailChangeIn.token``'s reason:
+    it is a credential, and a request caught in an unexpected error must not
+    write it into whatever logs the exception. Its example says what it is
+    rather than showing a plausible one.
+
+    ``password`` carries no length rule here, which is ``ConfirmPasswordResetIn``'s
+    decision and its argument, unchanged: the policy lives in ``PlainPassword``, a
+    copy here would answer in the wrong vocabulary, and the aggregate's refusal
+    happens *before* the claim - so the code is not spent and can be presented
+    again with a longer password.
+    """
+
+    code: str = Field(repr=False, examples=["the code from the text message"])
+    password: str = Field(
+        repr=False,
+        examples=["a long phrase you will remember"],
+        description="At least 8 characters. Never logged, never stored in the "
+        "clear - the server keeps an argon2id hash and nothing else.",
+    )
+
+
 # --- moving money -----------------------------------------------------------
 
 
@@ -880,3 +1060,163 @@ class DepositIn(BaseModel):
             "payment provider, which refuses anything else."
         ),
     )
+
+
+# --- who the account holder is ----------------------------------------------
+# The one section here whose models are grouped by *feature* rather than by
+# direction, and the departure is worth a word. Everything above is either a
+# response or a request, and a reader looking for `MovementIn` knows to skip the
+# first third. These two are a pair - the body a person fills in and the same
+# body read back with the tier it earned them - and they are three lines each,
+# so splitting them across two headings a hundred and fifty lines apart would
+# cost a reader more than the tidier file is worth. The precedent is
+# `PasswordResetAcceptedOut` and `PasswordResetConfirmedOut` above, which are
+# already interleaved with the requests they answer.
+
+
+class TierLimitOut(BaseModel):
+    """One row of the limits table: what a tier may move, in one currency.
+
+    **Three amounts, each a ``MoneyOut``, and the repeated currency is accepted
+    rather than factored out.** A flatter shape - a currency string and three
+    plain decimal strings - would read better and is exactly what the translator
+    must not build: formatting an amount is ``money_out``'s job and the only
+    place it happens, so a model that carried three bare strings would need
+    three f-strings in ``translate`` and would be the second definition of what
+    an amount looks like on this wire. The redundancy is deliberate for the same
+    reason ``instruction_to_dict`` records a currency beside an amount it could
+    have inherited: a reader of one ``MoneyOut`` should not have to look
+    elsewhere to know what it is.
+
+    ``currency`` is on the row *as well as* inside each amount, which makes it
+    strictly derivable - and it is here because the row is the thing a client
+    indexes by. A client rendering a withdrawal form for an NGN wallet should be
+    able to find the NGN row without inspecting a nested object, and the field
+    that says which row this is should not be three fields deep.
+
+    **Each amount is nullable, and ``null`` means "no ceiling" rather than
+    "unknown".** ``TierLimits`` holds ``Money | None`` per field deliberately -
+    it is how a tier says a ceiling does not apply - and this is the honest
+    mapping of that. Today no row has one: ``test_tier.py`` asserts the whole
+    table is filled in, so a client will never see a null unless somebody
+    removes a ceiling on purpose, which is exactly when it should be told. A
+    schema that required three amounts would turn "this limit was lifted" into a
+    500 from the translator, which is the one thing a lifted limit must not be.
+    """
+
+    currency: str = Field(examples=["NGN"])
+    per_transaction: MoneyOut | None = None
+    daily_outflow: MoneyOut | None = None
+    max_balance: MoneyOut | None = None
+
+
+class ProfileFieldsOut(BaseModel):
+    """The identity fields themselves, as one object that may or may not exist.
+
+    **Split out from ``ProfileOut`` so that "this account has not filled a profile
+    in" is a shape rather than a value.** The alternative - flattening the fields
+    onto ``ProfileOut`` and making ``display_name`` nullable - would spell "no
+    profile" as ``"display_name": null``, and a client would have to know that a
+    null name means a whole absent profile rather than a missing name. There is
+    no profile without a display name, so the flattened version would be
+    unambiguous, but only to a reader who already knew the rule.
+
+    The house pattern is the nested one and it is used everywhere a thing may be
+    absent - ``DestinationOut | None`` on a transaction and on a confirmation,
+    ``PlanOut.fund_id``. This is the same arrangement with the nullable object
+    being the whole of the interesting half.
+    """
+
+    display_name: str = Field(examples=["Ada"])
+    legal_first_name: str | None = None
+    legal_last_name: str | None = None
+    #: A calendar date, not a moment - see ``Profile`` for why this field inverts
+    #: the rule every other timestamp in this system follows.
+    date_of_birth: date | None = Field(default=None, examples=["1990-05-17"])
+    phone: str | None = None
+    country: str | None = Field(default=None, examples=["NG"])
+    address_line: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProfileOut(BaseModel):
+    """The account holder's standing: their details, their tier, their ceilings.
+
+    **One endpoint answers all three questions, and that is the design.** A client
+    rendering a profile form needs to know what is still missing, a client
+    rendering a withdrawal form needs to know the ceiling, and a person who has
+    just filled their name in is the one person guaranteed to be interested in
+    whether it changed anything. Two endpoints would mean two round trips for one
+    screen, and the second would be a second place the tier is derived.
+
+    **``limits`` is every currency, and not the wallets the account holds.** That
+    looks like an over-share and is the opposite: the limits table is keyed by
+    ``(tier, currency)``, it is the same table for everybody at a tier, and there
+    is nothing personal in it. Scoping it to the account's own wallets would need
+    a way to list wallets - which this API deliberately does not have, since a
+    wallet is reachable only by its own id - and it would make this response
+    depend on a read that has nothing to do with a profile. A client showing a
+    form for an NGN wallet picks the NGN row.
+
+    ``is_complete`` is sent beside ``tier`` even though it is derivable from it
+    today, because the two answer different questions and the day they diverge is
+    the day a third tier arrives. A form asks *is this finished*; a limit asks
+    *what am I*. Sending both means a client that wanted the first is not
+    silently reading the second.
+
+    **``profile`` is ``None`` for an account that has never filled the form in,
+    and that is a 200 rather than a 404.** Every account that existed before this
+    feature is in that state, and so is every account whose holder has not got
+    round to it; answering 404 would make the ordinary case look like a bug and
+    would be indistinguishable, to a client, from the route not existing. What
+    such an account gets instead is an empty form to fill in and the unverified
+    ceilings already visible - which is more useful than either.
+    """
+
+    user_id: UUID
+    profile: ProfileFieldsOut | None = None
+    #: ``unverified`` or ``identified``. Derived from the profile on every read
+    #: and never stored - see ``Tier``.
+    tier: str = Field(examples=["unverified"])
+    is_complete: bool
+    limits: list[TierLimitOut]
+
+
+class ProfileIn(BaseModel):
+    """The whole profile, sent to replace the whole profile.
+
+    **Every field is present because this is a ``PUT`` and not a patch**, which
+    is ``Profile.revise``'s decision read from the wire end. A partial body would
+    need a way to say "leave this alone", and JSON has exactly two candidates -
+    an absent key and ``null`` - so "clear my phone number" and "do not touch my
+    phone number" would be the same request. Sending everything makes both
+    expressible: an explicit ``null`` clears, and a value sets.
+
+    **No field carries a validation rule here, deliberately.** ``MAX_TEXT_LENGTH``,
+    the two-letter country shape and the refusal of a blank display name are all
+    ``Profile.__post_init__``'s, and a copy in this model would answer a bad value
+    with a 422 in pydantic's vocabulary instead of a 400 naming the field in the
+    domain's - the same split ``SignUpIn.password`` documents at length.
+
+    ``date_of_birth`` is the exception to that and not a contradiction of it: a
+    *type* is a transport concern, JSON has no date, and something has to read
+    ``"1990-05-17"``. Pydantic does it, so the aggregate is always handed a real
+    ``date`` from this direction and its ``datetime`` refusal is a backstop for
+    the CLI rather than a branch HTTP can reach. What the aggregate still owns is
+    everything about whether the date is *plausible*, which no shape check can
+    answer.
+    """
+
+    display_name: str = Field(examples=["Ada"])
+    legal_first_name: str | None = None
+    legal_last_name: str | None = None
+    date_of_birth: date | None = Field(default=None, examples=["1990-05-17"])
+    phone: str | None = Field(default=None, examples=["+2348000000000"])
+    country: str | None = Field(
+        default=None,
+        examples=["NG"],
+        description="A two-letter country code. Uppercased if lowercased.",
+    )
+    address_line: str | None = None
+

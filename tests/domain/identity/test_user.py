@@ -8,6 +8,8 @@ from app.domain.identity.exception import (
     InvalidUserEmailError,
     InvalidUserGoogleSubjectError,
     InvalidUserIDError,
+    InvalidUserIdentifierError,
+    InvalidUserPhoneError,
 )
 from app.domain.identity.user import User, fold_email
 
@@ -21,10 +23,15 @@ def build(**overrides) -> User:
     the constructor's own refusals, and a helper that came from the shared
     fixture set would make these tests depend on a file that also carries the
     database fixtures. This file needs nothing but the aggregate.
+
+    ``phone`` is ``None`` here rather than a number, mirroring the fixture: these
+    tests are about the email shape rule and the other field rules, and a test
+    about the number passes ``phone=`` explicitly.
     """
     fields = {
         "user_id": uuid4(),
         "email": "chinedu@example.com",
+        "phone": None,
         "google_subject": None,
         "created_at": MOMENT,
     }
@@ -124,8 +131,15 @@ class TestWhatCannotBeBuilt:
         with pytest.raises(InvalidUserIDError):
             build(user_id=user_id)
 
-    @pytest.mark.parametrize("email", [None, 42, b"chinedu@example.com", ["a@b"]])
+    @pytest.mark.parametrize("email", [42, b"chinedu@example.com", ["a@b"]])
     def test_a_non_string_email_is_rejected(self, email):
+        """**``None`` is deliberately absent from this list**, and that is a change
+        rather than an omission: it used to be here, because every account had to
+        hold an address. An address is optional now, so ``None`` means "this
+        account has none" and is answered by ``InvalidUserIdentifierError`` only
+        when there is no number either. A malformed address is still refused, and
+        a *blank* one still is too - see the next test.
+        """
         with pytest.raises(InvalidUserEmailError):
             build(email=email)
 
@@ -250,3 +264,114 @@ class TestWhatCannotBeBuilt:
         assert classes, "expected the identity package to define exceptions"
         for cls in classes:
             assert issubclass(cls, MoneyError), f"{cls.__name__} escapes the root"
+
+
+class TestTheTwoIdentifiers:
+    """An account is identified by an address, a number, or both - and at least one.
+
+    The rule is one sentence and this class is the whole of what it means at this
+    layer. It is worth a class of its own because it is the *only* invariant on
+    ``User`` that is about the pair rather than about either member, and because
+    the failure it prevents is not a malformed row - it is a row that is perfectly
+    well formed and that nothing in the system can ever reach.
+    """
+
+    def test_a_phone_only_account_is_the_shape_the_rule_permits(self):
+        """The state the change exists for: a working account with no address.
+
+        Asserted rather than assumed, because for the whole life of this class
+        until now it was *unbuildable* - every repository in the codebase
+        constructs a ``User`` from its row, so a shape the constructor refuses is a
+        shape no store can read back.
+        """
+        user = build(email=None, phone="08012345678")
+
+        assert user.email is None
+        assert user.phone == "2348012345678"
+
+    def test_an_account_may_hold_both(self):
+        user = build(email="chinedu@example.com", phone="+2348012345678")
+
+        assert user.email == "chinedu@example.com"
+        assert user.phone == "2348012345678"
+
+    @pytest.mark.parametrize(
+        "written",
+        ("08012345678", "+2348012345678", "2348012345678", "0801 234 5678"),
+    )
+    def test_a_number_is_folded_like_an_address_is(self, written):
+        """Four spellings, one stored value - ``fold_email``'s rule and its reason.
+
+        The ``UNIQUE`` constraint on the column only bounds what it looks like it
+        bounds if one number has one spelling by the time it reaches the store, and
+        this is where that is guaranteed: at construction, not in whichever adapter
+        remembers.
+        """
+        assert build(phone=written).phone == "2348012345678"
+
+    def test_a_malformed_number_is_refused_as_a_number(self):
+        """``InvalidUserPhoneError``, not the pair error.
+
+        The ordering claim: a number that cannot be a number must not be reported
+        as a *missing* identifier, or a person who typed something wrong is told
+        they supplied nothing.
+        """
+        with pytest.raises(InvalidUserPhoneError):
+            build(email=None, phone="not-a-number")
+
+    @pytest.mark.parametrize("phone", ["", "   ", "()"])
+    def test_a_blank_number_is_not_the_same_as_no_number(self, phone):
+        """``""`` is refused; ``None`` is how a caller says "no number".
+
+        The opposite of what ``Profile`` does with a blank optional field, and the
+        difference is what the value *is*: a profile field is a form entry a person
+        may submit empty, and an identifier is a value the store is asked to key
+        on. An empty string in a ``UNIQUE`` column would also collide with every
+        other one, so the second phone-less account would fail against the first.
+        """
+        with pytest.raises(InvalidUserPhoneError):
+            build(email=None, phone=phone)
+
+    @pytest.mark.parametrize("email", ["", "   "])
+    def test_a_blank_address_is_still_not_the_same_as_no_address(self, email):
+        """``checked_email`` was not relaxed when the field became optional.
+
+        The conditional in ``__post_init__`` decides *whether* that rule is reached,
+        not what it says - which is the distinction between making a field optional
+        and weakening a check. A blank address is still refused as blank.
+        """
+        with pytest.raises(InvalidUserEmailError):
+            build(email=email)
+
+    def test_an_account_with_neither_identifier_is_refused(self):
+        """The pair rule, and the reason it is an invariant rather than tidiness.
+
+        An account holding neither cannot be logged into, cannot be mailed, cannot
+        be texted, and cannot be found by any query this system has - so its owner
+        could never prove they own it, and nobody could ever discover it was there.
+        """
+        with pytest.raises(InvalidUserIdentifierError):
+            build(email=None, phone=None)
+
+    def test_a_google_subject_alone_does_not_satisfy_it(self):
+        """A subject is an identity Google issued and a login Google performs.
+
+        So an account holding only one is an account this system could never
+        deliver a credential to, which is the state the pair rule exists to
+        refuse. The subject is therefore not counted as an identifier - which is a
+        decision, and this is the test that keeps it from silently becoming one.
+        """
+        with pytest.raises(InvalidUserIdentifierError):
+            build(email=None, phone=None, google_subject="google-subject-123")
+
+    def test_the_pair_rule_runs_after_both_members_are_checked(self):
+        """So a bad *supplied* value is never reported as a missing one.
+
+        ``checked_phone`` raises first, and what the caller learns is what is wrong
+        with what they typed. If the pair rule ran before the two shape rules, a
+        number that folded to nothing would satisfy "at least one identifier" on
+        its way to being refused somewhere else entirely - or worse, a value that
+        is not a number at all would count as one.
+        """
+        with pytest.raises(InvalidUserPhoneError):
+            build(email=None, phone="()")

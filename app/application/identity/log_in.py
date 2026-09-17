@@ -6,9 +6,22 @@ from datetime import datetime
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.domain.identity.exception import InvalidCredentialsError
 from app.domain.identity.password import PlainPassword
-from app.domain.identity.password_hasher import PasswordHasher
+from app.domain.identity.password_hasher import DUMMY_HASH, PasswordHasher
 from app.domain.identity.session import Session
 from app.domain.identity.user import User
+
+#: The one sentence every refusal on this path uses, kept in one place rather than
+#: written out at each branch.
+#:
+#: **A constant because the property is about the words themselves.** "An unknown
+#: identifier and a wrong password are indistinguishable" - decision 55 - is true
+#: only for as long as the two answers match exactly, and a rule enforced by
+#: repetition is one edit away from being false: the third branch grows a
+#: clarifying clause, no test that reads a single message notices, and the oracle
+#: is back. There are four paths to it below - two entry points, each able to find
+#: no account or the wrong password - and a fifth is the kind of change somebody
+#: makes while adding a feature.
+_REFUSAL = "those details did not match an account"
 
 
 @dataclass(frozen=True)
@@ -40,7 +53,7 @@ class LoggedIn:
 
 
 class LogIn:
-    """Exchange an address and a password for a session and its token.
+    """Exchange an identifier and a password for a session and its token.
 
     **This is the last moment the password exists in plaintext anywhere in the
     system.** It arrives as a string, is wrapped so the policy can judge it, is
@@ -48,23 +61,46 @@ class LogIn:
     What leaves is a token, which is not a password and cannot be turned into
     one.
 
-    **It answers one refusal for two situations.** An address with no account and
-    an address whose password is wrong both raise ``InvalidCredentialsError``
+    **An identifier is an address or a number, and which one it is is stated
+    rather than guessed.** The two have separate entry points - ``execute`` and
+    ``execute_for_phone`` - and neither sniffs its argument for an ``@``. A guess
+    is wrong in both directions: an address is not obliged to contain one, so the
+    guess would refuse an account that exists, and on the day a number arrived
+    with an ``@`` in it the question "which kind of identifier is this" would have
+    become a question about the *shape of a string* instead of about what the
+    caller holds. ``POST /sessions`` says the kind in its body and the CLI says it
+    in the command name; here it is the method name, and a caller cannot reach the
+    wrong lookup without having written down which one it wanted.
+
+    **It answers one refusal for four situations.** An identifier with no account
+    and an identifier whose password is wrong both raise ``InvalidCredentialsError``
     with the same words - decision 55, a foreign wallet reporting as a missing
     one, applied to the thing that hands out identities. Distinguishing them
     would let anyone with a list of addresses learn which ones are registered
     without ever guessing a password, and there is nothing a legitimate client
     would do differently with the two answers, since both mean "check what you
-    typed".
+    typed". **The cross-identifier case is one of those situations and not a
+    fifth**: an address presented for an account whose identifier is a number is
+    simply an identifier with no account, and it gets that sentence. A distinct
+    answer there would be worse than a leak about one account - it would announce
+    that the value is *half* registered, which is a fact about the system rather
+    than about the guess.
 
-    **That protection is on the words, not on the clock, and the gap is real.**
-    An unknown address returns without hashing anything, so it answers in
-    microseconds where a wrong password takes tens of milliseconds - and the
-    difference is measurable from outside. The fix is to verify against a dummy
-    hash when no credential is found, four lines and a constant, and it belongs
-    in 2c with rate limiting: that addresses the same threat directly, and it
-    also covers the sign-up path, which this cannot. Stated here rather than
-    discovered in an incident.
+    **That protection is on the words, and since this step it is on the clock as
+    well.** For most of this system's life an unknown address returned without
+    hashing anything, so it answered in microseconds where a wrong password took
+    tens of milliseconds - and the difference was measurable from outside. That
+    gap was named here as owed to 2c, and it is closed in ``_settle`` below rather
+    than left owed, because **this step is what makes it cheap to measure.** A
+    phone number is a small, structured, enumerable space: ten digits behind a
+    known prefix, one handset each, and no free-text breadth to hide in - so the
+    walk that was impractical against a list of mailboxes is a loop against a
+    number range. What is *not* claimed is that the oracle is closed: the store
+    lookup still differs by microseconds between the branches, and rate limiting
+    remains the direct answer to enumeration, which is also the only thing that
+    covers the sign-up path. The claim is the narrow one - an unknown identifier
+    and a wrong password now cost the same order of time instead of two orders
+    apart.
     """
 
     def __init__(
@@ -73,8 +109,8 @@ class LogIn:
         self._unit_of_work_factory = unit_of_work_factory
         self._password_hasher = password_hasher
 
-    def execute(self, email: str, password: str, now: datetime) -> LoggedIn:
-        """Return the account these credentials belong to, and a fresh session.
+    def execute(self, email: str | None, password: str, now: datetime) -> LoggedIn:
+        """Return the account this address and password belong to, and a session.
 
         Raises ``InvalidCredentialsError`` if they do not match an account, and
         whatever ``PlainPassword`` raises for a password that could not be one -
@@ -85,6 +121,17 @@ class LogIn:
         it. Reporting "those details did not match" for a password that could
         never have matched would send somebody to reset a password they had typed
         correctly.
+
+        **``None`` is accepted, and it is the honest type for this argument.** An
+        absent address names no account - which is what ``find_by_email`` answers
+        for ``None``, and what the shared refusal is for - so a caller that holds
+        a number instead and takes the other branch is not one line away from a
+        ``TypeError`` reported as a 500. This is the same guard, one layer down
+        and for the same reason: the body of ``POST /sessions`` carries exactly
+        one identifier, and a route built as "if it named a number, do that, else
+        do this" reaches here with ``None`` on the path where its own invariant
+        says it cannot. The invariant is enforced where it is stated; what
+        arrives here if it is ever wrong is a refusal rather than a crash.
 
         **A new session every time, and the old ones are left alone.** Logging in
         twice from two terminals produces two rows, and this is deliberate rather
@@ -98,29 +145,100 @@ class LogIn:
         """
         uow = self._unit_of_work_factory.start()
         try:
-            user = uow.users.find_by_email(email)
-            if user is None:
-                raise InvalidCredentialsError("those details did not match an account")
-
-            credential = uow.password_credentials.find_by_user_id(user.user_id)
-            if credential is None:
-                # An account with no password. Nothing creates one today, and
-                # ``PasswordCredentialRepository`` explains why the shape exists:
-                # Phase 2c's Google sign-in makes accounts that genuinely have no
-                # password. Until then this branch is unreachable, and it is here
-                # rather than absent because the alternative when it *does* become
-                # reachable is not a refusal - it is ``None`` reaching the hasher
-                # and raising a ``TypeError`` that reports as a 500.
-                raise InvalidCredentialsError("those details did not match an account")
-
-            if not self._password_hasher.verify(
-                PlainPassword(password), credential.password_hash
-            ):
-                raise InvalidCredentialsError("those details did not match an account")
-
-            session, token = Session.issue(user.user_id, now)
-            uow.sessions.save(session)
-            uow.commit()
-            return LoggedIn(user=user, session=session, token=token)
+            return self._settle(uow, uow.users.find_by_email(email), password, now)
         finally:
             uow.rollback()
+
+    def execute_for_phone(self, phone: str, password: str, now: datetime) -> LoggedIn:
+        """Return the account this number and password belong to, and a session.
+
+        ``execute``'s contract one identifier over, and the same refusal: this
+        raises ``InvalidCredentialsError`` for a number with no account exactly as
+        it does for a wrong password, and **a number presented for an account
+        identified by an address gets that sentence too** - see the class
+        docstring for why that case must not be distinguishable.
+
+        **The number is folded by the lookup and not here.** ``find_by_phone``
+        applies ``fold_phone`` - the same function ``User`` applies on
+        construction - so ``0801 234 5678``, ``+2348012345678`` and
+        ``2348012345678`` all find one account, which is the whole point of the
+        fold and the reason a login typed in the form somebody happens to use
+        cannot fail against an account that plainly exists.
+
+        **A value that is not a number is not refused as malformed, and that is
+        the same decision ``RequestPasswordReset`` records about a malformed
+        address.** There is no shape check on this path, because ``checked_phone``
+        belongs to ``User`` and every account that exists already passed through
+        it; restating the rule here would be a second copy free to disagree with
+        the first, and it would answer a *different* thing for a mistyped number
+        than for an unknown one - which is a smaller version of the oracle the
+        shared refusal exists to prevent. ``not-a-number`` names no account and is
+        refused as one.
+
+        A password that could not be one is still refused as malformed rather than
+        as wrong, per ``execute``.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            return self._settle(uow, uow.users.find_by_phone(phone), password, now)
+        finally:
+            uow.rollback()
+
+    def _settle(
+        self, uow, user: User | None, password: str, now: datetime
+    ) -> LoggedIn:
+        """Turn a *looked-up* account into a session, or refuse in one sentence.
+
+        **Both entry points reach this method with the account they found, which
+        may be ``None``**, and that is why the lookup is the caller's and the
+        refusal is this method's: there is exactly one place where a login can
+        succeed and exactly one place where it can fail, so "the two refusals are
+        indistinguishable" is a fact about the shape of the code rather than a
+        property two branches have to be kept in agreement about.
+
+        **The dummy hash is spent here, and the shape of the fix is worth
+        reading.** When no credential is found - because no account matched, or
+        because the account has none, which is what a Google sign-in produces -
+        the presented password is still verified, against ``DUMMY_HASH``, and the
+        answer is discarded. What that buys is the thing the class docstring
+        argues: the two branches take the same time. What it costs is one hash on
+        a path that used to skip it, which is the correct trade and is why the
+        answer is thrown away rather than consulted: a password that happened to
+        match the dummy's (unknown, discarded) preimage would return ``True``, and
+        the branch below refuses on ``encoded is None`` regardless.
+
+        **``PlainPassword`` is built before either lookup's answer is used**, and
+        that is forced by the line above rather than chosen: the dummy comparison
+        is a comparison, so the password has to be one. The visible consequence is
+        that a too-short password is now refused as *malformed* even when the
+        identifier names no account, where it used to be refused as *wrong*. That
+        is the better answer of the two and it leaks nothing - the length policy is
+        public, and a password failing it was never anybody's - so this is the
+        behaviour ``execute``'s docstring already describes, arriving on the paths
+        that had not reached it.
+        """
+        credential = (
+            None
+            if user is None
+            else uow.password_credentials.find_by_user_id(user.user_id)
+        )
+        encoded = None if credential is None else credential.password_hash
+
+        # One comparison on every path, which is the whole of the fix: with an
+        # empty slot the presented password is checked against ``DUMMY_HASH`` and
+        # the answer is discarded below. ``encoded is None`` rather than a falsy
+        # test, so that a *corrupt* stored value still reaches the adapter and is
+        # still the adapter's loud problem - see ``Argon2PasswordHasher.verify``.
+        matched = self._password_hasher.verify(
+            PlainPassword(password), DUMMY_HASH if encoded is None else encoded
+        )
+        # ``user is None`` is the first term although ``encoded is None`` already
+        # covers it, and it is there to be read: it is what says the account below
+        # exists, which the session's ``user.user_id`` depends on.
+        if user is None or encoded is None or not matched:
+            raise InvalidCredentialsError(_REFUSAL)
+
+        session, token = Session.issue(user.user_id, now)
+        uow.sessions.save(session)
+        uow.commit()
+        return LoggedIn(user=user, session=session, token=token)

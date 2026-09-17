@@ -25,4 +25,21 @@ log in: the account is inferred from an address and the mail goes to whatever
 mailbox that address names. So the paths are bare plurals, and the absence of a
 ``/me`` is a true statement about the feature rather than a router that forgot to
 say whose it was.
+
+``profiles`` is beside ``users`` rather than inside it, and the split is the same
+one the schema makes between a ``User`` and a ``Profile``: an account and the
+person holding it are two things with two lifetimes, and the second is the one
+that must not be loaded by every authenticated request. The two files share a
+``tags`` label and nothing else - ``users`` answers "which account is this", which
+is security-shaped, and ``profiles`` answers "who is this person", which is
+compliance-shaped.
+
+``phone_verifications`` is the newest module and the second whose paths name no
+resource the caller owns - with ``password_resets`` it is one of exactly two such
+files, and the reason is one step further out. There the caller cannot log in;
+here the caller may not have an account to log into, because the account is what
+answering the code creates. It is also the only module in the API whose request
+half **costs the installation money per call**, which is worth knowing when
+somebody comes looking for what an unauthenticated stranger can make this server
+do: the answer is one text message, billed, per request.
 """

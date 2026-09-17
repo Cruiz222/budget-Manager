@@ -36,7 +36,7 @@ router = APIRouter(tags=["identity"])
 def log_in(
     body: schemas.LogInIn, service: LogIn = Depends(log_in_service)
 ) -> schemas.SessionOut:
-    """Exchange an address and a password for a token.
+    """Exchange an address or a number, and a password, for a token.
 
     **This is the only endpoint in the API that returns a secret, and it returns
     it once.** There is no endpoint that reads a session back out, so a client
@@ -50,19 +50,33 @@ def log_in(
     header, deliberately: there is no URL at which the session can be fetched,
     and pointing at one that does not exist would be worse than pointing nowhere.
 
-    A wrong password and an unknown address are the *same* response here -
+    A wrong password and an unknown identifier are the *same* response here -
     401 with ``InvalidCredentialsError`` - because distinguishing them would turn
-    this endpoint into a way to test whether an address is registered. See
-    ``LogIn`` for why that holds in the words even though it does not hold in the
-    timing, and for why that gap is 2c's.
+    this endpoint into a way to test whether an address or a number is registered.
+    The same answer covers the third case that arrived with numbers: a phone
+    presented for an account whose identifier is an address. See ``LogIn``, which
+    also records what has changed about that protection since this step - the
+    *timing* difference between the branches is spent away now, and rate limiting
+    remains owed.
+
+    **The two identifiers are two branches, not one lookup that sniffs its
+    argument**, and ``LogInIn``'s validator is what makes this branch total: the
+    body names exactly one of the two, so the ``else`` cannot see a body that
+    named a number. ``LogIn.execute`` accepts an absent address anyway, so the
+    failure mode if that ever stopped being true is the 401 below rather than a
+    500 - the invariant is enforced where it is stated, and not relied on three
+    layers down.
 
     ``datetime.now()`` is read here rather than inside the use case, following
     ``current_actor``: the boundary is where the wall clock enters, so every
     moment-sensitive rule underneath stays a comparison that a test can drive.
     """
-    return translate.session_out(
-        service.execute(body.email, body.password, datetime.now())
-    )
+    now = datetime.now()
+    if body.phone is not None:
+        logged_in = service.execute_for_phone(body.phone, body.password, now)
+    else:
+        logged_in = service.execute(body.email, body.password, now)
+    return translate.session_out(logged_in)
 
 
 @router.delete("/sessions/current", status_code=status.HTTP_204_NO_CONTENT)

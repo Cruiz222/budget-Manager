@@ -21,6 +21,7 @@ from app.infrastructure.repositories.sqlite_transaction_repository import (
 from app.infrastructure.repositories.sqlite_wallet_repository import (
     SqliteWalletRepository,
 )
+from tests.conftest import OTHER_USER_ID
 
 NGN = Currency.NGN
 
@@ -305,3 +306,279 @@ def test_list_awaiting_provider_is_empty_when_nothing_is_in_flight(build_wallet)
     repository = build_repository(wallet)
 
     assert repository.list_awaiting_provider() == []
+
+
+# --- what left the wallet today ---------------------------------------------
+#
+# The read behind the daily outflow cap. The five tests below that are not about
+# the window or the wallet are about *which rows count*, one status and one type
+# at a time, because the filter is a rule with an argument behind it rather than a
+# list somebody typed: a row counts when its money is not in the wallet.
+
+DAY_START = datetime(2026, 3, 2)
+DAY_END = datetime(2026, 3, 3)
+#: Inside ``[DAY_START, DAY_END)`` and nowhere near either edge.
+MIDDAY = datetime(2026, 3, 2, 12, 0)
+
+
+def outflow(repository, wallet, **overrides):
+    """This wallet's outflow over the day, with the window filled in."""
+    kwargs = dict(
+        start=DAY_START,
+        end=DAY_END,
+        currency=wallet.currency,
+    )
+    kwargs.update(overrides)
+    return repository.outflow_total_between(wallet.wallet_id, **kwargs)
+
+
+def test_a_wallet_with_no_ledger_has_spent_nothing(build_wallet):
+    """Zero rather than ``None``: no outflow is a total of zero, and the caller
+    adds the movement it is judging to this on every path."""
+    wallet = build_wallet()
+
+    total = outflow(build_repository(wallet), wallet)
+
+    assert total == Money(Decimal("0.00"), NGN)
+    assert total.currency is NGN
+
+
+def test_a_successful_withdrawal_counts(build_wallet):
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    withdrawal = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("7500.00"), NGN),
+        created_at=MIDDAY,
+    )
+    withdrawal.mark_successful()
+    repository.save(withdrawal)
+
+    assert outflow(repository, wallet) == Money(Decimal("7500.00"), NGN)
+
+
+def test_a_pending_payout_counts(build_wallet):
+    """The hold has already been taken, so the money is not in the wallet.
+
+    This is the case a cap that counted only settled rows would let a burst of
+    in-flight payouts each pass on its own.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    payout = build_transaction(
+        wallet,
+        type=TransactionType.PAYOUT,
+        amount=Money(Decimal("2000.00"), NGN),
+        created_at=MIDDAY,
+        # A payout with no destination cannot be constructed at all - see
+        # ``Transaction.__post_init__`` - so every payout below carries one.
+        destination=DESTINATION,
+    )
+    repository.save(payout)
+
+    assert payout.status is TransactionStatus.PENDING
+    assert outflow(repository, wallet) == Money(Decimal("2000.00"), NGN)
+
+
+def test_a_failed_payout_does_not_count(build_wallet):
+    """The hold was given back. The money never left."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    payout = build_transaction(
+        wallet,
+        type=TransactionType.PAYOUT,
+        amount=Money(Decimal("2000.00"), NGN),
+        created_at=MIDDAY,
+        destination=DESTINATION,
+    )
+    payout.mark_failed()
+    repository.save(payout)
+
+    assert outflow(repository, wallet) == Money(Decimal("0.00"), NGN)
+
+
+def test_a_reversed_payout_does_not_count(build_wallet):
+    """The money left and the bank returned it, which is the one judgement call
+    in the filter - the port argues it: this ceiling bounds value that stayed
+    out, and bounding how *often* money moves is rate limiting, which is a
+    separate control this system does not have yet."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    payout = build_transaction(
+        wallet,
+        type=TransactionType.PAYOUT,
+        amount=Money(Decimal("2000.00"), NGN),
+        created_at=MIDDAY,
+        destination=DESTINATION,
+    )
+    payout.mark_successful()
+    payout.reverse()
+    repository.save(payout)
+
+    assert payout.status is TransactionStatus.REVERSED
+    assert outflow(repository, wallet) == Money(Decimal("0.00"), NGN)
+
+
+@pytest.mark.parametrize(
+    "transaction_type",
+    [TransactionType.DEPOSIT, TransactionType.LOCK_FUNDS, TransactionType.UNLOCK_FUNDS],
+)
+def test_money_arriving_or_moving_within_does_not_count(
+    build_wallet, transaction_type
+):
+    """A deposit brings value in and a lock moves it between the wallet's own two
+    balances. Neither crosses the system's edge, so neither spends the allowance.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    transaction = build_transaction(
+        wallet,
+        type=transaction_type,
+        amount=Money(Decimal("4000.00"), NGN),
+        created_at=MIDDAY,
+    )
+    transaction.mark_successful()
+    repository.save(transaction)
+
+    assert outflow(repository, wallet) == Money(Decimal("0.00"), NGN)
+
+
+def test_the_two_types_that_leave_are_summed_together(build_wallet):
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    withdrawal = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("1500.50"), NGN),
+        created_at=MIDDAY,
+    )
+    withdrawal.mark_successful()
+    payout = build_transaction(
+        wallet,
+        type=TransactionType.PAYOUT,
+        amount=Money(Decimal("2499.50"), NGN),
+        created_at=MIDDAY,
+        destination=DESTINATION,
+    )
+    for transaction in (withdrawal, payout):
+        repository.save(transaction)
+
+    assert outflow(repository, wallet) == Money(Decimal("4000.00"), NGN)
+
+
+def test_a_movement_exactly_at_the_start_of_the_day_counts(build_wallet):
+    """``start`` inclusive: midnight belongs to the day that is beginning."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    withdrawal = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("100.00"), NGN),
+        created_at=DAY_START,
+    )
+    withdrawal.mark_successful()
+    repository.save(withdrawal)
+
+    assert outflow(repository, wallet) == Money(Decimal("100.00"), NGN)
+
+
+def test_a_movement_exactly_at_the_end_of_the_day_does_not(build_wallet):
+    """``end`` exclusive, which is what makes two consecutive days partition
+    every moment exactly once - the boundary row belongs to the next day and is
+    counted there."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    withdrawal = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("100.00"), NGN),
+        created_at=DAY_END,
+    )
+    withdrawal.mark_successful()
+    repository.save(withdrawal)
+
+    assert outflow(repository, wallet) == Money(Decimal("0.00"), NGN)
+    # And it is not lost: the next day's window is where it lands.
+    assert outflow(
+        repository, wallet, start=DAY_END, end=datetime(2026, 3, 4)
+    ) == Money(Decimal("100.00"), NGN)
+
+
+def test_another_wallets_outflow_is_not_this_wallets(build_wallet):
+    """The first of the two filters that keep the total about one wallet."""
+    wallet = build_wallet()
+    other = build_wallet(user_id=OTHER_USER_ID)
+    repository = build_repository(wallet)
+    SqliteWalletRepository(repository._connection).save(other)
+    mine = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("300.00"), NGN),
+        created_at=MIDDAY,
+    )
+    theirs = build_transaction(
+        other,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("9000.00"), NGN),
+        created_at=MIDDAY,
+    )
+    for transaction in (mine, theirs):
+        transaction.mark_successful()
+        repository.save(transaction)
+
+    assert outflow(repository, wallet) == Money(Decimal("300.00"), NGN)
+
+
+def test_a_row_in_another_currency_is_not_summed_in(build_wallet):
+    """The filter that makes a mixed total unrepresentable rather than wrong.
+
+    A wallet's ledger is single-currency by construction, so this row should not
+    exist - and if one ever did, the alternative is a sum that adds dollars to
+    naira and returns a number with one currency on it.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    mine = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("300.00"), NGN),
+        created_at=MIDDAY,
+    )
+    foreign = build_transaction(
+        wallet,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("300.00"), Currency.USD),
+        created_at=MIDDAY,
+    )
+    for transaction in (mine, foreign):
+        transaction.mark_successful()
+        repository.save(transaction)
+
+    assert outflow(repository, wallet) == Money(Decimal("300.00"), NGN)
+
+
+def test_the_total_is_exact_over_many_small_movements(build_wallet):
+    """The test that fails if this is ever rewritten as ``SELECT SUM(amount)``.
+
+    Amounts are stored as TEXT, so SQLite's ``SUM`` would coerce them to REAL and
+    add them in binary floating point - and a hundred addends of ``0.10`` sum to
+    ``9.999999999999998`` that way. The daily cap is compared with ``>``, so a
+    total a hair under the ceiling admits a movement a hair over it.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    for _ in range(100):
+        transaction = build_transaction(
+            wallet,
+            type=TransactionType.WITHDRAWAL,
+            amount=Money(Decimal("0.10"), NGN),
+            created_at=MIDDAY,
+        )
+        transaction.mark_successful()
+        repository.save(transaction)
+
+    total = outflow(repository, wallet)
+
+    assert total == Money(Decimal("10.00"), NGN)
+    assert total.amount == Decimal("10.00")

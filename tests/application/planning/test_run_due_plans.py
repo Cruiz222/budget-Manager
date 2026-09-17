@@ -5,16 +5,66 @@ import pytest
 
 from app.application.planning.execute_plan_run import ExecutePlanRun
 from app.application.planning.run_due_plans import RunDuePlans
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.money.currency import Currency
 from app.domain.money.exception import WalletNotFoundError
 from app.domain.money.money import Money
+from app.domain.planning.instruction import Instruction
+from app.domain.planning.plannedAction import PlannedAction
 from app.domain.planning.planStatus import PlanStatus
 from app.domain.planning.runBlockReason import RunBlockReason
 from app.domain.planning.runStatus import RunStatus
 from app.infrastructure.persistence.sqlite_unit_of_work import SqliteUnitOfWorkFactory
+from tests.conftest import BANK_DESTINATION
 
 NGN = Currency.NGN
 ANCHOR = datetime(2026, 1, 1)
+
+
+def payout(amount: str, label: str = "salary") -> Instruction:
+    """One payout of ``amount`` to the suite's standard bank account.
+
+    Built here rather than imported from ``test_execute_plan_run``, which has its
+    own copy: these two files are testing different things - one the refusal, one
+    what the tick does with it - and a shared helper would couple them such that
+    changing one test's arrangement changed the other's. It is six lines.
+
+    ``label`` is a parameter because a run's lines have to be told apart. The test
+    at the bottom of this file sends several lines of the same amount, and four of
+    them all called "salary" would leave the receipt unable to say which was which.
+    """
+    return Instruction(
+        action=PlannedAction.PAYOUT,
+        amount=Money(Decimal(amount), NGN),
+        label=label,
+        destination=BANK_DESTINATION,
+    )
+
+
+#: The unverified row of the limits table, which is the tier every account in this
+#: file is at - none of them has a profile.
+UNVERIFIED = limits_for(Tier.UNVERIFIED, NGN)
+
+
+#: One unit over what an account with no profile may send in a single movement.
+#:
+#: Read from the table rather than typed out: this test is about a ceiling, and a
+#: test about a ceiling that hard-coded the number would go on passing - and
+#: asserting a block that no longer happens - after somebody raised it.
+OVER_THE_TRANSACTION_CEILING = str(UNVERIFIED.per_transaction.amount + Decimal("1"))
+
+#: How many lines of ``per_transaction`` it takes to land *exactly* on the daily
+#: allowance - four, because 200,000 divides by 50,000.
+#:
+#: Divided rather than typed out, for the reason above: a test that wrote "4"
+#: would keep passing after somebody raised the daily cap, and would then be
+#: asserting that a fifth line is refused when it is not. Note this is one short
+#: of what blocks a *single* run - a run whose lines reached 250,000 would be
+#: refused outright - which is exactly why the test below splits its lines across
+#: two plans.
+LINES_AT_THE_DAILY_CAP = int(
+    UNVERIFIED.daily_outflow.amount // UNVERIFIED.per_transaction.amount
+)
 
 
 def build_scheduler(tmp_path, name="scheduler.db"):
@@ -338,3 +388,123 @@ class TestTheSchedulerIsNotAPrivilegedActor:
         assert wallet_after(factory, wallet).locked_balance == Money(
             Decimal("10000"), NGN
         )
+
+
+class TestATierBlockedPlanDoesNotStopTheTick:
+    """The regression test for the door a *raise* would have opened.
+
+    ``ExecutePlanRun._limit_block`` answers a ``RunBlockReason`` rather than
+    letting ``TierLimitExceededError`` out of the pre-flight, and the difference
+    is not stylistic. The tick is a loop, and an exception ends it. The failure a
+    raise would produce is the one ``TestTheTransactionBoundary`` above documents
+    from the other side - a plan that raised took every plan after it down with
+    it, and the ones that had already run were a lucky accident of ordering.
+
+    So the claim here is exact and needs both halves: the blocked plan is
+    *recorded* as blocked for the ceiling that refused it, **and** the next plan
+    is paid, in one tick, with nothing raised. A test of either half alone would
+    pass on an implementation that fails the other.
+    """
+
+    def test_a_plan_blocked_by_a_ceiling_does_not_stop_the_next_plan(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        # Funded for exactly the payout it is refused, so the *ceiling* is the
+        # only thing standing in its way: a wallet that was also short would be
+        # blocked either way and this test would prove nothing about limits.
+        blocked_wallet = build_wallet(locked=OVER_THE_TRANSACTION_CEILING)
+        blocked = build_plan(
+            wallet_id=blocked_wallet.wallet_id,
+            instructions=(payout(OVER_THE_TRANSACTION_CEILING),),
+        )
+        paid_wallet = build_wallet(locked="10000")
+        paid = build_plan(wallet_id=paid_wallet.wallet_id)
+        scheduler, factory = build_scheduler(tmp_path)
+        # The blocked plan is seeded first, so list_by_status returns it first -
+        # which is what makes "the tick carried on" mean the *later* plan ran.
+        seed(factory, [(blocked_wallet, blocked), (paid_wallet, paid)])
+
+        runs = scheduler.execute(ANCHOR)
+
+        assert [run.plan_id for run in runs] == [blocked.plan_id, paid.plan_id]
+        assert runs[0].reason is RunBlockReason.TIER_LIMIT_EXCEEDED
+        assert runs[1].status is RunStatus.SUCCEEDED
+        assert wallet_after(factory, paid_wallet).locked_balance == Money(
+            Decimal("8000"), NGN
+        )
+        assert wallet_after(factory, blocked_wallet).locked_balance == Money(
+            Decimal(OVER_THE_TRANSACTION_CEILING), NGN
+        )
+
+
+class TestADayIsSummedFromTheLedgerAndNotFromTheRun:
+    """**The second plan asks the ledger what the first one spent**, and this is
+    the test that says the ledger answered.
+
+    ``_limit_block`` reads a wallet's outflow for a plan's own ``as_of`` day, and
+    then carries a running total across *its own* lines so that four lines of
+    50,000 are judged as 200,000 rather than as four separate 50,000s. That
+    running total is local to one run. What it cannot see by itself is a line
+    another plan wrote, and those it can only find in the ledger.
+
+    So the claim here is about where the rows *land*. A payout stamped with the
+    wall clock while its ceiling was read from the plan's moment sits in a day no
+    run will ever ask about - and the failure is silent in the worst way, because
+    a day total that misses a row reads as a smaller total rather than as an
+    error. The cap would still be enforced. It would be enforced against a day
+    that is always empty.
+
+    This is deliberately not ``TestATierBlockedPlanDoesNotStopTheTick``. That one
+    is about a refusal not ending the tick and uses the per-transaction ceiling,
+    which reads no day at all; this one needs both plans to spend *one* wallet in
+    *one* tick, and it fails against a tick that stamps its rows with the clock.
+    """
+
+    def test_a_second_plan_sees_what_the_first_one_spent(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        line = str(UNVERIFIED.per_transaction.amount)
+        # Funded for the whole of the first plan's allowance *and* the line the
+        # second is refused, so the ceiling is the only thing in its way. A wallet
+        # that was also short would block the second plan either way - by
+        # ``_money_block``, one branch later - and this test would prove nothing
+        # about the day total. The leftover is asserted at the bottom, so the
+        # funding is not merely claimed.
+        wallet = build_wallet(
+            locked=str(
+                UNVERIFIED.per_transaction.amount * (LINES_AT_THE_DAILY_CAP + 1)
+            )
+        )
+        spender = build_plan(
+            wallet_id=wallet.wallet_id,
+            name="spender",
+            instructions=tuple(
+                payout(line, f"line{n}") for n in range(LINES_AT_THE_DAILY_CAP)
+            ),
+        )
+        refused = build_plan(
+            wallet_id=wallet.wallet_id,
+            name="refused",
+            instructions=(payout(line),),
+        )
+        scheduler, factory = build_scheduler(tmp_path)
+        # One wallet, two plans, seeded in that order so the spender runs first -
+        # which is what makes the second plan's day total *have* to come off the
+        # ledger rather than off a running total it never shared.
+        seed(factory, [(wallet, spender), (wallet, refused)])
+
+        runs = scheduler.execute(ANCHOR)
+
+        assert [run.plan_id for run in runs] == [spender.plan_id, refused.plan_id]
+        # The first plan's lines land exactly on the allowance and are allowed;
+        # ``check_outflow`` compares with ``>``, so 200,000 of a 200,000 day is
+        # 200,000 worth of allowance and not one unit less.
+        assert runs[0].status is RunStatus.SUCCEEDED
+        # And the second plan's single line, which fits in every other way, is
+        # refused - because the day it is being judged in already holds 200,000
+        # that this plan did not spend and had never heard of.
+        assert runs[1].reason is RunBlockReason.TIER_LIMIT_EXCEEDED
+        # The pot still holds exactly the line that was refused. That is the
+        # funding claim above, and it is also the proof that the block moved no
+        # money: a refusal that had taken the 50,000 would leave 0 here.
+        assert wallet_after(factory, wallet).locked_balance == UNVERIFIED.per_transaction

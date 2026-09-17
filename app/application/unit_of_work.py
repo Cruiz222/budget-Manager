@@ -11,7 +11,11 @@ from app.domain.repositories.password_credential_repository import (
     PasswordCredentialRepository,
 )
 from app.domain.repositories.password_reset_repository import PasswordResetRepository
+from app.domain.repositories.phone_verification_repository import (
+    PhoneVerificationRepository,
+)
 from app.domain.repositories.plan_run_repository import PlanRunRepository
+from app.domain.repositories.profile_repository import ProfileRepository
 from app.domain.repositories.savings_plan_repository import SavingsPlanRepository
 from app.domain.repositories.session_repository import SessionRepository
 from app.domain.repositories.transaction_repository import TransactionRepository
@@ -157,6 +161,66 @@ class UnitOfWork(ABC):
     #: See ``PasswordResetRepository.save`` for the statement that records one and
     #: ``PasswordResetRepository.claim_by_token_hash`` for the one that spends it.
     password_resets: PasswordResetRepository
+    #: Correctness, not convenience, and the sixth member of that small group after
+    #: ``wallets``/``transactions``/``plan_runs``, ``notifications``,
+    #: ``confirmations``, ``email_changes`` and ``password_resets`` - and the first
+    #: one that creates an account rather than moving something on one.
+    #:
+    #: Answering a phone verification makes two things true together: the texted code
+    #: was spent, and an account now holds the number it was sent to. Those must land
+    #: together, and a crash between them is worse than either alone in a way neither
+    #: of the other pairings is - it is not a stale credential and not a lost address,
+    #: it is a number that is *taken*. ``UNIQUE(phone)`` is what stops two people
+    #: signing up with one handset, so a claim that committed without its account
+    #: leaves the row holding the slot, and the person who actually holds that phone
+    #: cannot sign up with it at all until the request expires. The pairing is what
+    #: makes "this code was spent" imply "and here is the account it bought".
+    #:
+    #: The two halves are written by three different repositories -
+    #: ``phone_verifications`` here, ``users`` and ``password_credentials`` above -
+    #: which is the reason this declaration exists at all rather than being left to
+    #: the use case to remember. A use case that opened separate units would commit the
+    #: spend and the account separately, and nothing about either write would look
+    #: wrong.
+    #:
+    #: **The credential is here for a second and independent reason**, worth naming
+    #: because it is the one write in this pairing that has nothing to do with the
+    #: number: an account with no credential is one nobody can ever log into, and it
+    #: fails invisibly, since the signup would have reported success and the number
+    #: would already be taken. So three writes are one fact for two different reasons
+    #: at once, which is exactly the kind of thing a use case left to remember gets
+    #: wrong.
+    #:
+    #: See ``PhoneVerificationRepository.save`` for the statement that records one and
+    #: ``PhoneVerificationRepository.claim_by_token_hash`` for the one that spends it.
+    phone_verifications: PhoneVerificationRepository
+    #: **Convenience, and deliberately so - it is the one repository here whose
+    #: absence from the correctness group is worth arguing rather than
+    #: noticing.**
+    #:
+    #: It is tempting to reach for the pattern by analogy: a tier is derived from
+    #: this row, a tier decides how much money may move, so surely a profile write
+    #: has to land with something money-shaped. It does not, and the reason is
+    #: that **the profile is never read as part of a money movement's decision
+    #: from outside that movement's own unit.** ``WalletService._run`` loads the
+    #: profile *inside* the unit that moves the money, through this same unit, so
+    #: the tier it enforces and the balance it debits were read at one moment.
+    #: There is no second unit holding a stale tier, because no other code path
+    #: carries one.
+    #:
+    #: What that buys is the honest failures rather than the atomic ones. A
+    #: profile write that commits while a concurrent withdrawal is mid-flight
+    #: means the withdrawal is judged against whichever tier it read - and both
+    #: readings are *correct*, because a tier is not a state that has to change
+    #: atomically with anything. There is no half-applied version of "this person
+    #: gave us their name": the row is written whole by ``Profile.revise`` or not
+    #: at all.
+    #:
+    #: The pressure to put it in the correctness group would come from wanting the
+    #: tier *raised* before a movement is judged. That is a want, not an
+    #: invariant - the safe direction is for a movement to be judged harshly by a
+    #: stale tier, and that is the direction a lost race falls in.
+    profiles: ProfileRepository
 
     @abstractmethod
     def commit(self) -> None:

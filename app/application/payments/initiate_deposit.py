@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from app.application.unit_of_work import UnitOfWorkFactory
+from app.domain.identity.tier import check_credit, tier_for
 from app.domain.money.exception import (
     CurrencyMismatchError,
     InvalidAmountError,
@@ -13,7 +14,10 @@ from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
-from app.domain.payments.exception import DepositAlreadyInitiatedError
+from app.domain.payments.exception import (
+    DepositAlreadyInitiatedError,
+    PayerEmailMissingError,
+)
 from app.domain.payments.payerEmail import refuse_unusable_payer_email
 from app.domain.payments.paymentProvider import PaymentProvider
 
@@ -70,6 +74,15 @@ class InitiateDeposit:
     could ever credit. Refusing at the door means the payer is never sent
     anywhere. A *frozen* wallet is allowed, deliberately: freezing stops value
     leaving, and this is value arriving.
+
+    **The balance ceiling is refused here too, and for the same reason as the
+    closed wallet rather than a different one.** A deposit that would leave the
+    wallet above its cap cannot be credited when it settles, so opening a
+    collection for it sends a payer to a payment page to buy a refusal. The check
+    is ``check_credit`` itself rather than a second comparison written out, so the
+    courtesy and the rule it foreshadows cannot drift apart; what differs between
+    them is only *when* they run, and the balance is free to change in between.
+    That gap is a real one and it is **not** closed here - see ``_prepare``.
     """
 
     def __init__(
@@ -149,6 +162,24 @@ class InitiateDeposit:
         The read-only unit is rolled back rather than committed. Nothing was
         written, so there is nothing to make durable; but the transaction is
         open, and leaving it open holds a read lock the next writer waits on.
+
+        **The ceiling check is a courtesy, and it is not the control.** What it
+        buys is that a payer is not sent to a payment page for money this wallet
+        could not legally accept; what it does not buy is a guarantee, because the
+        balance it reads is a balance that is free to change before the payer
+        pays. Two collections opened on the same day, each of which fits under the
+        cap at the moment it is asked for, can both be paid and both settle - and
+        nothing refuses the second one, because ``SettlePayment`` credits the
+        wallet directly and does not go through the ceiling at all.
+
+        **That gap is open on purpose and not by oversight.** Closing it means
+        deciding what happens to a payment the payer has *already made* and the
+        wallet may not accept: hold it, reverse it, or exceed the cap for it. Each
+        of those is a real answer with a different conversation attached, and
+        guessing one here would be inventing a refund policy in a docstring. It is
+        recorded in the README's ``### Still open`` for the slice that builds it,
+        and until then the cap is enforced at this door, on the deposit command,
+        and on every movement out.
         """
         uow = self._unit_of_work_factory.start()
         try:
@@ -170,6 +201,23 @@ class InitiateDeposit:
             if wallet.status is WalletStatus.CLOSED:
                 raise WalletClosedError("this wallet is closed")
 
+            # Read through the actor rather than through the wallet, and the
+            # distinction is the same one ``get_owned`` above makes: the wallet
+            # has just been proved to belong to ``self._actor``, so the profile
+            # that answers here is the owner's. A missing one is not an error -
+            # ``tier_for`` reads ``None`` as UNVERIFIED, which is what every
+            # account that predates profiles is.
+            #
+            # The total the wallet would *hold* rather than the available balance
+            # alone, because that is what the credit guard compares: a pot is
+            # money this account still holds, so a deposit into a wallet whose
+            # locked balance already reaches the cap is refused here as surely as
+            # it would be refused later.
+            check_credit(
+                tier_for(uow.profiles.find_for_user(self._actor)),
+                wallet.available_balance + wallet.locked_balance + amount,
+            )
+
             # The payer address, refused here when it plainly cannot work.
             # ``payerEmail`` carries the argument for the check's narrowness, and
             # the short version is that this is a courtesy and the provider is the
@@ -177,7 +225,24 @@ class InitiateDeposit:
             # address, so a client is told one thing either way and nothing rests
             # on this codebase's reading of the provider's rule. It sits after the
             # wallet checks so that a closed wallet answers with its own refusal
-            # rather than a lecture about an address.
+            # rather than a lecture about an address - and after the ceiling for
+            # the same reason, since "this account may not hold that much" is a
+            # fact about the account and an unusable address is a courtesy about
+            # the request.
+            #
+            # The missing case comes *first*, and the order is not cosmetic: the
+            # courtesy below asks a question about an address, and there is no
+            # address here to ask it about - ``has_real_domain(None)`` is an
+            # ``AttributeError``, which reports as a 500 rather than as a refusal.
+            # A phone-only account is a state this system permits and a person can
+            # therefore be in, so the branch is reachable rather than theoretical.
+            # See ``PayerEmailMissingError``, which names the remedy.
+            if user.email is None:
+                raise PayerEmailMissingError(
+                    "this account has no email address, and a deposit needs one to "
+                    "be billed under; add an email to the account and try again"
+                )
+
             refuse_unusable_payer_email(user.email)
 
             # Which is ``app.domain.money.reference``'s rule rather than this

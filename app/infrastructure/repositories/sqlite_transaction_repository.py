@@ -1,7 +1,10 @@
 import sqlite3
+from datetime import datetime
+from decimal import Decimal
 
 from app.domain.money.currency import Currency
 from app.domain.money.exception import TransactionNotFoundError
+from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
@@ -158,6 +161,74 @@ class SqliteTransactionRepository(TransactionRepository):
             (enum_to_text(TransactionStatus.PENDING),),
         ).fetchall()
         return [self._row_to_transaction(row) for row in rows]
+
+    def outflow_total_between(
+        self,
+        wallet_id,
+        start: datetime,
+        end: datetime,
+        currency: Currency,
+    ) -> Money:
+        """See the port for what counts and why the boundary is half-open.
+
+        **The sum is done in Python over a selected column, and not by ``SUM()``
+        in SQL.** This is the one decision in this method worth stating, because
+        ``SELECT SUM(amount)`` is the obvious line and it is wrong: amounts are
+        stored as TEXT - ``money_to_text`` exists precisely so that they are,
+        because "binary floats cannot represent money exactly" - and SQLite's
+        ``SUM`` coerces a text operand to REAL. So the arithmetic would happen in
+        binary floating point and a total of a hundred small movements would come
+        back as 999.9999999999999 rather than 1000.00. The error is small and the
+        rule it breaks is not: the daily cap is compared against this total with
+        ``>``, so a total that is a hair under the ceiling admits a movement that
+        is a hair over.
+
+        Selecting the rows and summing ``Decimal`` in Python keeps the arithmetic
+        in the type that can hold it. The rows are one wallet's, one day's, and
+        one direction's, which is a handful at most; the read is indexed by
+        ``wallet_id`` and bounded by ``created_at``, both of which every ledger
+        query here already uses. This is a case where the correct version is also
+        the cheap one.
+
+        ``text_to_money`` is reused rather than ``Decimal(row["amount"])`` typed
+        out again, so the exact round-trip a loaded transaction gets is the
+        round-trip each addend gets, and the sum cannot disagree with the rows it
+        came from.
+        """
+        rows = self._connection.execute(
+            """
+            SELECT amount
+            FROM transactions
+            WHERE wallet_id = ?
+              AND currency = ?
+              AND type IN (?, ?)
+              AND status IN (?, ?)
+              AND created_at >= ?
+              AND created_at <  ?
+            """,
+            (
+                uuid_to_text(wallet_id),
+                enum_to_text(currency),
+                enum_to_text(TransactionType.WITHDRAWAL),
+                enum_to_text(TransactionType.PAYOUT),
+                # PENDING and SUCCESSFUL, in that order so that the two statuses
+                # read in the order the port's docstring argues them.
+                enum_to_text(TransactionStatus.PENDING),
+                enum_to_text(TransactionStatus.SUCCESSFUL),
+                # ``datetime_to_text`` on both bounds, which is the same
+                # serialization the column is written with - so the comparison is
+                # between two ISO-8601 strings in one frame, and it is why
+                # ``limit_day_bounds`` returns naive local moments rather than
+                # offset-carrying ones.
+                datetime_to_text(start),
+                datetime_to_text(end),
+            ),
+        ).fetchall()
+
+        return sum(
+            (text_to_money(row["amount"], currency) for row in rows),
+            start=Money(Decimal("0.00"), currency),
+        )
 
     def _row_to_transaction(self, row) -> Transaction:
         currency = text_to_enum(Currency, row["currency"])

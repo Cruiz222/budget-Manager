@@ -2,10 +2,14 @@ from uuid import UUID
 
 from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.confirm_password_reset import ConfirmPasswordReset
+from app.application.identity.confirm_phone_sign_up import ConfirmPhoneSignUp
 from app.application.identity.log_in import LogIn
 from app.application.identity.log_out import LogOut
 from app.application.identity.request_email_change import RequestEmailChange
 from app.application.identity.request_password_reset import RequestPasswordReset
+from app.application.identity.request_phone_verification import (
+    RequestPhoneVerification,
+)
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.notifications.deliver_notifications import DeliverNotifications
@@ -16,6 +20,7 @@ from app.application.payments.initiate_deposit import InitiateDeposit
 from app.application.payments.reconcile_payments import ReconcilePayments
 from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
+from app.application.profile_service import ProfileService
 from app.application.planning.execute_plan_run import ExecutePlanRun
 from app.application.planning.notify_upcoming_runs import NotifyUpcomingRuns
 from app.application.planning.run_due_plans import RunDuePlans
@@ -26,11 +31,14 @@ from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHas
 from app.infrastructure.settings import (
     EmailSettings,
     PaystackSettings,
+    TermiiSettings,
     describe_configuration,
+    describe_termii_configuration,
 )
 from app.infrastructure.notifications.smtp_notification_channel import (
     SmtpNotificationChannel,
 )
+from app.infrastructure.notifications.termii_sms_channel import TermiiSmsChannel
 from app.infrastructure.payments.paystack_payment_provider import (
     PaystackPaymentProvider,
 )
@@ -97,6 +105,39 @@ def provider_for(settings: PaystackSettings | None, provider=None):
     if settings is None:
         return None
     return PaystackPaymentProvider(secret_key=settings.secret_key)
+
+
+def _sms_channel_for(settings: TermiiSettings | None, channel=None):
+    """The channel a text leaves through: the injected one, Termii, or none at all.
+
+    ``_channel_for``'s exact counterpart one wire over - words leave by mail
+    through that one, and a code leaves by text through this one - and it is
+    private for the same reason: its callers are the builders in this file and
+    nothing else. Note that ``provider_for`` beside it is public, and the
+    difference is a caller rather than a conviction: ``create_app`` resolves a
+    provider once and puts it on ``app.state``, so it needs the name, whereas both
+    channel builders construct their adapter per call, exactly as the mail path
+    always has. The three functions differ in one thing only - which settings they
+    read and which adapter they build - and that is deliberate rather than
+    regrettable: the day one of them grows a caller outside this module it is
+    renamed, and until then the underscore is accurate.
+
+    ``None`` is a value here, not a failure, exactly as it is for the other two:
+    this suite runs with no ``TERMII_*`` set, so the ordinary test app would be an
+    install that cannot text, and the fake seam is the same one the mail tests use
+    - the builder is handed a channel, or the channel builder is replaced. What
+    ``None`` *means* to a caller differs from mail's, and the difference is why this
+    flow refuses rather than carrying on silently - see
+    ``RequestPhoneVerification``.
+    """
+    if channel is not None:
+        return channel
+    if settings is None:
+        return None
+    return TermiiSmsChannel(
+        api_key=settings.api_key,
+        sender_id=settings.sender_id,
+    )
 
 
 def build_initiate_deposit(
@@ -275,6 +316,45 @@ def build_plan_service(
     plan is not refused, it is a plan that was never created.
     """
     return PlanService(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        actor=actor,
+    )
+
+
+def build_profile_service(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    *,
+    actor: UUID,
+) -> ProfileService:
+    """Wire up the profile use cases over the same storage as everything else.
+
+    **The simplest builder here, and the one worth reading as the baseline.** It
+    takes no ``settings``, no hasher and no provider, because reading and writing
+    somebody's name needs none of them - and the contrast with
+    ``build_wallet_service`` above is the whole content of this docstring. That
+    builder takes a mail installation so a movement can produce a receipt; this
+    one cannot send anything to anybody, which is a property of the feature rather
+    than a gap in it. A profile write is a write and nothing else.
+
+    ``actor`` is required and keyword-only, matching ``build_plan_service`` - the
+    service binds it at construction, so every method it has is scoped to one
+    person and there is no method that takes a user id. See ``ProfileService``.
+
+    A separate factory from the wallet service's, and that is correct here for
+    the reason ``build_plan_service`` gives: every method opens and closes its own
+    unit, so a second factory pointed at the same database file is a second
+    transaction by design rather than a second database.
+
+    **The wallet service does not go through this one**, and it is worth saying
+    where the two builders sit side by side and look interchangeable. The tier
+    that decides how much money may move is read *inside the unit that moves the
+    money*, through ``uow.profiles``, so the balance and the tier were read at one
+    moment. A wallet service that asked this service for a tier would be reading
+    it in a transaction of its own and acting on it in another - which is the race
+    ``BEGIN IMMEDIATE`` exists to close, reintroduced at a higher layer where no
+    isolation level can help.
+    """
+    return ProfileService(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
         actor=actor,
     )
@@ -729,4 +809,92 @@ def build_confirm_password_reset(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
         password_hasher=password_hasher or Argon2PasswordHasher(),
         channel=_channel_for(settings, channel),
+    )
+
+
+def build_request_phone_verification(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: TermiiSettings | None = None,
+    channel=None,
+) -> RequestPhoneVerification:
+    """Wire up asking to prove a number, the second builder for a caller with nothing.
+
+    No hasher because there is no password to hash yet - the password is chosen at
+    the confirm, by whoever read the text - and no actor for
+    ``build_request_password_reset``'s reason exactly: the person using this cannot
+    be identified, and here it is stronger, because they may not have an account to
+    be identified *as*. Demanding anything would refuse exactly the person the
+    endpoint exists for.
+
+    **A missing channel is a refusal here, where mail's is a refusal only
+    sometimes.** ``build_request_email_change`` treats no mail account as an
+    instruction to do without it, and it can, because the account's own password was
+    just proved. Nothing here can be proved: the reason to believe somebody holds a
+    handset *is* a message arriving on it, so there is no fallback to fall back to
+    and the refusal is the only true answer. The sentence naming the missing
+    variable is composed here rather than in the use case, by
+    ``_no_sms_account_reason`` below - see ``build_request_password_reset`` for the
+    whole of that argument, which is one channel over and identical.
+
+    The injected ``channel`` is resolved *first*, so a test that passes a fake never
+    causes the real environment to be read at all.
+    """
+    resolved = _sms_channel_for(settings, channel)
+    return RequestPhoneVerification(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        channel=resolved,
+        unconfigured_reason=_no_sms_account_reason(resolved),
+    )
+
+
+def _no_sms_account_reason(resolved) -> str | None:
+    """Why a number cannot be verified here, in the one sentence both presentations say.
+
+    ``_no_mail_account_reason``'s shape and its argument - a prefix saying what is
+    impossible, then ``describe_termii_configuration`` naming the variable that would
+    fix it - and the two differ only in which reader supplies the second half. That
+    is deliberate rather than a copy that drifted: the pair of functions is what
+    keeps each channel's reason composed from *its own* configuration, so an install
+    with mail and no SMS says which variable is missing instead of reporting an
+    outage, and an install with neither still gets a sentence about the flow the
+    person actually tried to use.
+
+    ``None`` when there is a channel, because there is nothing to explain; and the
+    prefix alone when ``describe_termii_configuration`` has nothing to add, which
+    happens only when the environment is complete and yet no settings and no channel
+    reached this function - a caller that bypassed ``from_environment``.
+    """
+    if resolved is not None:
+        return None
+    missing = describe_termii_configuration()
+    reason = (
+        "this installation has no SMS account, so a number cannot be verified"
+    )
+    return f"{reason}: {missing}" if missing else reason
+
+
+def build_confirm_phone_sign_up(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    password_hasher: PasswordHasher | None = None,
+) -> ConfirmPhoneSignUp:
+    """Wire up answering a phone signup, which needs the hasher and nothing else.
+
+    **Two arguments, and the shortest signature of any builder that creates an
+    account** - which is worth naming, because what is missing is more instructive
+    than what is there. No channel: nothing is sent from this half, and there is no
+    second message to send (see ``phoneVerificationMessage`` for why a "your number
+    is verified" text would tell somebody a fact they learned by answering the code).
+    No settings and no ``unconfigured_reason`` either, for
+    ``build_confirm_password_reset``'s reason: by the time this is reached a channel
+    already existed, because a confirm is only reachable through a request that
+    required one, so there is nothing here that a missing channel could refuse.
+
+    The hasher is not optional and not defaulted, and it is the third builder to
+    take it for *writing* after ``build_sign_up`` and ``build_confirm_password_reset``.
+    The argument is identical to those two: a hash is the only thing this half
+    stores, so an install that could not hash could not confirm at all.
+    """
+    return ConfirmPhoneSignUp(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        password_hasher=password_hasher or Argon2PasswordHasher(),
     )

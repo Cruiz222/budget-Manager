@@ -54,3 +54,21 @@ class RunBlockReason(Enum):
     held back by a date wants patience, and until this member existed the run
     could not tell the user which of the two it needed.
     """
+
+    TIER_LIMIT_EXCEEDED = "tier_limit_exceeded"
+    """The owner's account may not move this much, whatever the wallet holds.
+
+    **One member for three ceilings**, which is the opposite of the split above
+    and is worth the sentence: the per-transaction ceiling, the daily outflow
+    cap and the balance cap are three rules with one remedy between them - *this
+    account is not allowed to, and completing a profile is how that changes* -
+    where the two money members above have genuinely different remedies. The
+    counter this enum exists for asks "how many runs did a limit turn away?",
+    and it is answered.
+
+    What is *not* recorded here is which ceiling refused the run. The exception
+    the wallet path raises carries it (see ``TierLimitExceededError``), and a
+    caller that needs the same granularity from the plan path will want another
+    member - which is free to add, per the note above, and which no row already
+    written would become wrong by.
+    """

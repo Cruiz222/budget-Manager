@@ -59,6 +59,14 @@ class RecordingTransactionRepository(TransactionRepository):
         # class un-instantiable whether or not anything calls it.
         raise NotImplementedError
 
+    def outflow_total_between(self, wallet_id, start, end, currency):
+        # The daily-outflow cap's read, and the same "the port grew" line one
+        # above applies. Deliberately not given a total of its own: this module
+        # drives ``WithdrawMoney`` directly, where the cap is not enforced - it
+        # lives in ``WalletService._run`` - so a number here would be a rule
+        # invented by a test double rather than exercised by one.
+        raise NotImplementedError
+
 
 # --- A withdrawal debits the wallet and holds the money ---
 

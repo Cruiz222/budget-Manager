@@ -65,6 +65,20 @@ class EmailChangeOutcome:
         means the same thing either way: "the address this request is about". A
         client that has to know *which* of the two it is asking about reads
         ``applied`` and asks the right question.
+
+        **Still ``str`` although ``User.email`` is optional now**, and that is a
+        fact about this class rather than an assumption about the account. The
+        first branch is only reachable on the applied path, where ``execute`` has
+        already called ``user.change_email`` on the very object this outcome
+        holds - so it reads a value assigned moments earlier, and
+        ``change_email`` cannot assign ``None``. The second branch answers
+        whenever there is a pending change, and a pending change always names an
+        address. So the coupling is real and worth naming: **this property's type
+        rests on ``execute`` returning the same ``User`` it moved**, and an
+        outcome assembled from a pre-move copy would break it. Widening to
+        ``str | None`` would instead describe a state nothing can construct, and
+        push a ``None`` check onto every caller to handle something that never
+        arrives.
         """
         return self.user.email if self.change is None else self.change.new_email
 
@@ -92,6 +106,23 @@ class RequestEmailChange:
     account") is the one they already know from the login form. A password that
     could not be one at all still gets ``PlainPassword``'s own refusal, which is a
     400 naming the length policy, exactly as at sign-up.
+
+    **For an account that holds no address, this sets one rather than moving
+    one** - and it is the only way such an account ever gets one, which makes it
+    load-bearing rather than a courtesy case. An account signed up with a phone
+    number and no email is fully usable right up to the point it has to be billed:
+    a payment provider is handed the payer's address, so a deposit from a
+    phone-only account is refused until one exists. That refusal
+    (``PayerEmailMissingError``) tells the person what is missing and what to do
+    about it, and it does not name this operation - naming an endpoint is not the
+    domain's job, and the layer that raises it has no idea one exists. Everything
+    below is therefore written to work from ``None``: the "already this account's
+    address" refusal is unreachable, the usability rule applies unconditionally
+    instead of being waived for the account's own address, and the applied path
+    assigns where the moving case replaces. The refusals are otherwise identical,
+    because they are about the *value being claimed* and the store it is claimed
+    against, neither of which cares whether the claimer currently holds something
+    else.
 
     **With no mail account configured, the change is applied here and now.** This
     is the fallback the whole slice depends on: the endpoint exists to rescue an
@@ -162,7 +193,9 @@ class RequestEmailChange:
           Checked against the *folded* value, which is why it comes after the
           shape rule rather than before it: ``Ada@Example.com`` with a trailing
           space is the same address as ``ada@example.com``, and comparing the raw
-          string would report a change to itself as a change.
+          string would report a change to itself as a change. An account holding
+          no address cannot reach this at all, and nothing special is done about
+          that: it holds nothing for the new address to equal.
         - **``UnusableEmailError``** - the address has no dot in its domain, so no
           provider will bill it. This is the entry rule, and the one case where it
           is *not* checked is this account's own address, because the account
@@ -188,11 +221,23 @@ class RequestEmailChange:
 
             email = checked_email(new_email)
 
+            # The comparison is left to do the work rather than guarded against
+            # ``user.email`` being ``None``. ``email`` was checked a line above and
+            # is non-empty, so it is never equal to ``None`` - which is the
+            # statement that an account holding no address cannot be asking to
+            # move to the address it holds, because it holds none. A guard here
+            # would be a second way of saying that, free to disagree with this one.
             if email == user.email:
                 raise EmailUnchangedError(
                     f"{email} is already this account's address"
                 )
 
+            # Unconditional, unlike the stranded-account case the docstring
+            # records: the waiver is for an account whose *own* address is
+            # unusable, and an account with no address has no own address to
+            # waive. So a phone-only account setting an address is held to the
+            # entry rule at the only moment it can be - which is exactly right,
+            # since this is the address Paystack will be handed.
             refuse_unusable_email(email)
 
             holder = uow.users.find_by_email(email)
@@ -202,6 +247,11 @@ class RequestEmailChange:
             if self._channel is None:
                 # No mailbox to prove anything with, so the password proof above is
                 # the whole of the authorisation. See the class docstring.
+                #
+                # ``change_email`` is the assigning case as well as the moving one:
+                # for an account with no address this is where it acquires one, and
+                # the outcome built below reads it back off this same object. See
+                # ``EmailChangeOutcome.email``, whose type depends on that.
                 user.change_email(email)
                 uow.users.save(user)
                 uow.commit()

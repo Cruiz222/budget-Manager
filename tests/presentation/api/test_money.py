@@ -42,6 +42,7 @@ import pytest
 
 from app.composition_root import build_wallet_service
 from app.domain.identity.session import Session, hash_session_token
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.infrastructure.persistence.sqlite_unit_of_work import (
@@ -693,6 +694,45 @@ class TestConfirmingAWithdrawal:
 
         assert response.status_code == 409
         assert response.json()["error"] == "InsufficientFundsError"
+        ledger = client.get(f"/wallets/{wallet_id}/transactions", headers=headers).json()
+        assert [row["type"] for row in ledger] == ["deposit", "withdrawal"]
+        assert ledger[-1]["status"] == "failed"
+
+    def test_a_withdrawal_over_the_transaction_ceiling_is_a_400_naming_the_limit(
+        self, client, as_user, funded
+    ):
+        """The whole chain, over the wire, which is why it is asserted here.
+
+        A session resolves an actor, the actor's own profile decides a tier, the
+        tier's table decides a ceiling, the ceiling refuses *inside* the operation
+        that was going to move the money, and ``errors._grade`` renders it as a
+        400 carrying the error's own name. No domain test can reach four of those
+        five steps, and the balance is deliberately ample - the wallet is not the
+        reason this is refused, so the ceiling is the only thing left that can be.
+
+        **A 400 rather than a 409**, which reads against the test above and is
+        decision 182's fallthrough doing its job: a limit is a well-formed request
+        that the account is not allowed to make, which is the class the grade was
+        written for. Nothing was translated for this error, and that is the point.
+
+        The FAILED row is the other half, and it is why the guard sits inside
+        ``execute`` rather than before it: a refusal that reached the wire without
+        reaching the ledger would be a control the audit trail never hears about.
+        """
+        headers = as_user()
+        wallet_id = funded(headers=headers, amount="300000.00")
+        limit = limits_for(Tier.UNVERIFIED, Currency.NGN).per_transaction
+
+        response = refused(
+            client,
+            f"/wallets/{wallet_id}/withdrawals",
+            headers,
+            amount=str(limit.amount + Decimal("1")),
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "TierLimitExceededError"
+        assert str(limit) in response.json()["detail"]
         ledger = client.get(f"/wallets/{wallet_id}/transactions", headers=headers).json()
         assert [row["type"] for row in ledger] == ["deposit", "withdrawal"]
         assert ledger[-1]["status"] == "failed"

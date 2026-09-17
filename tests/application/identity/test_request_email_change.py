@@ -93,7 +93,7 @@ def change_for(factory, password_hasher):
     return _build
 
 
-def seed_account(db_path, password_hasher, email, password=PASSWORD) -> User:
+def seed_account(db_path, password_hasher, email, password=PASSWORD, phone=None) -> User:
     """Write an account straight into the store, bypassing ``SignUp`` entirely.
 
     **The only way an account this system would refuse can exist.** ``SignUp``
@@ -101,11 +101,22 @@ def seed_account(db_path, password_hasher, email, password=PASSWORD) -> User:
     ``nobody@localhost`` can only be one written before the rule - and a test that
     went through the front door could not produce one at all. This is what a row
     that predates the rule looks like.
+
+    ``email`` and ``phone`` are both dials: ``email=None`` with a ``phone`` is the
+    phone-only account, which is a row ``SignUp`` could produce but which no test
+    of *this* flow may reach through the front door either - the signup that makes
+    one is a later step of the same slice.
     """
     factory = SqliteUnitOfWorkFactory(db_path)
     uow = factory.start()
     try:
-        user = User(user_id=uuid4(), email=email, google_subject=None, created_at=NOW)
+        user = User(
+            user_id=uuid4(),
+            email=email,
+            phone=phone,
+            google_subject=None,
+            created_at=NOW,
+        )
         uow.users.save(user)
         uow.password_credentials.save(
             PasswordCredential(
@@ -477,6 +488,151 @@ class TestTheRescue:
         assert password_hasher.verify(PlainPassword(PASSWORD), credential.password_hash)
 
 
+class TestAnAccountWithNoAddress:
+    """Setting an address, for an account that holds none.
+
+    **This is the only route by which a phone-only account becomes able to take
+    money**, which is what makes it step 1 of the phone-signup slice rather than a
+    later courtesy. An account signed up with a number works right up to the moment
+    it has to be billed: ``initiate_deposit`` hands the payer's address to Paystack,
+    so a deposit is refused until one exists. Nothing else in the system can supply
+    one - the account cannot be mailed a code, because there is nowhere to mail it.
+
+    So the flow is not "move an address that happens to be missing". Everything it
+    does is unchanged, but two of its decisions are unreachable here and one is
+    newly reachable, and those are the claims below.
+    """
+
+    @pytest.fixture
+    def phone_only(self, db_path, password_hasher):
+        return seed_account(
+            db_path, password_hasher, email=None, phone="08012345678"
+        )
+
+    def test_the_change_is_applied_with_no_mail_account(
+        self, change_for, phone_only, factory
+    ):
+        outcome = change_for(phone_only.user_id).execute(NEW_ADDRESS, PASSWORD, NOW)
+
+        uow = factory.start()
+        try:
+            stored = uow.users.get_by_id(phone_only.user_id)
+        finally:
+            uow.rollback()
+
+        assert outcome.applied is True
+        assert outcome.email == NEW_ADDRESS
+        assert stored.email == NEW_ADDRESS
+
+    def test_the_number_is_left_alone(self, change_for, phone_only, factory):
+        """Setting an address is not a swap of the identifier.
+
+        The account keeps the number it was identified by, and gains an address
+        beside it. Replacing one with the other would silently disconnect the
+        account from the only credential path it had - a person who could sign in
+        by text before asking for an email would not be able to afterwards.
+        """
+        change_for(phone_only.user_id).execute(NEW_ADDRESS, PASSWORD, NOW)
+
+        uow = factory.start()
+        try:
+            stored = uow.users.get_by_id(phone_only.user_id)
+        finally:
+            uow.rollback()
+
+        assert stored.phone == "2348012345678"
+
+    def test_the_outcome_reports_the_new_address(self, change_for, phone_only):
+        """``EmailChangeOutcome.email`` is the address just set.
+
+        The property reads it back off the account rather than out of a pending
+        change, and this is the state where that matters: an account that held
+        ``None`` a moment ago now reports the address it was given, because
+        ``execute`` moved the same object it returns. See the property's docstring
+        for why its type is still ``str``.
+        """
+        outcome = change_for(phone_only.user_id).execute(NEW_ADDRESS, PASSWORD, NOW)
+
+        assert outcome.email == NEW_ADDRESS
+
+    def test_the_account_can_be_logged_in_to_at_the_address(
+        self, db_path, password_hasher, change_for, factory
+    ):
+        """The same half a store assertion misses, one case over.
+
+        An account found by its number before the change must be found by its
+        address after it - the fold, the lookup and the row agreeing.
+        """
+        phone_only = seed_account(
+            db_path, password_hasher, email=None, phone="08012345678"
+        )
+
+        change_for(phone_only.user_id).execute(NEW_ADDRESS, PASSWORD, NOW)
+
+        uow = factory.start()
+        try:
+            found = uow.users.find_by_email(NEW_ADDRESS)
+        finally:
+            uow.rollback()
+
+        assert found is not None
+        assert found.user_id == phone_only.user_id
+
+    def test_an_unusable_address_is_still_refused(self, change_for, phone_only):
+        """The stranded-account waiver is not available to an account with no address.
+
+        Usability is waived for an account whose *own* address is unusable, so that
+        it can ask to stay where it is after a rule changed under it. An account
+        with no address has no own address to waive, so it is held to the entry
+        rule at the only moment it can be - which is right, because this is the
+        address Paystack will be handed.
+        """
+        with pytest.raises(UnusableEmailError):
+            change_for(phone_only.user_id).execute("nobody@localhost", PASSWORD, NOW)
+
+    def test_nothing_is_written_when_the_address_is_refused(
+        self, change_for, phone_only, db_path
+    ):
+        with pytest.raises(UnusableEmailError):
+            change_for(phone_only.user_id).execute("nobody@localhost", PASSWORD, NOW)
+
+        assert requests_in(db_path) == 0
+
+    def test_the_password_is_still_required(self, change_for, phone_only):
+        """Setting an address is not a weaker operation than moving one.
+
+        The authorisation is unchanged: a session *and* the password, because the
+        token that would otherwise prove the change was minted by whoever asked.
+        An account that could have an address attached without its password proved
+        would be one whose deposits could be redirected by anybody holding a
+        session - which is the whole point of the payer address being on the
+        account rather than on the request.
+        """
+        with pytest.raises(InvalidCredentialsError):
+            change_for(phone_only.user_id).execute(NEW_ADDRESS, "wrong-password", NOW)
+
+    def test_with_a_mail_account_the_address_still_has_to_be_proved(
+        self, change_for, phone_only, db_path, build_channel
+    ):
+        """Two steps, not one, even from ``None``.
+
+        With mail configured the account does not simply gain the address: a code
+        goes to it and the change waits. That is the same shape as a move, and it
+        is the right one - the point of the code is to show the address is *yours*,
+        and that is no less true of an address an account has never held.
+        """
+        channel = build_channel()
+
+        outcome = change_for(phone_only.user_id, channel=channel).execute(
+            NEW_ADDRESS, PASSWORD, NOW
+        )
+
+        assert outcome.applied is False
+        assert outcome.email == NEW_ADDRESS
+        assert requests_in(db_path) == 1
+        assert channel.sent, "the code must go to the address being claimed"
+
+
 class TestWhatIsRefused:
     """Five refusals, and the order they are reachable in is load-bearing."""
 
@@ -537,7 +693,11 @@ class TestWhatIsRefused:
         uow = SqliteUnitOfWorkFactory(db_path).start()
         try:
             user = User(
-                user_id=uuid4(), email=ADDRESS, google_subject=None, created_at=NOW
+                user_id=uuid4(),
+                email=ADDRESS,
+                phone=None,
+                google_subject=None,
+                created_at=NOW,
             )
             uow.users.save(user)
             uow.commit()

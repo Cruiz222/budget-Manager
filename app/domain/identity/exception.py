@@ -20,6 +20,9 @@ the middle of a phase that touches every read in the codebase.
 """
 
 from app.domain.money.exception import MoneyError
+from app.domain.money.money import Money
+
+from .limitKind import LimitKind
 
 
 class IdentityError(MoneyError):
@@ -38,6 +41,42 @@ class InvalidUserIDError(IdentityError):
 
 class InvalidUserEmailError(IdentityError):
     pass
+
+
+class InvalidUserPhoneError(IdentityError):
+    """The number is blank, the wrong type, not digits, or implausibly long.
+
+    **Deliberately not a phone number grammar**, following
+    ``InvalidProfilePhoneError`` below: whether a number is *dialable* is a
+    question for the SMS provider, and a regex here would refuse the
+    international formats it had not thought of - the same argument
+    ``checked_email`` makes for its ``@`` and nothing more.
+
+    The distinction from ``InvalidProfilePhoneError`` is worth stating, because
+    the two look alike and are not. That one guards a free-text KYC field nothing
+    is ever sent to. This one guards an **identifier**: the value is folded to one
+    canonical spelling, carries a ``UNIQUE`` constraint, and is the address a
+    credential is delivered to. So it is stricter about *shape* - digits only, a
+    plausible length - while remaining exactly as permissive about dialability as
+    its sibling.
+    """
+
+
+class InvalidUserIdentifierError(IdentityError):
+    """An account was built with neither an email address nor a phone number.
+
+    **The one invariant on ``User`` that is about the pair rather than either
+    member.** An account holding neither cannot be logged into, cannot be mailed,
+    cannot be texted, and cannot be found by any query this system has - there is
+    no flow that could ever reach it and no way for its owner to prove they are
+    its owner. So it is not a state worth representing, and refusing it at
+    construction means the repository's load path refuses it too.
+
+    Note what is *not* required: both. An account with either identifier is
+    reachable, and ``google_subject`` is deliberately not counted as one - it is
+    an identity Google issued and a login Google performs, so on its own it is not
+    something this system can deliver a credential to.
+    """
 
 
 #: The address is a well-formed address that cannot work.
@@ -78,6 +117,27 @@ class UserNotFoundError(IdentityError):
 #: people register one address and discover it at the login form. ``LogIn``
 #: deliberately does not behave this way; see ``InvalidCredentialsError``.
 class DuplicateEmailError(IdentityError):
+    pass
+
+
+#: The number is already held by an account.
+#:
+#: ``DuplicateEmailError`` one identifier over, and it is raised from the same
+#: place in the same shape - ``UNIQUE`` caught at the door rather than at the
+#: store's integrity error, because the caller needs a sentence and not a
+#: ``sqlite3.IntegrityError``.
+#:
+#: **Where it is raised is the interesting difference, and it is a whole step
+#: later than its sibling.** An address is refused at the *request*, because
+#: ``SignUp`` writes the account in the same breath as it names the address; a
+#: number is refused at the **confirm**, because the request half deliberately
+#: does not ask whether the number is taken. That is not an oversight to be tidied
+#: up - asking would turn an unauthenticated endpoint into a cheap oracle over a
+#: space as small as a phone number's, and answering it would cost nothing an
+#: attacker does not already have while *telling* them costs the whole of the
+#: answer. By the time this is raised the person has proved they hold the handset,
+#: so the sentence it carries is one they are entitled to read.
+class DuplicatePhoneError(IdentityError):
     pass
 
 
@@ -358,3 +418,247 @@ class PasswordResetExpiredError(IdentityError):
 #: two-minute fix and an afternoon of guessing.
 class NoMailAccountError(IdentityError):
     pass
+
+
+# ---------------------------------------------------------------------------
+# Proving a number belongs to the person typing it
+# ---------------------------------------------------------------------------
+#
+# The same three groups as above, one aggregate along, and the split between them is
+# the same split for the same reason. What is *not* here is worth counting: a phone
+# verification carries a payload of exactly one field - the number - and that field
+# is the table's key rather than a value being moved, so the classes below are one
+# fewer than ``EmailChange``'s for the same reason ``PasswordReset``'s are: there is
+# nothing on the row to validate that the key does not already cover.
+#
+# Every one of these is a type-guard rather than a policy, and in practice means a
+# repository that mapped a column wrongly.
+class InvalidPhoneVerificationIDError(IdentityError):
+    pass
+
+
+class InvalidPhoneVerificationPhoneError(IdentityError):
+    """The number on the row is not a string at all.
+
+    **This is the type check and not the shape rule**, exactly as
+    ``InvalidEmailChangeNewEmailError`` is: a number that is a string but badly
+    shaped is refused by ``checked_phone`` as ``InvalidUserPhoneError``, which is the
+    right answer because the shape rule is ``User``'s and is deliberately shared.
+    This class exists for the case that rule cannot describe - a value that is not
+    even a string, which is a mix-up in the store rather than a bad number.
+    """
+
+
+class InvalidPhoneVerificationTokenHashError(IdentityError):
+    pass
+
+
+class InvalidPhoneVerificationStatusError(IdentityError):
+    pass
+
+
+class InvalidPhoneVerificationRequestedAtError(IdentityError):
+    pass
+
+
+class InvalidPhoneVerificationExpiresAtError(IdentityError):
+    pass
+
+
+class InvalidPhoneVerificationWindowError(IdentityError):
+    pass
+
+
+class InvalidPhoneVerificationSettledAtError(IdentityError):
+    pass
+
+
+#: The code is unknown, or names a number whose row no longer exists.
+#:
+#: One class for both, for ``InvalidEmailChangeTokenError``'s reason exactly: a caller
+#: who can tell "no such code" from "a code whose row vanished" has an oracle, and the
+#: remedy is the same either way.
+#:
+#: **Deliberately not shared with the two below, and not shared with the request
+#: trios above either.** The three refusals here are the same three a reset has, but a
+#: caller that catches one is catching a fact about *this* request, and a shared
+#: vocabulary across two features would mean a change to one had to be reasoned about
+#: in terms of the other. See ``PhoneVerificationStatus`` for the same argument one
+#: layer down.
+class InvalidPhoneVerificationTokenError(IdentityError):
+    pass
+
+
+#: The verification has already been answered.
+#:
+#: Reachable only because the row survives being spent - deleting it on use would
+#: collapse this into ``InvalidPhoneVerificationTokenError`` and lose the difference
+#: between "you already did this" and "that code means nothing". It is the one of the
+#: three siblings where that difference is **least** useful to the person and still
+#: worth keeping: a reset is re-presented by someone who forgot which mail they
+#: answered, whereas a spent verification here means the account was created, so the
+#: actionable response is to log in rather than to read this at all. It stays for the
+#: reason the row stays - the message is not this class's to write, and a caller that
+#: wants to say "you already have an account, log in" needs to be able to tell.
+class PhoneVerificationAlreadyUsedError(IdentityError):
+    pass
+
+
+#: The verification's window closed before it was answered.
+#:
+#: Derived and never written, exactly as ``EmailChangeExpiredError`` and
+#: ``PasswordResetExpiredError`` are.
+class PhoneVerificationExpiredError(IdentityError):
+    pass
+
+
+#: This installation has no SMS account, so a number cannot be proven.
+#:
+#: ``NoMailAccountError`` one channel over, and its whole argument applies unchanged:
+#: it is a fact about the *installation* rather than about an account, the reason
+#: string is composed by the builder that knows the settings and names the missing
+#: variable, and it is raised by the use case rather than by a presentation dependency
+#: so that the CLI and the API render one identical sentence. Read that class for why
+#: each of those is so.
+#:
+#: **What is different is that this one has no fallback at all, where mail's has
+#: one.** A mail-less installation can still apply an address change - the request
+#: applies on the password proof alone - so ``NoMailAccountError`` names the one flow
+#: that genuinely cannot proceed. A number has no second proof: the reason to believe
+#: somebody holds a handset *is* a message arriving on it, so an installation that
+#: cannot send texts cannot verify numbers, and refusing is not a missing feature but
+#: the only thing that is true. The same applies to a password reset that names a
+#: number rather than an address, which is why this class is raised by more than one
+#: use case rather than by the signup alone.
+class NoSmsAccountError(IdentityError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Profile (who the account holder is, as opposed to which account they hold)
+# ---------------------------------------------------------------------------
+#
+# The first group in this file that is mostly *policy* rather than type-guard,
+# and the difference is worth marking: a session's field checks exist to catch a
+# repository that mapped a column wrongly, whereas a profile's exist to catch a
+# person who typed something that is not a name. The two are split below rather
+# than mixed, so a caller can tell which kind of refusal it is holding.
+#
+# One class per field, for the reason the top of this file gives and for a
+# sharper version of it here: these refusals reach a form, and "that is not a
+# phone number" is only useful if it says *which* field it is about. A shared
+# ``InvalidProfileFieldError`` would make every one of them say the same thing.
+class InvalidProfileUserIDError(IdentityError):
+    pass
+
+
+class InvalidProfileCreatedAtError(IdentityError):
+    pass
+
+
+class InvalidProfileUpdatedAtError(IdentityError):
+    pass
+
+
+class InvalidProfileWindowError(IdentityError):
+    pass
+
+
+class InvalidProfileDisplayNameError(IdentityError):
+    """The display name is missing, blank, the wrong type, or absurdly long.
+
+    The only *required* field on a profile, which is why this class exists at
+    all while the five identity fields below it are optional. See
+    ``app.domain.identity.profile`` for why a profile with nothing in it is
+    refused rather than stored.
+    """
+
+
+class InvalidProfileDateOfBirthError(IdentityError):
+    """The date of birth is not a ``date`` - and ``datetime`` is refused too.
+
+    **The one field in this codebase where ``datetime`` is the wrong answer.**
+    Every other aggregate refuses a bare ``date`` because a moment stamped with
+    a day has lost its time; a birth date has no time to lose, and accepting a
+    ``datetime`` would store a midnight nobody was born at. See
+    ``Profile``'s docstring, which carries the argument and its inversion.
+    """
+
+
+class InvalidProfileLegalNameError(IdentityError):
+    """A legal name is blank, the wrong type, or absurdly long.
+
+    Covers both halves - ``legal_first_name`` and ``legal_last_name`` - because
+    they share one rule and a caller acts on them identically. Contrast the
+    field classes above and below, which are separate because their rules
+    genuinely differ.
+    """
+
+
+class InvalidProfilePhoneError(IdentityError):
+    """The phone number is blank, the wrong type, or absurdly long.
+
+    **Deliberately not a phone number grammar.** What this refuses is the value
+    that is obviously not one; whether a number is dialable is a question for
+    the SMS provider that does not exist yet, and a regex here would refuse the
+    international formats it had not thought of - the same argument
+    ``checked_email`` makes for its ``@`` and nothing more.
+    """
+
+
+class InvalidProfileCountryError(IdentityError):
+    """The country is not a two-letter code.
+
+    A *shape* rule and not a membership check, and the distinction is the whole
+    of the class: see ``Profile._checked_country`` for why a hand-written list
+    of ISO 3166 codes is the wrong thing to build here.
+    """
+
+
+class InvalidProfileAddressError(IdentityError):
+    """The address line is blank, the wrong type, or absurdly long.
+
+    Note what is **not** validated: that the address is real. An address is
+    confirmed by mailing something to it or by the identity check that has not
+    been built, and no amount of parsing changes that - ``checked_email``'s
+    argument applied to a street.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Tier limits (what an account is allowed to move)
+# ---------------------------------------------------------------------------
+class TierLimitExceededError(IdentityError):
+    """A movement was refused because it breached the account's tier limits.
+
+    **Carries the three facts an audit needs, and not just a sentence.** ``kind``
+    says which ceiling refused it, ``limit`` says what the ceiling was, and
+    ``attempted`` says what the value would have been - so "was this refused for
+    the per-transaction ceiling or the daily cap?" is answerable from the row
+    rather than by reading prose, which is ``RunBlockReason``'s argument for
+    being an enum arriving one layer over at the exception that reports it.
+
+    ``attempted`` means something slightly different per kind and that is
+    deliberate rather than sloppy: for a per-transaction breach it is the
+    movement, for a daily breach it is the day's total *including* this movement,
+    and for a balance breach it is the balance the wallet would have held. In
+    every case it is the number that was compared against ``limit`` - which is
+    the only reading under which the two fields can be checked against each other
+    later without re-deriving which comparison this was.
+
+    Deriving from ``IdentityError`` puts it under ``MoneyError``, and that is
+    load-bearing rather than tidy: ``WalletService._run`` catches ``MoneyError``
+    to record a refusal in the audit trail and commit it, and a limit refusal has
+    to travel that same path. An exception root outside the tree would be a
+    refusal the ledger never hears about, which is the one thing a financial
+    control must not be.
+    """
+
+    def __init__(
+        self, kind: LimitKind, limit: Money, attempted: Money, message: str
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.limit = limit
+        self.attempted = attempted
+

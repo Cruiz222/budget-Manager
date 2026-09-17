@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -13,6 +14,12 @@ from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
 from app.application.wallet_operation import WalletOperation
 from app.application.withdraw.withdraw_money import WithdrawMoney
+from app.domain.identity.tier import (
+    check_credit,
+    check_outflow,
+    limit_day_bounds,
+    tier_for,
+)
 from app.domain.money.confirmation import Confirmation
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.confirmationStatus import ConfirmationStatus
@@ -32,6 +39,7 @@ from app.domain.money.money import Money
 from app.domain.money.reference import scoped_reference
 from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
+from app.domain.money.transactionType import OUTBOUND_TYPES, TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notificationKind import NotificationKind
@@ -418,6 +426,7 @@ class WalletService:
             confirmation.internal_reference,
             confirmation=confirmation,
             confirmation_as_of=as_of,
+            now=as_of,
         )
 
     def _payout_from_available(
@@ -431,6 +440,7 @@ class WalletService:
             destination=confirmation.destination,
             confirmation=confirmation,
             confirmation_as_of=as_of,
+            now=as_of,
         )
 
     def _payout_from_locked(
@@ -469,6 +479,7 @@ class WalletService:
             as_of=as_of,
             confirmation=confirmation,
             confirmation_as_of=as_of,
+            now=as_of,
         )
 
     # --- pots ---------------------------------------------------------------
@@ -827,6 +838,7 @@ class WalletService:
         destination: Destination | None = None,
         confirmation: Confirmation | None = None,
         confirmation_as_of: datetime | None = None,
+        now: datetime | None = None,
         **extra,
     ) -> Transaction:
         """Open a unit, build the operation against the loaded wallet, run it.
@@ -850,6 +862,26 @@ class WalletService:
         consumed by ``_claim`` and must never reach an operation's constructor,
         which would be a parameter the operation has no idea it accepted.
 
+        ``now`` is the third moment this method takes, and it is the same moment
+        as ``as_of`` at every call site for the reason ``_payout_from_locked``
+        gives about the other two: one command is happening. It is a separate
+        name because it answers a separate question - *which limit-day is this
+        movement in* - and because it has to be a named parameter to be read here
+        at all, while ``as_of`` still has to keep travelling through ``**extra``
+        to the pot-scoped constructors that judge maturity. It is optional
+        because only a movement *out* needs it: a credit is judged against the
+        balance it would produce and an internal move faces no ceiling, so
+        neither reads a day. An outflow that reached here without one would be a
+        bug in this class rather than a caller's mistake, and ``_ceiling`` says
+        so.
+
+        **``now`` has two readers and they agree by construction.** ``_ceiling``
+        computes the limit-day from it, and ``operation.now`` stamps the row that
+        day total will later be summed from. One value, one day - which is the
+        property the daily cap needs and the reason the stamp is set here rather
+        than left to ``Transaction``'s default of the clock. See
+        ``WalletOperation.now``.
+
         **A refusal spends the confirmation, on this path.** ``except MoneyError``
         commits - it has to, or the FAILED row it just wrote would be lost - and
         the claim went into that same unit, so both land together. A client whose
@@ -869,6 +901,18 @@ class WalletService:
             operation: WalletOperation = operation_cls(
                 wallet, uow.transactions, **extra
             )
+            # The ceilings this movement faces, read here rather than in a use
+            # case above, and *before* ``execute`` writes the row below - see
+            # ``_ceiling`` for why the reading has to be this early and the
+            # verdict cannot be.
+            operation.guard = self._ceiling(uow, wallet, operation_cls, now)
+            # The same moment again, this time onto the row ``execute`` is about
+            # to write. A movement judged in a limit-day must be *recorded* in it
+            # or the day total the next movement reads would not contain it - so
+            # the stamp and the ceiling have to come from one value, which is why
+            # this line sits beside the one above rather than near the write it
+            # affects. See ``WalletOperation.now``.
+            operation.now = now
             transaction = operation.execute(
                 amount,
                 scoped_reference(wallet.wallet_id, internal_reference),
@@ -907,6 +951,84 @@ class WalletService:
         else:
             uow.commit()
             return transaction
+
+    def _ceiling(
+        self,
+        uow: UnitOfWork,
+        wallet: Wallet,
+        operation_cls,
+        now: datetime | None,
+    ) -> Callable[[Money], None] | None:
+        """The tier ceilings this movement faces, bound to the values they compare.
+
+        Returns a callable rather than a verdict, and the delay is the design:
+        ``check_credit``/``check_outflow`` are asked by ``WalletOperation.execute``
+        *after* it has written the PENDING row, so the error they raise is caught
+        by the very ``except MoneyError`` every other refusal goes through and
+        lands on the ledger as FAILED. A verdict reached here, one layer up,
+        would be a refusal with no row - and "how many movements did this cap turn
+        away this week?" is not a question prose answers. See
+        ``WalletOperation.guard``.
+
+        **What has to be read here rather than in the guard**, and the two
+        directions differ in it:
+
+        - An outflow's day total is read *now*, once, and captured - because a
+          PENDING row counts toward its own day (see
+          ``TransactionRepository.outflow_total_between``), so a total read at
+          guard time would include the movement it is meant to judge and refuse
+          at half the cap.
+        - A credit's balance is read *at guard time*, off the wallet captured
+          here, because that is the moment before ``_apply`` mutates it. Nothing
+          between the two moments moves money - writing a ledger row does not -
+          so it is the pre-movement balance either way.
+
+        ``tier_for`` is handed whatever ``find_for_user`` returns, which is
+        ``None`` for every account that has never filled a profile in. That is the
+        ordinary state of every account that existed before this feature, and it
+        answers ``UNVERIFIED`` rather than raising, so a missing profile is not a
+        new way for a withdrawal to fail.
+
+        **Which movement faces which ceiling is a classification, not a guess.**
+        ``TransactionType.OUTBOUND_TYPES`` is the two types that carry value
+        across the wallet's edge; the two internal members fall past both branches
+        to ``None`` on purpose, because moving money into a pot is not spending
+        it. A fifth member of that enum cannot quietly end up outside the cap -
+        a test over the enum requires it to be placed on one side or the other.
+
+        ``now`` is required for an outflow and unread by everything else. An
+        outflow that reached here without one is a *bug in this class* rather than
+        a caller's mistake, which is why it raises ``ValueError`` and not one of
+        the domain's own classes - and why that matters: it is not a
+        ``MoneyError``, so it rolls the unit back instead of committing a FAILED
+        row. A refusal the caller could have avoided is recorded; a bug is not
+        dressed up as one.
+        """
+        tier = tier_for(uow.profiles.find_for_user(wallet.user_id))
+        transaction_type = operation_cls.transaction_type
+
+        if transaction_type is TransactionType.DEPOSIT:
+            # Available and locked together, because a pot is money this account
+            # still holds - see ``check_credit``.
+            return lambda amount: check_credit(
+                tier, wallet.available_balance + wallet.locked_balance + amount
+            )
+
+        if transaction_type in OUTBOUND_TYPES:
+            if now is None:
+                raise ValueError(
+                    f"{operation_cls.__name__} moves value out of the wallet and "
+                    "was run without a moment, so the limit-day it belongs to "
+                    "cannot be named"
+                )
+            day_start, day_end = limit_day_bounds(now)
+            outflow_today = uow.transactions.outflow_total_between(
+                wallet.wallet_id, day_start, day_end, wallet.currency
+            )
+            return lambda amount: check_outflow(tier, amount, outflow_today)
+
+        # LOCK_FUNDS and UNLOCK_FUNDS: the wallet's own two balances, reshuffled.
+        return None
 
     def _announce(
         self,

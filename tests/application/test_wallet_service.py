@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
@@ -566,12 +566,22 @@ def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path, build_wal
     contacted. Listing the statuses by hand rather than filtering them keeps the
     contrast on screen - a deposit settles here, a withdrawal does not, and both
     are rows in the same ledger.
+
+    **The withdrawal is stamped a minute after the deposit, and that offset is
+    the point rather than a convenience.** The two rows are written from two
+    frames deliberately: a deposit records the clock, because no decision reads
+    its moment, while a movement *out* records the moment it was judged in - the
+    day the daily cap sums its allowance from (see ``WalletOperation.now``). An
+    order between a row from each frame is therefore not a fact about this
+    service until the test puts them in one frame, which is what
+    ``deposited.created_at`` below does. Note it reads the *record's* stamp, not
+    the clock, so this file's rule that no test here reads a clock still holds.
     """
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
 
-    service.deposit(
+    deposited = service.deposit(
         wallet.wallet_id,
         Money(Decimal("5000"), NGN),
         internal_reference=str(uuid4()),
@@ -581,6 +591,7 @@ def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path, build_wal
         wallet.wallet_id,
         Money(Decimal("2000"), NGN),
         internal_reference=str(uuid4()),
+        now=deposited.created_at + timedelta(minutes=1),
     )
 
     ledger = service.transactions_for_wallet(wallet.wallet_id)

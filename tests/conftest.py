@@ -33,6 +33,7 @@ from app.infrastructure.payments.paystack_payment_provider import (
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
+from app.infrastructure.settings import TermiiSettings
 from app.presentation.cli import _write_token
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
@@ -41,7 +42,9 @@ from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.notifications.exception import SmsProviderError
 from app.domain.notifications.notificationChannel import NotificationChannel
+from app.domain.notifications.smsChannel import SmsChannel
 from app.domain.payments.exception import PaymentProviderError
 from app.domain.payments.paymentIntent import PaymentIntent
 from app.domain.payments.providerAnswer import ProviderAnswer
@@ -324,6 +327,17 @@ SETTINGS_VARIABLES = (
     "BUDGET_DB",
     "BUDGET_SESSION",
     "PAYSTACK_SECRET_KEY",
+    # ``TERMII_API_KEY`` and ``TERMII_SENDER_ID`` are the newest pair, and they are
+    # here for the same class of reason ``BUDGET_SESSION`` is - with one difference
+    # that makes them the more urgent of the two. A developer with an SMS key
+    # exported does not merely get a *wrong* value; ``build_request_phone_verification``
+    # would resolve the real ``TermiiSmsChannel`` from the environment, and the
+    # suite would then open a socket and send a **billable text message** from
+    # whichever test ran first. Nothing would fail: the code would be texted to a
+    # number no test owns and the assertion would be about a channel the test never
+    # held. Clearing them is what keeps the seam a seam.
+    "TERMII_API_KEY",
+    "TERMII_SENDER_ID",
 )
 
 
@@ -373,6 +387,21 @@ CHANGE_CODE_LABEL = "present this code to confirm it"
 #: shared prefix plus a mixed-up ``sent`` list would produce - would not be told
 #: apart from a passing one.
 RESET_CODE_LABEL = "present this code to choose a new password"
+
+#: The sentence above the code in ``verification_code_message``.
+#:
+#: **The third constant, and the reason the parameter on ``code_in`` exists.** All
+#: three bodies now carry a code under a sentence, and the three sentences share
+#: the words "present this code to" - so a label that was a prefix of another would
+#: find whichever body came first in a mixed-up ``sent`` list and report a passing
+#: test about the wrong message. The three are deliberately distinguished by their
+#: verbs: *confirm it* (an address change), *choose a new password* (a reset), and
+#: *create your account* (a signup).
+#:
+#: It is also the only one of the three whose message has no ``subject``, which
+#: ``code_in`` never reads - it splits ``body`` - so the helper works on an
+#: ``PhoneVerificationSms`` without knowing it is one.
+SIGNUP_CODE_LABEL = "present this code to create your account"
 
 
 def code_in(message, label: str = CHANGE_CODE_LABEL) -> str:
@@ -563,10 +592,24 @@ def build_user():
     ``build_user()`` and ``TEST_USER_ID`` describe one account rather than two
     that look alike. Tests about lookup pass a different address through
     ``email=``.
+
+    **``phone`` is a dial rather than a default**, and that is the difference
+    between the two identifiers here. An account's address is assumed by almost
+    every test in the suite - it is the identifier the deposit path hands to
+    Paystack and the one the email flows address - so defaulting it would be
+    right and defaulting a number would not. A phone is the subject of a handful
+    of tests, and each of those has a particular number in mind, so the default is
+    ``None``: it is "this account has no number", which is true of every account
+    the suite built before there was a column for one.
+
+    ``email`` accepts ``None`` alongside it, so a test can build the phone-only
+    account the two-identifier rule permits. Passing *neither* is refused by
+    ``User`` itself rather than here - see ``InvalidUserIdentifierError``.
     """
 
     def _build(
-        email: str = TEST_USER_EMAIL,
+        email: str | None = TEST_USER_EMAIL,
+        phone: str | None = None,
         user_id: UUID = TEST_USER_ID,
         google_subject: str | None = None,
         created_at: datetime = POT_MOMENT,
@@ -574,6 +617,7 @@ def build_user():
         return User(
             user_id=user_id,
             email=email,
+            phone=phone,
             google_subject=google_subject,
             # ``POT_MOMENT`` rather than ``datetime.now()``, for the reason every
             # other moment in this module is fixed: an assertion about a stored
@@ -598,6 +642,144 @@ def build_channel():
 
     def _build(failures=()) -> FakeChannel:
         return FakeChannel(failures=failures)
+
+    return _build
+
+
+#: Shaped like a Termii key - recognisable as a test value rather than mistakable
+#: for a live credential, and prefixed the way a real one is. It is not a
+#: credential: it is a string two functions in one process agree about.
+#:
+#: There is no ``TEST_TERMII_SECRET`` beside it, because Termii authenticates with
+#: one value rather than a pair, and the sender id below is not a secret - it is
+#: the name a recipient sees. Both are here so that a test which printed one would
+#: read as a test value, which is the whole reason ``TEST_PAYSTACK_SECRET`` is
+#: spelled the way it is.
+TEST_TERMII_API_KEY = "TL_test_" + "0" * 32
+
+#: A registered-looking sender id, at the length ceiling the real one allows.
+TEST_TERMII_SENDER_ID = "BudgetMgr"
+
+#: A complete SMS account, for the tests that need ``_sms_channel_for`` to take the
+#: branch under test rather than the absent one.
+#:
+#: Two fields and both present, which is the whole reason this exists as a constant
+#: rather than as two arguments spelled out per file: ``TermiiSettings`` describes a
+#: conversation that *can* happen, so a half-filled one is refused by
+#: ``describe_termii_configuration`` and the reader returns ``None`` - and a test
+#: written against one of those would be asserting about the unconfigured install
+#: while believing it was testing the configured one. The values themselves are
+#: never dialled: the adapter is replaced at the seam, exactly as the mail tests do
+#: it, so this is the pair that makes the *branch* reachable and nothing more.
+TEST_TERMII_SETTINGS = TermiiSettings(
+    api_key=TEST_TERMII_API_KEY, sender_id=TEST_TERMII_SENDER_ID
+)
+
+#: The characters an SMS recipient may be written in, as the provider accepts them.
+#:
+#: Quoted from Termii's API contract, which takes ``to`` in international format
+#: with no leading ``+`` and no national trunk ``0`` - the same shape
+#: ``phoneNumber.fold_phone`` produces, which is what makes the producer and the
+#: provider agree by construction rather than by luck.
+#:
+#: **A second copy of the rule, deliberately, and this one is the third.** It
+#: could be imported from ``app.infrastructure.notifications.termii_sms_channel``,
+#: and importing it would make this agree with the channel's guard by construction
+#: rather than by being right - see ``FakePaymentProvider``'s docstring for what
+#: that cost the last time. The deposit route sent Paystack a reference containing
+#: a character Paystack refuses, and every copy of the rule involved had been
+#: derived from the others, so the suite could not see it.
+_TERMII_RECIPIENT_ALPHABET = frozenset("0123456789")
+
+#: The longest sender id Termii accepts. See ``_TERMII_RECIPIENT_ALPHABET`` for why
+#: this is written out rather than imported.
+_TERMII_MAX_SENDER_ID_LENGTH = 11
+
+
+class FakeSmsChannel(SmsChannel):
+    """An SMS channel that records instead of sending, and refuses what Termii refuses.
+
+    ``FakeChannel``'s shape - attempts, sent, and a queue of failures - with one
+    thing added, and that thing is the reason this class exists rather than a
+    second use of the mail fake. **It refuses the messages the real provider
+    refuses**, so a bug of the kind this project has already paid for is visible
+    from inside the suite.
+
+    The bug in question is the one ``FakePaymentProvider``'s docstring records: the
+    deposit route sent Paystack a reference with a colon in it, Paystack refused
+    every deposit, and 2,042 passing tests could not see it because the fake
+    accepted any string it was handed. The same shape of gap lives here. An SMS
+    recipient is *folded* by ``phoneNumber.fold_phone``, and if that fold stops
+    producing international digits - a trunk ``0`` left on, a ``+`` surviving - the
+    real Termii would refuse every message while this suite stayed green. So the
+    refusal is encoded here, out of the provider's documentation rather than out of
+    the fold, which is what makes a change on one side fail on the other.
+
+    **It duplicates the adapter's guard and not the adapter's shape**, and the
+    asymmetry is on purpose. Both statements are of the same rule, written
+    separately, so they can disagree - and they are written differently enough
+    (this one tests the alphabet and the trunk digit, the adapter names each shape
+    in its own sentence) that a shared blind spot is less likely than if one had
+    been copied from the other character for character.
+
+    It does *not* encode the provider's success code, because there is no wire here
+    to carry one: a ``code`` that is not ``ok`` is a fact about a response body, and
+    a fake that never sends a request has no body to judge. That half is the
+    adapter's, tested in ``tests/infrastructure/notifications``, where a recording
+    double stands in for ``httpx.post``.
+    """
+
+    def __init__(self, failures=(), sender_id: str = TEST_TERMII_SENDER_ID):
+        self.attempts: list = []
+        self.sent: list = []
+        self._failures = list(failures)
+        self._sender_id = sender_id
+
+    def send(self, message) -> None:
+        self.attempts.append(message)
+
+        # The provider's rule, checked before the scripted failures are consulted,
+        # because a message the far end would refuse never becomes a retry - it is
+        # a bug that no amount of trying again will fix, and a test that scripted a
+        # failure alongside a malformed recipient should see the malformed
+        # recipient.
+        if not message.recipient or not set(message.recipient) <= (
+            _TERMII_RECIPIENT_ALPHABET
+        ):
+            raise SmsProviderError(
+                "the SMS provider refused the message: the recipient is not in "
+                "international format (digits only, no leading '+')"
+            )
+
+        if message.recipient.startswith("0"):
+            raise SmsProviderError(
+                "the SMS provider refused the message: the recipient still "
+                "carries a national trunk prefix"
+            )
+
+        if len(self._sender_id) > _TERMII_MAX_SENDER_ID_LENGTH:
+            raise SmsProviderError(
+                "the SMS provider refused the message: the sender id is longer "
+                f"than {_TERMII_MAX_SENDER_ID_LENGTH} characters"
+            )
+
+        if self._failures:
+            raise self._failures.pop(0)
+
+        self.sent.append(message)
+
+
+@pytest.fixture
+def build_sms_channel():
+    """Return a fresh :class:`FakeSmsChannel`, optionally told to fail sends.
+
+        build_sms_channel()                                # every send succeeds
+        build_sms_channel(failures=[SmsProviderError("down")])
+        build_sms_channel(sender_id="a-name-that-is-far-too-long")
+    """
+
+    def _build(**kwargs) -> FakeSmsChannel:
+        return FakeSmsChannel(**kwargs)
 
     return _build
 
@@ -748,6 +930,15 @@ class RecordingTransactionRepository(TransactionRepository):
         raise NotImplementedError
 
     def list_awaiting_provider(self):
+        raise NotImplementedError
+
+    def outflow_total_between(self, wallet_id, start, end, currency):
+        # Not implemented, like the four reads above, and here the reason is
+        # worth a line because this one *aggregates*: the rows this class keeps
+        # are snapshots of a transaction saved twice, so a sum over ``saved``
+        # would count the PENDING hold and the SUCCESSFUL debit as two
+        # movements. A test that needs a day's total asks the real repository,
+        # through a real unit of work, where the row is one row.
         raise NotImplementedError
 
 

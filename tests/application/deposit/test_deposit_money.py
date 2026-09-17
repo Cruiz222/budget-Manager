@@ -63,6 +63,14 @@ class RecordingTransactionRepository(TransactionRepository):
         # grown under one of them.
         raise NotImplementedError
 
+    def outflow_total_between(self, wallet_id, start, end, currency):
+        # The third time, and this one is the daily-outflow cap's read. Not
+        # implemented here for the reason above and for one more: a deposit is
+        # not an outflow, so no test in this module has a daily total to serve -
+        # and a stub that returned a number would be this copy inventing a rule
+        # about which rows count.
+        raise NotImplementedError
+
 
 # --- Successful deposit ---
 

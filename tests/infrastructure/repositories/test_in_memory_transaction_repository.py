@@ -1,6 +1,9 @@
 from uuid import uuid4
 import pytest
 from datetime import datetime
+from decimal import Decimal
+from app.domain.money.destination import Destination
+from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.transaction import Transaction
@@ -225,4 +228,150 @@ def test_list_awaiting_provider_is_empty_when_nothing_is_in_flight():
     repository = InMemoryTransactionRepository()
 
     assert repository.list_awaiting_provider() == []
+
+
+# --- what left the wallet today --------------------------------------------
+#
+# The mirror of the section in ``test_sqlite_transaction_repository.py``. Two
+# stores, one rule, and the rule is worth stating twice rather than sharing a
+# helper: what makes these tests worth having is that each is written against its
+# own store, so an implementation that drifted from the port fails here instead of
+# passing on the strength of the other one.
+
+DAY_START = datetime(2026, 3, 2)
+DAY_END = datetime(2026, 3, 3)
+MIDDAY = datetime(2026, 3, 2, 12, 0)
+
+PAYOUT_DESTINATION = Destination(
+    kind=DestinationKind.BANK_ACCOUNT,
+    identifier="0123456789",
+    name="Chinedu Okafor",
+    details={"bank_code": "058"},
+)
+
+
+def build_outflow(wallet_id, **overrides):
+    """A movement of value out of ``wallet_id``, at ``MIDDAY`` by default."""
+    kwargs = dict(
+        wallet_id=wallet_id,
+        type=TransactionType.WITHDRAWAL,
+        amount=Money(Decimal("1000.00"), Currency.NGN),
+        internal_reference=str(uuid4()),
+        created_at=MIDDAY,
+    )
+    kwargs.update(overrides)
+    return Transaction(**kwargs)
+
+
+def outflow(repository, wallet_id, currency=Currency.NGN):
+    """That wallet's outflow over the day, with the window filled in."""
+    return repository.outflow_total_between(
+        wallet_id, DAY_START, DAY_END, currency
+    )
+
+
+def test_outflow_of_an_empty_ledger_is_zero_in_the_wallets_currency():
+    """Zero rather than ``None``, carrying the currency it was asked about."""
+    repository = InMemoryTransactionRepository()
+
+    total = outflow(repository, uuid4())
+
+    assert total == Money(0, Currency.NGN)
+    assert total.currency is Currency.NGN
+
+
+def test_outflow_counts_a_settled_withdrawal_and_a_held_payout():
+    """The two statuses whose money is not in the wallet, added together."""
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    withdrawal = build_outflow(wallet_id, amount=Money(Decimal("250.25"), Currency.NGN))
+    withdrawal.mark_successful()
+    payout = build_outflow(
+        wallet_id,
+        type=TransactionType.PAYOUT,
+        amount=Money(Decimal("749.75"), Currency.NGN),
+        destination=PAYOUT_DESTINATION,
+    )
+    for transaction in (withdrawal, payout):
+        repository.save(transaction)
+
+    assert payout.status is TransactionStatus.PENDING
+    assert outflow(repository, wallet_id) == Money(Decimal("1000.00"), Currency.NGN)
+
+
+@pytest.mark.parametrize(
+    ("transaction_type", "settle"),
+    [
+        # Never left the wallet: given back by the bank, or never sent at all.
+        (TransactionType.WITHDRAWAL, "failed"),
+        # Left and came back, which is the judgement call the port argues.
+        (TransactionType.WITHDRAWAL, "reversed"),
+        # Arrived, so it spends nothing.
+        (TransactionType.DEPOSIT, "successful"),
+        # Moved between the wallet's own two balances.
+        (TransactionType.LOCK_FUNDS, "successful"),
+        (TransactionType.UNLOCK_FUNDS, "successful"),
+    ],
+)
+def test_outflow_excludes_every_row_whose_money_is_in_the_wallet(
+    transaction_type, settle
+):
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    transaction = build_outflow(wallet_id, type=transaction_type)
+    if settle == "successful":
+        transaction.mark_successful()
+    elif settle == "failed":
+        transaction.mark_failed()
+    else:
+        transaction.mark_successful()
+        transaction.reverse()
+    repository.save(transaction)
+
+    assert outflow(repository, wallet_id) == Money(0, Currency.NGN)
+
+
+def test_outflow_window_is_half_open():
+    """``start`` inclusive, ``end`` exclusive - so the two days partition time.
+
+    The row stamped exactly at midnight belongs to the day that is beginning, so
+    asking the day before gives nothing while the day after gives it back.
+    """
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    at_midnight = build_outflow(wallet_id, created_at=DAY_END)
+    at_midnight.mark_successful()
+    before_midnight = build_outflow(wallet_id, created_at=DAY_START)
+    before_midnight.mark_successful()
+    for transaction in (at_midnight, before_midnight):
+        repository.save(transaction)
+
+    assert outflow(repository, wallet_id) == Money(Decimal("1000.00"), Currency.NGN)
+    assert repository.outflow_total_between(
+        wallet_id, DAY_END, datetime(2026, 3, 4), Currency.NGN
+    ) == Money(Decimal("1000.00"), Currency.NGN)
+
+
+def test_outflow_is_one_wallets_and_one_currencys():
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    mine = build_outflow(wallet_id, amount=Money(Decimal("300.00"), Currency.NGN))
+    theirs = build_outflow(uuid4(), amount=Money(Decimal("9000.00"), Currency.NGN))
+    foreign = build_outflow(
+        wallet_id,
+        # No ``currency`` argument, because a Transaction has no such parameter:
+        # its currency *is* the currency of its amount, and there is no second
+        # field that could disagree with it. That is the property the assertion
+        # below leans on - the filter cannot be handed a currency the row does not
+        # carry.
+        amount=Money(Decimal("500.00"), Currency.USD),
+    )
+    for transaction in (mine, theirs, foreign):
+        transaction.mark_successful()
+        repository.save(transaction)
+
+    assert outflow(repository, wallet_id) == Money(Decimal("300.00"), Currency.NGN)
+    assert outflow(repository, wallet_id, Currency.USD) == Money(
+        Decimal("500.00"), Currency.USD
+    )
 

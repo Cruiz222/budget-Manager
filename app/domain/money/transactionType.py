@@ -43,3 +43,34 @@ class TransactionType(Enum):
     # immediate locked -> available move; nothing about it is scheduled.
     UNLOCK_FUNDS = "unlock_funds"
     PAYOUT = "payout"
+
+
+#: The members whose money leaves the wallet for good.
+#:
+#: **This is the classification the daily outflow cap is built from**, and it is
+#: a named constant rather than a set assembled at the limit check because it is
+#: a fact about the *type* and not about the limits: a fifth member added above
+#: has to be placed on one side or the other, and
+#: ``test_every_transaction_type_is_classified`` in ``tests/domain/money`` fails
+#: until somebody does. A new movement type that fell silently through to "not an
+#: outflow" would be outside the cap - which is the direction a financial control
+#: must fail in the loud one.
+#:
+#: ``DEPOSIT`` is absent because it is value *arriving*, which the balance ceiling
+#: faces instead (see ``check_credit``); ``LOCK_FUNDS`` and ``UNLOCK_FUNDS`` are
+#: absent because they move money between the wallet's own two balances, which
+#: changes what the owner holds not at all. The axis is the table in the class
+#: docstring above.
+#:
+#: **The two repository adapters spell these same two members inside their
+#: ``outflow_total_between`` queries rather than reading this constant**, and the
+#: reason is that the clause binds a fixed number of parameters -
+#: ``AND type IN (?, ?)`` - so a constant that grew a member would need the SQL to
+#: grow with it, and a derived placeholder count would trade a readable query for
+#: a clever one. What keeps the two spellings together is
+#: ``tests/infrastructure/repositories/``, which exercises every member of this
+#: enum against both stores; a divergence there fails a test rather than
+#: silently widening the cap.
+OUTBOUND_TYPES: frozenset[TransactionType] = frozenset(
+    {TransactionType.WITHDRAWAL, TransactionType.PAYOUT}
+)

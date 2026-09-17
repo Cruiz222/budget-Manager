@@ -68,6 +68,34 @@ class UserRepository(ABC):
         and a second copy of the rule could disagree with the first. The
         disagreement would surface as a person unable to log in to an account
         that plainly exists.
+
+        Since an address is now optional on an account, there is a case where
+        this lookup could be asked about a value that does not exist: an account
+        with no email has ``NULL`` in the column, and SQL's ``=`` is never true of
+        ``NULL``, so such an account is simply not found by any address - which is
+        correct. What the caller must not do is hand this method ``None``, because
+        the fold is applied before the comparison; the implementations guard it.
+        """
+        pass
+
+    @abstractmethod
+    def find_by_phone(self, phone: str) -> User | None:
+        """Return the user holding this number, or None.
+
+        ``find_by_email``'s shape and its argument, one identifier over, and the
+        parallel is exact rather than approximate: the number is compared
+        **folded**, by the same function ``User`` calls on construction
+        (``identity.phoneNumber.fold_phone``), because the argument here is a
+        candidate number that has not been through a ``User`` yet and there is no
+        aggregate to take the fold from.
+
+        The fold is load-bearing in a way the email fold is not, which is worth
+        stating because it is easy to read both as tidiness. An address is only
+        ever written one way by a machine; a number is written ``08012345678``,
+        ``+2348012345678`` and ``2348012345678`` by *the same person on three
+        occasions*, so without one canonical spelling the ``UNIQUE`` column bounds
+        nothing and a login typed in the wrong form fails against an account that
+        plainly exists.
         """
         pass
 

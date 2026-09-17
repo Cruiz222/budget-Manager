@@ -4129,6 +4129,187 @@ keeps one shape and two dispositions, and the tests assert both halves by pastin
 code wrapped in whitespace and by setting a password with a trailing space that must
 survive to the login prompt.
 
+### Profiles, tiers, and the ceiling an amount meets
+
+This slice closes a hole the README had already named against itself (the
+entry-point audit, decision list below and `### Still open`): **amounts were refused
+for shape and never for size.** `Money` refused a non-finite value, a bool, a third
+decimal place and a foreign currency in arithmetic; `<= 0` was refused at two doors;
+and nothing refused an amount above any ceiling. The only thing that would is the
+provider, at the far end, after the request has left.
+
+It closes it with a *profile*, and that pairing is the design rather than a
+convenience. A KYC tier **is** a set of amount ceilings, so "give an account the
+identity fields a tier is derived from" and "give the tier teeth" are one job -
+built separately they would have been built twice, and the second version would have
+been free to disagree with the first about what a tier means.
+
+**192. A `Profile` is its own aggregate, keyed on `user_id`, and not a set of fields
+on `User`.** The reason is the one that gave `PasswordCredential` its own table:
+`User` is loaded by *every authenticated request* and rendered by `translate.user_out`,
+and personal identity data on that object is one forgotten omission away from being
+served to every caller who asks who they are. A separate aggregate makes the leak not
+a thing to remember but a thing that cannot happen - the profile is read by the two
+places that need it, under the actor's own id, and by nothing else.
+
+**193. A tier is derived from the profile on every read and never stored.** `tier_for`
+takes a `Profile | None` and answers `IDENTIFIED` only when the four fields a real
+identity check would confirm are all present, `UNVERIFIED` otherwise; `None` is a
+normal input and not an error, because every account that existed before this feature
+has no profile row. A stored tier would be a column free to disagree with the profile
+it describes, and the direction it drifts in is the dangerous one: an account reading
+`IDENTIFIED` over an empty profile. It also would have made this slice untestable
+until a verification provider existed - the derived version is exercisable today.
+
+**194. The limits are a table over every `(Tier, Currency)` pair, written out rather
+than converted.** `Money` carries an explicit currency and `Currency` has five
+members, so a limit scaled by an exchange rate would need a rate - and this system has
+none: no FX table, no rate provider, no moment at which a rate could be said to be
+current. A limit computed from a rate changes its meaning the day the rate moves, and
+a ceiling that moves on its own is not a ceiling. The five non-NGN columns are
+deliberately *lower* than the naira one rather than derived from it, because the
+currencies this system does not actually collect in are the ones it should be most
+careful about. `limits_for` raises `KeyError` for a missing pair rather than falling
+back to a default, and a test asserts the table covers the whole product of the two
+enums - so the failure is a test at build time rather than a `KeyError` in production
+the day somebody adds a sixth currency.
+
+**195. The unverified row is 50,000 a movement, 200,000 a day, 300,000 held.** Every
+existing account is on it on rollout, so these numbers decide whether an account that
+is moving money today still works tomorrow. They are set at the point below which a
+person's ordinary use of the product is untouched - a plan contribution, a withdrawal,
+a payout - and deliberately not so low that the limit is the first thing a new user
+meets, because a tier 0 that refuses ordinary use teaches people to hand over a date
+of birth to stop being annoyed, which is the wrong reason to give one. The balance cap
+is three days at the daily cap, which makes it a cap that can be *reached*: a cap
+nobody can reach is a cap that is never tested. The step to `IDENTIFIED` is an order
+of magnitude, which is the shape a tiered programme has in practice - and what it
+means is *we have their details*, not *we checked them*, since no provider verifies
+anything in this slice.
+
+**196. Each tier has three ceilings, and they are not three interchangeable dials.**
+The per-transaction ceiling and the daily cap face value *leaving*; the balance cap
+faces value *arriving*. So a credit is judged by the balance it would produce and
+nothing else - one large deposit into an empty wallet is bounded by the same number as
+a hundred small ones, so a per-transaction ceiling on inbound money would add nothing.
+And a movement out has no balance ceiling at all, deliberately: the balance cap is a
+statement about what a wallet may hold, a movement out can only lower it, and applying
+it there could only ever refuse to let somebody spend down towards a cap they are
+already above - a control turned into a trap. Each comparison is `>` and not `>=`, so
+a movement exactly at the ceiling is allowed; an allowance of 50,000 is worth 50,000.
+
+**197. The ceilings are enforced at confirm time, in `WalletService._run`, and not at
+request time.** `request_confirmation` already argues why the *balance* is not checked
+then: the check that can be relied on is the one at confirm time, and a second one
+earlier would be a weaker copy of the wallet's own rule free to disagree with it. A
+limit is the same shape of rule and gets the same answer. **The bypass this does not
+open** - the obvious objection - is that twenty recorded withdrawals confirmed in
+sequence do not get twenty movements through: each confirm reads the day's total
+inside its own unit, and the earlier confirms have already committed their rows, so
+the twentieth sees the nineteen before it and is refused. The request stays inert; the
+confirm is authoritative.
+
+**198. The limit check runs *inside* the operation, between the PENDING row and the
+movement, rather than before the operation starts.** This is a placement with an
+argument rather than a preference. Invariant 7 of this slice says every refusal is
+recorded, and the only way a refusal can be recorded is if it happens after the ledger
+row exists and inside the `try` that catches `MoneyError` - so the ceiling is a `guard`
+callable on `WalletOperation` that `execute` runs after saving the row and before
+`_apply`. `TierLimitExceededError` therefore derives from `IdentityError`, which is a
+`MoneyError`, and travels the same path every other refusal does: recorded FAILED and
+committed. An exception root outside that tree would have been a refusal the ledger
+never hears about, which is the one thing a financial control must not be. The same
+placement is why the day's total is read *before* the row is written: a PENDING row
+counts toward its own day, so a total read afterwards would include the movement in
+its own allowance and refuse at half the cap.
+
+**199. The unit of work opens with `BEGIN IMMEDIATE`, and it is not silently contained
+to this feature.** The deferred `BEGIN` it replaces takes a read lock and upgrades only
+at the first write, so two confirms can each read the same day's total *before* either
+writes - both pass, both commit, and the daily cap is breached by an amount neither of
+them did anything wrong by its own reading. SQLite's single-writer rule does not save
+it: both reads happen before either write, so the second write waits and then succeeds.
+`BEGIN IMMEDIATE` takes the write lock at the start, which makes the read and the write
+it authorises one critical section. That serialises money operations against each other
+(which SQLite does for writes anyway) at the cost of a unit holding the write lock for
+its whole life, read-only ones included - while readers still run together, since a
+reserved lock coexists with shared ones in the default rollback-journal mode. It
+affects every unit in the system and is called out for that reason rather than folded
+into the limit work.
+
+**200. A plan run is *blocked* by a ceiling, not stopped by it.** A plan-run payout
+never goes through `WalletService._run` - `_move_the_money` builds its operations
+directly, because a scheduled run has no confirmation and no person in it - so without
+a check of its own a plan would have been the one way to move money with no ceiling at
+all, and the caps would have been decorative for exactly the accounts that move the
+most. The check lands in `_blocking_reason`, as a new `RunBlockReason.TIER_LIMIT_EXCEEDED`
+member. It is a *block* rather than a raise because a raised error takes down the whole
+scheduler tick: five payout instructions judged one at a time would raise on the fourth
+and every other plan that tick would not run. Blocking is the honest state - the run did
+not happen, it is recorded as blocked for a reason, and the tick carries on. The
+ceilings are applied per instruction *and cumulatively*, by passing the running day
+total forward, so a plan whose lines each fit but which together cross the cap is
+refused; and only lines that send value out are counted, so a release-only plan is
+judged by nothing here, exactly as it faces no ceiling when a person types it.
+
+**201. The balance ceiling is refused at initiate deposit, and the settle-time half is
+deliberately left open.** A deposit that would leave the wallet above its cap cannot be
+credited when it settles, so opening a collection for it would send a payer to a
+checkout page to buy a rejection. The check at that door is `check_credit` itself
+rather than a second comparison written out, so the courtesy and the rule it foreshadows
+cannot drift apart. What it is not is a guarantee: the balance it reads is free to
+change before the payer pays, so two collections that each fitted can both be paid and
+both settle, and nothing refuses the second one - `SettlePayment` credits the wallet
+directly and does not go through the ceiling. Closing that gap means deciding what
+happens to a payment the payer has *already made* and the wallet may not accept: hold
+it, reverse it, or exceed the cap for it. Each is a real answer with a different
+conversation attached, and guessing one here would be inventing a refund policy in a
+docstring. It is in `### Still open`.
+
+**202. The limit-day is the server's local day.** Every timestamp in this system is a
+naive `datetime` written from a presentation's `datetime.now()` - and for a movement
+out, from the `as_of` that presentation hands down, which is the same value (decision
+203); there is no timezone
+anywhere in the codebase, no column holding an offset, and no moment at which one is
+recorded. So the stored rows are in the server's wall-clock frame, and a day boundary
+is only meaningful in that frame - applying a Lagos offset to a value that is already
+local would shift it twice and put the boundary in the wrong place on purpose. What
+that costs, plainly: a user in another timezone gets their allowance reset at a moment
+that is not their midnight. The remedy is a timezone concept this system does not have,
+and it is open rather than settled.
+
+**203. A movement out is stamped with the moment it was judged in, not with the clock.**
+`WalletOperation` built its `Transaction` without a `created_at`, so the default in
+`Transaction.__init__` supplied `datetime.now()` - and the daily cap is summed *from
+that column*. Two frames, then: the ceiling computed from the `as_of` the caller was
+handed, and the row written from whatever the clock said. In production they agree,
+because every presentation passes `datetime.now()` as its `as_of`, and that is what made
+it dangerous rather than benign: the disagreement was invisible until something supplied
+a moment that was not the clock's, and it fails *silently*, because a day total that
+misses a row reads as a smaller total rather than as an error. A plan run is that
+something. `_limit_block` asks about the plan's own `as_of` day, so a tick replayed or
+caught up for a day that is not today would have judged every one of its payouts against
+a day that was always empty - the cap enforced, and never once binding. So
+`WalletOperation.now` carries the moment and stamps the row, assigned beside `guard` at
+both places that build an operation: `WalletService._run`, and `ExecutePlanRun`'s
+`_move_the_money`, which builds its own because a scheduled run has no confirmation.
+Two things keep it narrow. It is set only on the three outbound call sites in `_run` -
+the ones that already passed `now`, because only a movement *out* is judged against a
+day - so a deposit or an internal move still stamps the clock and behaves exactly as
+before. And it is not a new convention: every other use case here that is handed an
+`as_of` stamps what it writes with it, which is what makes a replayed tick compose the
+same rows (see `NotifyUpcomingRuns`, whose receipts are stamped with the tick's moment
+for precisely this reason). The template was the outlier, and the daily cap is the first
+thing to depend on the rule it was breaking.
+
+**The profile is also the second thing `errors._grade` was asked about in a week**
+(decision 182), and this one needed no change: `TierLimitExceededError` is a
+`MoneyError` that is in none of `UNAUTHORIZED`, `NOT_FOUND` or `CONFLICT`, so the
+fallthrough that was already documented as "the safe direction to be wrong in" turns
+it into a 400 carrying the error's own name and message. No translation was written
+for it, and that is the point - the grade was right for input a person supplied, which
+an over-limit withdrawal is.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**
@@ -4137,9 +4318,18 @@ survive to the login prompt.
   `plan.total_to_move.currency is not wallet.currency` (decision 179);
   `PlanService.edit_instructions` loads only the plan, so the check is not
   re-applied; and a mismatched run raises `CurrencyMismatchError` out of
-  `_money_block`, through `ExecutePlanRun`'s `except BaseException: raise`, into
+  `_blocking_reason` - `_limit_block` for a plan that sends value out, because
+  `check_outflow` adds the instruction to a day total read in the wallet's own
+  currency, and `_money_block` for one that only reshuffles, which compares
+  `total_to_move` against a balance the same way. Then through
+  `ExecutePlanRun`'s `except BaseException: raise`, into
   `RunDuePlans`, which catches per *plan* nowhere. The tick exits 1 and every plan
   after it in that pass does not run.
+
+  Decision 200 put a pre-flight ahead of `_money_block` and did not change this:
+  the plan already killed the tick one method later, so the new check moved
+  *which* method raises and not whether anything does. Said plainly because it is
+  the sort of thing a later reader would otherwise infer was fixed.
 
   Two candidate fixes and they are not equivalent. Re-check in
   `edit_instructions`, which needs the wallet loaded and therefore a second read
@@ -4182,14 +4372,45 @@ survive to the login prompt.
     so destinations are *recorded* and money is *held*, and no external transfer is
     ever initiated. The real refusal will arrive with the rail that needs it, and
     the shape of the entry rule should be decided then rather than now.
-  - **Amounts are refused for shape and never for size.** `Money` refuses a
+  - ~~**Amounts are refused for shape and never for size.** `Money` refuses a
     non-finite value, a bool, more than two decimal places, and a foreign currency
     in arithmetic; `initiate_deposit.py:161` and `wallet_operation.py:152` refuse
     `<= 0`; `withdraw_money.py:38` refuses `< 0` (so a zero withdrawal is legal
     there and refused by the wallet downstream, which is a second refusal for one
     fact). Nothing refuses an amount above any ceiling, and the only thing that
     would is the provider - which does refuse them, at the far end, after the
-    request has left.
+    request has left.~~ **Done, for every door this slice reaches** - which is all
+    of them except settlement, and that exception is its own entry below. A tier
+    now carries a per-transaction ceiling, a daily outflow cap and a maximum
+    wallet balance; they are enforced inside `WalletOperation.execute` so that a
+    refusal is recorded (decisions 197-198), in `ExecutePlanRun._blocking_reason`
+    for automated runs (decision 200), and at initiate deposit for the balance cap
+    (decision 201). The provider is no longer the first thing to refuse an amount
+    for its size.
+  - **A payment that has already been made and would breach the balance cap has no
+    answer.** This is the one half of the entry above that stayed open, and it is
+    open because it is a policy question rather than a missing check. The cap is
+    refused at initiate deposit, which is the last moment at which refusing costs
+    nobody anything; but the balance read there is free to change before the payer
+    pays, so two collections that each fitted can both be paid and both settle, and
+    `SettlePayment` credits the wallet directly and consults no ceiling. What it
+    should do instead is genuinely undecided: hold the payment until the account is
+    identified, reverse it, or credit it and accept that this wallet is over its cap.
+    Each is a real answer with a different conversation attached, and none of them
+    should be chosen by whoever is next editing the file. The live run this project
+    has learned to insist on - a deposit that would breach the cap, against the real
+    provider - is how the choice should be informed, and it has not been run.
+- **The limit-day is the server's day, so an allowance resets at the wrong midnight
+  for anybody who is not where the server is.** Decision 202 has the argument:
+  every stored moment in this system is naive and local, so a day boundary is only
+  meaningful in that frame, and `limit_day_bounds` slices the local day rather than
+  inventing an offset it would then apply to a value that already has one. The cost
+  is real and not only cosmetic - `Africa/Lagos` is the market this product is
+  built for, so the server will usually be *in* the right frame and the bug will
+  mostly be invisible, which is the worst way for a boundary bug to behave. Closing
+  it means a timezone concept: a column, a policy for the ones already written, and
+  a decision about whether the day belongs to the server, the account or the
+  wallet's currency. That decision is the entry, and it is not a small one.
   - **A plan's schedule is validated as a type and not as a value.** `Schedule`
     requires a `Cadence` and a `datetime` anchor (`schedule.py:31-45`), and
     `ends_on` cannot fall before the anchor's day. Nothing refuses an anchor in the

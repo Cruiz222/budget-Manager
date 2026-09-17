@@ -89,6 +89,35 @@ class PayerEmailRefusedError(PaymentError):
     """
 
 
+class PayerEmailMissingError(PaymentError):
+    """The account holds no address, so there is nothing to be billed under.
+
+    **Not a refusal about a *value*, which is why it is not
+    ``PayerEmailRefusedError``.** That one says the address an account holds is
+    not one a provider will take; this one says there is no address at all. The
+    two read alike from a distance and their sentences are not interchangeable:
+    one person has something to correct, the other has a field to fill in, and an
+    error name that conflated them would make the API tell half its callers the
+    wrong thing.
+
+    **It exists because an address became optional on an account**, which is what
+    lets somebody sign up with a phone number alone. Such an account is complete
+    and functional - a wallet, a password, a session, a number it can be reached
+    at - right up to the point it has to be *billed*, and a provider is handed the
+    payer's address. So this is not the account being half-built; it is one
+    operation needing one field that another does not.
+
+    The remedy is named in the sentence rather than left to be discovered, and it
+    is the email-change request - which for an account holding no address *sets*
+    one rather than moving one, and is the only route by which such an account
+    becomes able to take money. See ``RequestEmailChange``.
+
+    A 400 by falling through ``errors._grade``, like every other refusal this
+    domain makes: what is wrong is the account the caller is asking on behalf of,
+    and it is theirs to change.
+    """
+
+
 class DepositAlreadyInitiatedError(PaymentError):
     """A deposit is already open under this idempotency key.
 

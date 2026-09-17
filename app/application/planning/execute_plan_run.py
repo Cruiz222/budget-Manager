@@ -12,6 +12,8 @@ from app.application.payout.payout_from_available import PayoutFromAvailable
 from app.application.payout.payout_from_locked import PayoutFromLocked
 from app.application.release.release_from_locked import ReleaseFromLocked
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
+from app.domain.identity.exception import TierLimitExceededError
+from app.domain.identity.tier import check_outflow, limit_day_bounds, tier_for
 from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.wallet import Wallet
@@ -127,7 +129,7 @@ class ExecutePlanRun:
             wallet = uow.wallets.get_owned(plan.wallet_id, self._actor)
             due_at = plan.next_due_at
 
-            reason = self._blocking_reason(plan, wallet, as_of)
+            reason = self._blocking_reason(uow, plan, wallet, as_of)
             if reason is not None:
                 return self._record_blocked(uow, plan, wallet, due_at, reason)
 
@@ -140,7 +142,7 @@ class ExecutePlanRun:
     # --- the decision -------------------------------------------------------
 
     def _blocking_reason(
-        self, plan: SavingsPlan, wallet: Wallet, as_of: datetime
+        self, uow: UnitOfWork, plan: SavingsPlan, wallet: Wallet, as_of: datetime
     ) -> RunBlockReason | None:
         """Whether anything stops this run, checked *before* a single instruction runs.
 
@@ -166,12 +168,24 @@ class ExecutePlanRun:
         half-execution this method exists to prevent, arriving through the one
         door a balance check cannot see. So a frozen wallet blocks any run that
         sends value out, and permits one that only reshuffles.
+
+        **The tier ceilings are checked before the balance**, and the order is
+        the advice - the argument ``_money_block`` already makes for putting
+        maturity ahead of money. A run that breaches a ceiling cannot be helped
+        by the size of the balance, so telling somebody to top up would send them
+        to move money that changes nothing: they would fund the plan and be
+        blocked again for the same reason. The ceiling is the thing they can act
+        on, so it is the thing named first.
         """
         if wallet.status is WalletStatus.CLOSED:
             return RunBlockReason.WALLET_CLOSED
 
         if wallet.status is WalletStatus.FROZEN and self._sends_value_out(plan):
             return RunBlockReason.WALLET_FROZEN
+
+        blocked_for_a_limit = self._limit_block(uow, plan, wallet, as_of)
+        if blocked_for_a_limit is not None:
+            return blocked_for_a_limit
 
         return self._money_block(plan, wallet, as_of)
 
@@ -187,6 +201,70 @@ class ExecutePlanRun:
             instruction.action is PlannedAction.PAYOUT
             for instruction in plan.instructions
         )
+
+    def _limit_block(
+        self, uow: UnitOfWork, plan: SavingsPlan, wallet: Wallet, as_of: datetime
+    ) -> RunBlockReason | None:
+        """Whether the owner's tier ceilings refuse this run, checked line by line.
+
+        **The second door money leaves by, and the reason the first one was not
+        enough.** ``WalletService._run`` enforces the ceilings for every command
+        a *person* types - a withdrawal, a payout - and a plan run never goes
+        through it: ``_move_the_money`` builds its operations directly, which is
+        deliberate (a scheduled run has no confirmation and no person in it). So
+        without this method a plan would be the one way to move money with no
+        ceiling at all, and the caps would be decorative for exactly the users
+        who move the most.
+
+        **A refusal here is a *block*, not a raise**, and that is not a
+        stylistic preference. Five payout instructions judged one at a time would
+        raise on the fourth and take the whole scheduler tick down with it - every
+        other plan that tick, including the ones with nothing wrong with them.
+        Blocking is the honest state: the run did not happen, it is recorded as
+        blocked for a reason, and the tick carries on. See ``RunBlockReason``.
+
+        **The ceilings are applied per instruction and cumulatively**, which is
+        what makes one call to ``check_outflow`` per payout do the work of both:
+        passing the running day *forward* means the third payout of a run is
+        judged against a day that already includes the first two, so a plan whose
+        lines each fit but which together cross the cap is refused. The
+        per-transaction ceiling comes along for free, since that is the first
+        comparison the same call makes - and a plan is not a way to send one
+        payout bigger than a person could send by hand.
+
+        **Only the lines that send value out are counted**, and the check itself
+        is skipped entirely for a plan that has none. A RELEASE moves value
+        between the wallet's own two balances, which changes what the owner holds
+        not at all - so a release-only plan is judged by nothing here, exactly as
+        it faces no ceiling when a person types it.
+
+        **This method cannot be the first thing to fail on a plan whose amounts
+        are in another currency.** ``Money`` refuses arithmetic across two
+        currencies, so ``_money_block`` below raises on such a plan too - the
+        pre-existing loud failure the README records. Running the limit check
+        first does not create it: it is the same plan, refused by the next method
+        instead of this one. What this method cannot do is swallow it, which is
+        why the ``except`` below names one class and not ``MoneyError``.
+        """
+        if not self._sends_value_out(plan):
+            return None
+
+        tier = tier_for(uow.profiles.find_for_user(wallet.user_id))
+        day_start, day_end = limit_day_bounds(as_of)
+        running = uow.transactions.outflow_total_between(
+            wallet.wallet_id, day_start, day_end, wallet.currency
+        )
+
+        try:
+            for instruction in plan.instructions:
+                if instruction.action is not PlannedAction.PAYOUT:
+                    continue
+                check_outflow(tier, instruction.amount, running)
+                running = running + instruction.amount
+        except TierLimitExceededError:
+            return RunBlockReason.TIER_LIMIT_EXCEEDED
+
+        return None
 
     def _money_block(
         self, plan: SavingsPlan, wallet: Wallet, as_of: datetime
@@ -298,12 +376,27 @@ class ExecutePlanRun:
         since opened, and - worse - the pre-flight, which can only know
         ``as_of``, would have approved it. Pre-flight and execution must be
         answering the same question or the pre-flight is worth nothing.
+
+        ``as_of`` is also *stamped* onto the rows, and there is a third reason
+        for that beyond maturity. ``_limit_block`` above sums this wallet's day
+        from the ledger, so a payout recorded under the wall clock while it was
+        judged under ``as_of`` would sit in a day the next plan of the same tick
+        never asks about - and the failure would be silent, because a day total
+        that misses a row reads as a smaller total rather than as an error. One
+        value, one day: the same reason ``WalletService._run`` assigns
+        ``operation.now`` beside ``operation.guard``. Note it has to be assigned
+        *here* rather than inherited from a service, because this method builds
+        its operations itself - that is what makes it the second door, and what
+        makes every rule a movement faces something this class must remember to
+        apply. See ``WalletOperation.now``.
         """
         transactions = []
         for index, instruction in enumerate(plan.instructions):
             operation_cls, extra = self._operation_for(plan, instruction, as_of)
+            operation = operation_cls(wallet, uow.transactions, **extra)
+            operation.now = as_of
             transactions.append(
-                operation_cls(wallet, uow.transactions, **extra).execute(
+                operation.execute(
                     amount=instruction.amount,
                     internal_reference=self._reference(plan.plan_id, due_at, index),
                     destination=instruction.destination,

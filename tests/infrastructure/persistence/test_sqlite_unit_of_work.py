@@ -66,6 +66,46 @@ CREATE TABLE wallets (
 """
 
 
+#: The users table exactly as it looked while ``email`` was ``NOT NULL`` and
+#: there was no ``phone`` column - that is, before an account could be identified
+#: by a number. Written out rather than derived, for the same reason the two
+#: schemas above are.
+#:
+#: **This is the shape the rebuild migration exists for**, and the reason it
+#: cannot be an ``ALTER``: SQLite has no form of ``ALTER TABLE`` that drops
+#: ``NOT NULL``, so making this column optional means building the table again
+#: and moving the rows across. A test that built the old table from the current
+#: ``SCHEMA`` could not exercise that at all - the point is that the column is
+#: constrained in a way the new code refuses to accept.
+LEGACY_USERS_SCHEMA = """
+CREATE TABLE users (
+    user_id        TEXT PRIMARY KEY,
+    email          TEXT NOT NULL UNIQUE,
+    google_subject TEXT UNIQUE,
+    created_at     TEXT NOT NULL
+);
+"""
+
+
+#: The users table in the one state between the two above: a ``phone`` column
+#: that has arrived while ``email`` is *still* ``NOT NULL``. No released version
+#: of this code produces it - it is what a half-applied rollout, a hand-written
+#: ``ALTER``, or a branch that added the column before the rebuild would leave on
+#: disk. It exists here to pin one specific decision in the migration: the guard
+#: reads ``email``'s nullability rather than asking whether ``phone`` exists, so a
+#: database in this shape is *rebuilt* rather than skipped, and the only test that
+#: can tell those two apart is one where ``phone`` holds values worth keeping.
+LEGACY_USERS_WITH_PHONE_SCHEMA = """
+CREATE TABLE users (
+    user_id        TEXT PRIMARY KEY,
+    email          TEXT NOT NULL UNIQUE,
+    phone          TEXT UNIQUE,
+    google_subject TEXT UNIQUE,
+    created_at     TEXT NOT NULL
+);
+"""
+
+
 def build_legacy_database(db_path, rows):
     """A pre-funds database holding the given wallets, ready to be opened."""
     legacy = sqlite3.connect(db_path, isolation_level=None)
@@ -160,6 +200,209 @@ def test_a_database_predating_the_destination_column_is_migrated(tmp_path):
         assert "destination" in columns
     finally:
         connection.close()
+
+
+def test_a_database_predating_an_optional_email_keeps_its_accounts(tmp_path):
+    """The rebuild moves every row across, and keeps the constraint it can keep.
+
+    ``email`` had to become nullable so an account can be identified by a number
+    alone, and SQLite cannot drop ``NOT NULL`` in place - so the table is built
+    again and the rows copied. Two things could go wrong in that move, and both
+    are asserted here: the rows are the ones that were there, and the ``UNIQUE``
+    on the address survives. A rebuild that quietly lost that index would let two
+    accounts hold one address, which is a worse state than the one being
+    migrated - and it is exactly the kind of loss a table rebuild invites,
+    because the constraint lives in the new ``CREATE TABLE`` rather than being
+    carried over from the old one.
+    """
+    db_path = str(tmp_path / "legacy_users.db")
+    account_id = uuid4()
+    created_at = datetime(2026, 3, 2, 12, 0)
+
+    legacy = sqlite3.connect(db_path, isolation_level=None)
+    legacy.executescript(LEGACY_USERS_SCHEMA)
+    legacy.execute(
+        "INSERT INTO users VALUES (?, ?, ?, ?)",
+        (
+            uuid_to_text(account_id),
+            "chinedu@example.com",
+            None,
+            datetime_to_text(created_at),
+        ),
+    )
+    legacy.close()
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        columns = {
+            row["name"]: row["notnull"]
+            for row in connection.execute("PRAGMA table_info(users)")
+        }
+        assert "phone" in columns
+        assert columns["email"] == 0, "email must be nullable after the rebuild"
+
+        rows = connection.execute("SELECT * FROM users").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["user_id"] == uuid_to_text(account_id)
+        assert rows[0]["email"] == "chinedu@example.com"
+        assert rows[0]["phone"] is None
+        assert rows[0]["created_at"] == datetime_to_text(created_at)
+
+        # The address is still unique, asserted by trying to take it - the
+        # constraint is only worth claiming if a second insert actually fails.
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO users (user_id, email, phone, google_subject, created_at)
+                VALUES (?, ?, NULL, NULL, ?)
+                """,
+                (uuid_to_text(uuid4()), "chinedu@example.com", datetime_to_text(created_at)),
+            )
+    finally:
+        connection.close()
+
+
+def test_the_rebuild_keeps_a_phone_that_was_already_there(tmp_path):
+    """A database that gained ``phone`` before the rebuild keeps its numbers.
+
+    The guard is ``email``'s ``notnull`` flag, not "does ``phone`` exist", and
+    this is the only shape where the two questions give different answers: a
+    number column is present, so a guard that asked about it would skip the
+    rebuild and leave ``NOT NULL`` on the address - which is the column that had
+    to change. Getting that wrong is invisible until a phone-only account is
+    written, at which point it is refused by a constraint nobody is looking at.
+    """
+    db_path = str(tmp_path / "legacy_users_with_phone.db")
+    account_id = uuid4()
+    created_at = datetime(2026, 3, 2, 12, 0)
+
+    legacy = sqlite3.connect(db_path, isolation_level=None)
+    legacy.executescript(LEGACY_USERS_WITH_PHONE_SCHEMA)
+    legacy.execute(
+        "INSERT INTO users VALUES (?, ?, ?, ?, ?)",
+        (
+            uuid_to_text(account_id),
+            "chinedu@example.com",
+            "2348012345678",
+            None,
+            datetime_to_text(created_at),
+        ),
+    )
+    legacy.close()
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        columns = {
+            row["name"]: row["notnull"]
+            for row in connection.execute("PRAGMA table_info(users)")
+        }
+        assert columns["email"] == 0
+
+        row = connection.execute("SELECT * FROM users").fetchone()
+        assert row["phone"] == "2348012345678"
+        assert row["email"] == "chinedu@example.com"
+    finally:
+        connection.close()
+
+
+def test_an_account_with_no_address_survives_a_reopen(tmp_path):
+    """The rebuilt table is a no-op the second time, and a NULL address round-trips.
+
+    Two claims, one opening. The first is that the migration is idempotent - the
+    guard sees a nullable ``email`` and returns, so a database that has been
+    migrated is not rebuilt again on every start. The second is the state the
+    whole change exists to permit: an account with a number and no address is
+    written, read back through the repository, and arrives with both fields as
+    they were stored - ``None`` rather than an empty string on one side and the
+    folded number on the other.
+    """
+    db_path = str(tmp_path / "phone_only.db")
+    account_id = uuid4()
+    created_at = datetime(2026, 3, 2, 12, 0)
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO users (user_id, email, phone, google_subject, created_at)
+            VALUES (?, NULL, ?, NULL, ?)
+            """,
+            (uuid_to_text(account_id), "2348012345678", datetime_to_text(created_at)),
+        )
+    finally:
+        connection.close()
+
+    # Reopening runs every migration again, including the rebuild above.
+    reopened = open_sqlite_connection(db_path)
+    reopened.close()
+
+    stored = SqliteUnitOfWorkFactory(db_path).start()
+    try:
+        account = stored.users.get_by_id(account_id)
+        assert account.email is None
+        assert account.phone == "2348012345678"
+        assert account.created_at == created_at
+    finally:
+        stored.rollback()
+
+
+def test_the_verifications_table_arrives_on_an_old_database(tmp_path):
+    """**A new table on a database already in the wild, which is why it needs no
+    migration function.**
+
+    This is the contrast that makes the rebuild above worth its risk. ``users`` had to be
+    built again because a column that already existed could not be changed; a table that
+    does not exist yet costs nothing, because ``CREATE TABLE IF NOT EXISTS`` in the schema
+    creates it on the next open. So there is no ``_migrate_*`` for ``phone_verifications``
+    and there should not be one - adding a table is not a migration, changing a table is.
+
+    Asserted rather than assumed because the distinction is invisible in the ``SCHEMA``
+    string and only shows up here: a database that predates this slice has accounts in it
+    and no table for verifications, and the next open has to leave the first alone while
+    creating the second. The legacy schema is the *oldest* users table in this file, so
+    this also carries the rebuild in the same open - both kinds of change, one call.
+
+    The row inserted at the end is the part that makes it a table rather than a name: a
+    ``CREATE TABLE`` that got the columns wrong would still pass a ``PRAGMA`` check on some
+    of them, and would fail here.
+    """
+    db_path = str(tmp_path / "pre_phone_verifications.db")
+    legacy = sqlite3.connect(db_path, isolation_level=None)
+    legacy.executescript(LEGACY_USERS_SCHEMA)
+    legacy.close()
+
+    connection = open_sqlite_connection(db_path)
+    try:
+        columns = raw_columns(connection, "phone_verifications")
+        connection.execute(
+            """
+            INSERT INTO phone_verifications (
+                phone_verification_id, phone, token_hash, status,
+                requested_at, expires_at, settled_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                uuid_to_text(uuid4()),
+                "2348012345678",
+                "a-hash",
+                "awaiting",
+                datetime_to_text(datetime(2026, 3, 2, 12, 0)),
+                datetime_to_text(datetime(2026, 3, 2, 12, 10)),
+            ),
+        )
+    finally:
+        connection.close()
+
+    assert columns == {
+        "phone_verification_id",
+        "phone",
+        "token_hash",
+        "status",
+        "requested_at",
+        "expires_at",
+        "settled_at",
+    }
 
 
 def test_rollback_discards_a_wallet_and_its_transaction(tmp_path, build_wallet):
@@ -1043,3 +1286,100 @@ def test_a_legacy_plans_pot_round_trips_as_none(tmp_path, build_wallet, build_pl
         assert fresh.plans.get_owned(plan.plan_id, plan.user_id).fund_id is None
     finally:
         fresh.rollback()
+
+
+# --- one writer at a time ----------------------------------------------------
+#
+# The section that pins ``BEGIN IMMEDIATE``, and the reason it is not written as
+# two threads confirming two withdrawals at once.
+#
+# That race is the obvious shape for this test and it proves less than it looks:
+# two threads whose reads have to interleave before either writes is a
+# *probability*. On one machine the interleaving happens and the cap is breached;
+# on a loaded one the threads serialise by accident, the test passes, and it
+# passes against the very bug it was written to catch. A test that fails
+# sometimes against a correct implementation and passes sometimes against a
+# broken one is worse than no test.
+#
+# So what is asserted below is the **lock** the outcome follows from. It holds
+# for every interleaving rather than for one scheduling of two threads, it needs
+# no threads at all, and it fails against a deferred ``BEGIN`` every time -
+# which is the standard the plan for this feature set for it. The outcome itself
+# - twenty movements landing on a cap and the twenty-first refused - is asserted
+# in ``tests/application/test_wallet_limits.py``, where it can be written without
+# a race, because the second unit there reads what the first committed.
+
+
+def test_a_second_unit_cannot_take_a_write_lock_while_one_is_open(tmp_path):
+    """**The mutual exclusion the daily cap rests on**, asserted as itself.
+
+    With ``BEGIN IMMEDIATE`` the first unit holds a write lock from the moment it
+    starts, so a second unit's own ``BEGIN IMMEDIATE`` cannot proceed until the
+    first has finished. That is what makes a read-then-write rule enforceable at
+    all: the read that decides whether a movement fits the day's cap cannot be
+    interleaved with another unit writing one, because no other unit can be
+    anywhere in the middle of anything.
+
+    **This test fails against a deferred ``BEGIN``**, which is the property that
+    makes it worth having: a plain ``BEGIN`` takes no lock, so the contender below
+    would succeed immediately and ``pytest.raises`` would have nothing to catch.
+    That is the version in which ten confirms passed a cap of eight.
+
+    The contender is a bare connection rather than a ``UnitOfWork``, because the
+    claim is about the lock and a unit would have to be built, used and torn down
+    to make it. One statement is the smallest thing that can ask for a write lock.
+    Its timeout is set to a tenth of a second so the wait is bounded here rather
+    than the connection default of five - the assertion is about *whether* the
+    lock is held, not about how long anybody is willing to wait for it.
+    """
+    db_path = str(tmp_path / "one_writer.db")
+    factory = SqliteUnitOfWorkFactory(db_path)
+    unit = factory.start()
+    try:
+        contender = sqlite3.connect(db_path, isolation_level=None, timeout=0.1)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                contender.execute("BEGIN IMMEDIATE")
+        finally:
+            contender.close()
+    finally:
+        unit.rollback()
+
+
+def test_the_write_lock_is_released_when_the_unit_ends(tmp_path):
+    """The other half, because a lock nobody releases is not a control.
+
+    The test above would pass for an implementation that never let go - every
+    unit after the first would wait out the busy timeout and fail, which is a
+    system that refuses everything rather than one that enforces a ceiling. So
+    the same contender is run either side of the ending: blocked while the unit
+    is open, free once it is over.
+
+    **Both endings are exercised, and the rollback is the one worth having.** A
+    read-only unit ends with ``rollback`` in every service in this codebase - it
+    is what releases the connection when nothing was written - so a lock released
+    only on ``commit`` would leave the whole system waiting behind its own reads.
+    """
+    db_path = str(tmp_path / "released.db")
+    factory = SqliteUnitOfWorkFactory(db_path)
+
+    def contender_gets_in() -> bool:
+        connection = sqlite3.connect(db_path, isolation_level=None, timeout=0.1)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+            return True
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            connection.close()
+
+    rolled_back = factory.start()
+    assert contender_gets_in() is False
+    rolled_back.rollback()
+    assert contender_gets_in() is True
+
+    committed = factory.start()
+    assert contender_gets_in() is False
+    committed.commit()
+    assert contender_gets_in() is True

@@ -93,7 +93,9 @@ def request_reset(factory):
     return _build
 
 
-def seed_account(db_path, email, user_id=None, with_password=False, password_hasher=None):
+def seed_account(
+    db_path, email, user_id=None, with_password=False, password_hasher=None, phone=None
+):
     """Write an account straight into the store, with or without a credential.
 
     **``with_password`` defaults to false and that is the interesting dial.** An
@@ -101,6 +103,10 @@ def seed_account(db_path, email, user_id=None, with_password=False, password_has
     sign-in account, once that lands - and this flow is the only way such an account
     can acquire its first one. ``SignUp`` cannot build that state, so the row has to
     be written here.
+
+    ``phone`` is a dial for the same class of reason: the reset flow's SMS branch
+    needs a number on the account, and this is the only place a row is shaped by
+    hand.
     """
     factory = SqliteUnitOfWorkFactory(db_path)
     uow = factory.start()
@@ -108,6 +114,7 @@ def seed_account(db_path, email, user_id=None, with_password=False, password_has
         user = User(
             user_id=user_id if user_id is not None else uuid4(),
             email=email,
+            phone=phone,
             google_subject=None,
             created_at=NOW,
         )

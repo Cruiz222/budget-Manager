@@ -14,6 +14,7 @@ that it makes the two decisions its docstring claims - argon2id with the library
 defaults, and a distinction between "wrong password" and "not a hash at all".
 """
 
+import base64
 from datetime import datetime
 from uuid import uuid4
 
@@ -22,11 +23,20 @@ from argon2.exceptions import InvalidHashError, VerificationError
 
 from app.domain.identity.password import PlainPassword
 from app.domain.identity.password_credential import PasswordCredential
-from app.domain.identity.password_hasher import PasswordHasher
+from app.domain.identity.password_hasher import DUMMY_HASH, PasswordHasher
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
 from tests.conftest import FakePasswordHasher
 
 PASSWORD = PlainPassword("correct-horse-battery")
+
+
+def _header(encoded: str) -> str:
+    """The ``$argon2id$v=..$m=..,t=..,p=..$`` prefix, which is the parameters.
+
+    Split rather than parsed, because the point is that the two strings *start*
+    the same way - the salt and the digest below are meant to differ.
+    """
+    return "$".join(encoded.split("$")[:4])
 
 
 @pytest.fixture
@@ -223,3 +233,76 @@ class TestItIsInterchangeableWithTheDouble:
 
         assert double.verify(PASSWORD, double.hash(PASSWORD)) is True
         assert double.verify(PASSWORD, Argon2PasswordHasher().hash(PASSWORD)) is False
+
+
+class TestTheDecoyHash:
+    """``DUMMY_HASH`` - the constant ``LogIn`` spends when no credential was found.
+
+    **This class exists to answer one question no other test can: is the decoy a
+    value both adapters *accept*?** ``LogIn._settle`` hands it to ``verify`` on the
+    path where no account matched, and the difference between "returns ``False``"
+    and "raises" is the difference between a 401 and a 500 on the login form - for
+    every unknown identifier, which is to say on the path an attacker is *supposed*
+    to be able to walk. ``Argon2PasswordHasher.verify`` propagates anything that is
+    not a ``VerifyMismatchError``, deliberately (see the class above), so a decoy
+    that argon2 cannot parse would turn the enumeration defence into an outage.
+    That is why the value is generated rather than written by hand, and why the
+    claim is pinned here rather than trusted.
+
+    **The last test is about drift, and it is the reason the constant is a literal
+    at all.** A hash encodes its own cost parameters, so the decoy must be made with
+    the *same* ones the real hashes are - otherwise the decoy comparison answers
+    faster than a genuine one and the timing gap reopens in the opposite direction.
+    ``argon2.PasswordHasher()`` uses the library's current defaults, so a literal
+    cannot follow them if they move. Rather than a comment asking somebody to
+    notice, the mismatch fails a test.
+    """
+
+    def test_the_real_adapter_refuses_it_rather_than_raising(self, hasher):
+        """``False`` and not an exception, which is the whole claim.
+
+        ``DUMMY_HASH`` is the value a wrong password is compared against when there
+        is no stored hash to compare it with. "The password was wrong" is exactly
+        what it must be able to say.
+        """
+        assert hasher.verify(PASSWORD, DUMMY_HASH) is False
+
+    def test_the_double_refuses_it_too(self):
+        """Both adapters, because both are handed it - the suite runs on the double.
+
+        ``FakePasswordHasher`` returns ``False`` for any value it did not tag with
+        its own scheme, so this passes by construction *today* - and it is asserted
+        anyway because the construct is what makes the two interchangeable, and a
+        double that raised here would make every non-argon2 test of the decoy
+        path fail for a reason with nothing to do with the decoy.
+        """
+        assert FakePasswordHasher().verify(PASSWORD, DUMMY_HASH) is False
+
+    def test_it_is_a_real_encoding_and_not_a_stub(self):
+        """Structurally a hash, not merely a string that starts like one.
+
+        The digest is decoded and measured, because a hand-written literal is
+        exactly the thing that would look right and parse wrong: ``argon2-cffi``
+        reads the length off the encoding, so a four-byte digest is a hash whose
+        parameters claim one thing and whose body holds another. Thirty-two bytes
+        is argon2's default output length.
+        """
+        assert DUMMY_HASH.startswith("$argon2id$")
+
+        digest = DUMMY_HASH.split("$")[5]
+        assert len(base64.b64decode(digest + "==")) == 32
+
+    def test_it_carries_the_parameters_the_hasher_uses_now(self, hasher):
+        """The drift alarm, and the reason this file can keep a frozen literal.
+
+        The decoy was generated with ``argon2.PasswordHasher()``'s defaults on the
+        day it was written. If ``argon2-cffi`` raises those - a thing it has done
+        before and will do again - every hash it produces will carry a new header
+        while ``DUMMY_HASH`` keeps the old one, and the decoy comparison will
+        quietly stop costing what a real comparison costs. This test turns that
+        silence into a failure, and the fix is to regenerate the literal.
+
+        It compares the *header* only: salt and digest must differ, since one hash
+        of one password is never another's.
+        """
+        assert _header(DUMMY_HASH) == _header(hasher.hash(PASSWORD))

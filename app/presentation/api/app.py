@@ -7,8 +7,9 @@ ways to point the system at a database would be one too many and the second one
 is always the one that is wrong.
 
 What ``create_app`` puts on ``app.state`` is the whole of the configuration: a
-unit of work factory and the mail settings. Both are resolved once, when the app
-is built, and never per request - which is what makes a running server act on one
+unit of work factory, the mail settings, the payment settings and the provider
+built from them, and the SMS settings. All are resolved once, when the app is
+built, and never per request - which is what makes a running server act on one
 configuration rather than on whatever the environment happened to be when a
 request arrived.
 
@@ -29,7 +30,11 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 )
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
 from app.infrastructure.settings import database_path as configured_database_path
-from app.infrastructure.settings import from_environment, paystack_from_environment
+from app.infrastructure.settings import (
+    from_environment,
+    paystack_from_environment,
+    termii_from_environment,
+)
 from app.presentation.api import errors
 from app.presentation.api.routes import (
     confirmations,
@@ -37,7 +42,9 @@ from app.presentation.api.routes import (
     funds,
     health,
     password_resets,
+    phone_verifications,
     plans,
+    profiles,
     sessions,
     users,
     wallets,
@@ -52,6 +59,7 @@ def create_app(
     password_hasher=None,
     paystack_settings=None,
     payment_provider=None,
+    termii_settings=None,
 ) -> FastAPI:
     """Build the application.
 
@@ -109,6 +117,23 @@ def create_app(
     deliberately not collapsed into one parameter. Settings without a provider is
     an installation that *can* take payments; a provider without settings is a
     test. One parameter could not say which of those it meant.
+
+    ``termii_settings`` - the SMS settings, a ``TermiiSettings``. ``None`` means
+    "read this installation's configuration", and an installation without both
+    ``TERMII_API_KEY`` and ``TERMII_SENDER_ID`` resolves to ``None`` - a supported
+    state, and the state a fresh clone is in. It is the mail settings' ``None``
+    rather than the payment one's: this installation simply cannot text, and the
+    flows that need a text refuse in words naming the missing variable.
+
+    **There is no matching ``sms_channel`` parameter, and the asymmetry with
+    ``payment_provider`` above is worth a sentence.** A provider has to exist as an
+    object on ``app.state`` because two routes need it directly - one to open a
+    collection with, one to verify a signature against. Nothing here holds a
+    channel: both halves that could send a text go through a builder, which
+    constructs the adapter per request exactly as the mail builders always have.
+    So the seam for a test is the same one the mail tests use - the channel builder
+    inside ``composition_root`` - rather than a fourth thing on ``app.state`` that
+    no route would ever read.
     """
     application = FastAPI(
         title="Budget Manager",
@@ -148,14 +173,19 @@ def create_app(
         if payment_provider is None
         else payment_provider
     )
+    application.state.termii = (
+        termii_from_environment() if termii_settings is None else termii_settings
+    )
 
     errors.install(application)
     for module in (
         health,
         users,
+        profiles,
         sessions,
         email_changes,
         password_resets,
+        phone_verifications,
         wallets,
         funds,
         plans,
