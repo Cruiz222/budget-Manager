@@ -315,8 +315,9 @@ Transaction
 
 ## Signing in
 
-Every command except `signup`, `login`, `logout`, `confirm-email`,
-`reset-password`, `confirm-password-reset` and `plan tick` acts as somebody, and that
+Every command except `signup`, `signup-google`, `signup-phone`, `confirm-phone`,
+`login`, `login-google`, `login-phone`, `logout`, `confirm-email`, `reset-password`,
+`confirm-password-reset`, `plan tick` and `reconcile` acts as somebody, and that
 somebody is proved by a token rather than named by a flag. So a fresh install starts
 here:
 
@@ -329,10 +330,11 @@ here:
 Three things about that are worth knowing:
 
 - **`signup` does not sign you in.** It creates the identity; `login` is what
-  proves you hold it, and it is the *only* command that writes the session file.
-  Keeping them apart is the whole point of the phase (decision 85) - a registration
+  proves you hold it, and it is one of the three commands that write the session
+  file - the others being `login-phone` and `login-google`. Keeping signing up and
+  signing in apart is the whole point of the phase (decision 85) - a registration
   that silently authenticated would mean the first token on a machine came from a
-  command that never checked the password.
+  command that never checked anything the person knew.
 - **The password is typed, never passed.** There is no `--password` flag, because an
   argument lands in the shell's history file, in the process table while the command
   runs, and in whatever the terminal is recording. `signup` asks twice; `login`
@@ -401,6 +403,34 @@ it, because the premise of the whole flow is that somebody else may know the old
 password (decision 188). Both commands need a mail account; with none configured the
 first refuses and names the variable, which is the one place this flow is stricter than
 the address change (decision 186).
+
+**Signing up with Google takes two commands of the same shape, and they are the only
+pair here that needs configuration before it can read its own input.** The token is
+read at a hidden prompt rather than passed - it is a live bearer credential for about
+an hour, so the history file is the last place it should be - and both commands refuse
+naming the missing variable when the installation has no `GOOGLE_CLIENT_ID`, because
+there is no version of either that could work without one:
+
+```
+.venv/bin/python -m app.presentation.cli --db budget.db signup-google
+    # the id_token is asked for; nothing else is
+.venv/bin/python -m app.presentation.cli --db budget.db login-google
+    # the id_token again, and the session file is written
+```
+
+Neither creates the other's outcome, and that is the design rather than a missing
+convenience: `signup-google` registers an account and starts no session, exactly as
+`signup` does, and `login-google` never registers - a token naming an account this
+installation does not have is refused in `login`'s own words, and the remedy is the
+command above it. A person who runs the wrong one is told which they wanted rather
+than quietly given the other.
+
+**The token itself comes from outside this system today**, which is worth knowing
+before running either command: Google's OAuth 2.0 Playground, or the operator's own
+client. The browser flow that would obtain one *for a person* needs a redirect
+address, and this installation deliberately has no setting for one - so that half is
+Phase 4, and both commands' own docstrings say so rather than implying they can
+produce a token themselves.
 
 Three commands are worth knowing by name when something goes wrong. `whoami` says
 who the current token belongs to, which is the first question anybody debugging an
@@ -1908,7 +1938,8 @@ to know whose.
 
 2a is the half with the hard property to prove — *an actor that can only be reached
 by proving you are it*. 2b spends it on the money endpoints. 2c is Google OIDC and
-rate limiting.
+rate limiting - of which the first has since shipped (decisions 204-213) and the
+second is still the next thing owed.
 
 The phase is also where the two shims die, together and in one commit, which is what
 the "Still open" list promised and why it insisted they were one change rather than
@@ -4108,12 +4139,13 @@ the enumeration oracle returning by a different door - so the choice is between
 mailing a person who can then use their account and telling nobody anything while
 leaving them with no way in at all. Mailing is both the more useful answer and the
 more honest one, since the mailbox is exactly the evidence that they own the account.
-This is unreachable today, because `SignUp` writes both rows in one unit and no other
-path creates a `User`; it becomes reachable when Google OIDC lands and `LogIn`'s
-branch for a credential-less account stops being dead code. Written down now because
-it is a decision the flow already encodes, and it would otherwise be re-derived
-against a live account.
-
+This was unreachable when it was written, because `SignUp` wrote both rows in one
+unit and no other path created a `User`. **It is reachable now**: `SignUpWithGoogle`
+is the second path, and the account it creates holds an address and no credential
+(decisions 204-213). So this is the decision that made the arrival uneventful - a
+Google account sets its first password by asking for a reset, which is the flow that
+was designed for it before it could exist - and the alternative would have been to
+re-derive it against a live account.
 **191. `_prompt_code` is extracted and strips, which closes decision 180's unshipped
 fix.** That decision recorded the paste problem, demonstrated the fix in a wrapper
 written to measure it, and said in as many words that `cli.py` still passed a pasted
@@ -4309,6 +4341,146 @@ fallthrough that was already documented as "the safe direction to be wrong in" t
 it into a 400 carrying the error's own name and message. No translation was written
 for it, and that is the point - the grade was right for input a person supplied, which
 an over-limit withdrawal is.
+
+### Signing up with Google, and the identity somebody else vouches for
+
+This slice builds the last unbuilt clause of the MVP sentence - *"A person **signs
+up with Google**"* - and it is the first bullet of Phase 2c. Very little of the
+*shape* was new: `users.google_subject` has existed since Phase 1 with a comment
+explaining why `NULL` and `''` must stay distinct, `UserRepository.find_by_google_subject`
+has existed for as long, `LogIn._settle` already handled an account with no
+credential, and `RequestPasswordReset` was designed around the fact that a Google
+account would be exactly that. What did not exist was any verification of anything,
+any setting, any route, any CLI command, and any library capable of checking a
+signature.
+
+Two decisions were taken with the person who asked for this before the plan was
+written, and they frame everything below: **the id_token arrives in a request body**,
+and **an address that already has an account is refused rather than linked**.
+
+**The security chain this closes is worth stating first**, because it is the reason
+the feature is shaped the way it is rather than the other way round. An unverified
+Google address must never become a `User.email`, and the reason is a path through
+code that already shipped: `RequestPasswordReset` mails a code **to whatever address
+an account holds**, with no credential check, precisely so a credential-less account
+can set a first password. An address stored without Google having proved it would
+therefore be an address this system would mail a working reset code to, and whoever
+controlled that mailbox would take the account. `email_verified` is load-bearing
+rather than hygiene, and its refusal lives in the use case as a named error rather
+than being folded into the verifier, so the reason is greppable from the flow it
+protects.
+
+**204. Two use cases, not one create-or-log-in endpoint.** `SignUpWithGoogle` and
+`LogInWithGoogle` are separate modules with separate routes, and the argument is the
+one that produced Phase 2a: `SignUp`'s docstring records that `ResolveUserByEmail`'s
+find-or-create *"created an account as a side effect of a caller naming it"*, and
+that replacing it with two separate acts is the whole of that phase. A single Google
+endpoint would reintroduce exactly that, with the extra cost that "the address was
+free" and "the proof held" would collapse into one response a client could not read.
+Two use cases also keeps the 409 legible: it can only come from the sign-up half,
+where the caller was asking to create something.
+
+**205. The two routes mirror `POST /users` and `POST /sessions` exactly, including
+that signing up does not sign you in.** `POST /users/google` answers 201 with a
+`UserOut` and no session; `POST /sessions/google` answers 201 with a token. The cost
+is that a first-time client sends the same token twice, which is cheap because a
+token is reusable for its lifetime; the benefit is the one `POST /users` already
+argues - the address being free and the proof holding stay two facts. `LoggedIn` is
+the same frozen value `LogIn` returns, so `translate.session_out`, the CLI's
+`_start_session` and everything downstream of them work unchanged.
+
+**206. The audience is checked against our own client id, and this is the whole of
+the OIDC confusion bug.** A token that Google issued to *any other application* is a
+valid Google token. Without `audience=settings.client_id`, every Google-integrated
+product on the internet is a credential for this one. It is one keyword argument in
+the adapter, one line in the fake, and one test - which is exactly why it is worth a
+numbered decision rather than being left as an argument in a docstring, since the
+failure it prevents is invisible from every angle except the one it comes from.
+
+**207. `algorithms=["RS256"]` is pinned, never inferred.** PyJWT will happily read
+the algorithm out of the token's own header if you let it, and `alg: "none"` is the
+single most common JWT verification failure in the wild - a token that says "no
+signature" and a library that agrees. Pinning the list is what refuses it, and it has
+its own test.
+
+**208. The subject is the key and the address is a record.** `LogInWithGoogle` looks
+up `find_by_google_subject` and never consults the address on the token. A subject is
+stable for the life of a Google account, while the address on it can change - so an
+account found by address would be unreachable the moment its owner changed their
+Gmail, and worse, an account found by address is an account whose stored address a
+later token could silently re-point. So the address a token carries is used at the
+sign-up and never again, which makes a Google account's stored address a record of
+what it was rather than a key to it. This is the decision the Phase 1 groundwork was
+built for.
+
+**209. A duplicate address is a 409 and is never linked automatically.** If somebody
+already holds the address, `DuplicateEmailError` comes back and nothing is joined: a
+caller proving they hold a Google account has proved nothing about the account that
+already exists here, and linking would let whoever controls the Google identity take
+over an account they never authenticated against. The remedy is named in the refusal
+- use another address - and the person who has both keeps using both. That is a real
+cost and it is the price of not having an account-takeover path that reads as a
+convenience. A duplicate *subject* is a different 409 with a different remedy
+(`DuplicateGoogleSubjectError`, log in), which is why the two are not one class.
+
+**210. `email_verified` is normalised by the adapter and refused by the use case.**
+Google has shipped this claim as both a boolean and the string `"true"`, and
+`bool("false")` is `True` - so the adapter accepts either spelling and yields a real
+`bool`, and `GoogleIdentity.__post_init__` refuses anything that is not one. The
+division is `PaymentProvider.outcome_for`'s: **the port reports facts and the use
+case applies policy**, which is what lets the takeover argument above sit in the
+layer whose comments can be read alongside the reset flow it protects. The port
+cannot express "I could not reach Google" as a `GoogleIdentity`, so it raises:
+`InvalidGoogleTokenError` for a token that does not verify, `GoogleProviderError` for
+the case where nothing could be asked at all.
+
+**211. The verifier is built once and kept on `app.state`, unlike every other
+collaborator the identity routes use.** The contrast is with the SMS channel, which
+is built per request, and it is not stylistic: `jwt.PyJWKClient` fetches Google's
+signing keys, caches them and rotates them itself, so a per-request verifier would
+re-fetch the JWKS on every sign-in - slower, and a way to be rate-limited by a
+provider whose keys have not changed. It is `payment_provider`'s shape rather than
+the channel's, and `create_app`'s docstring carries the argument where the
+asymmetry is visible.
+
+**212. The address is still minted here, so `refuse_unusable_email` applies exactly
+as it does in `SignUp`.** The same pair in the same order - shape before usability,
+so `not-an-address` is not reported as an unusable one - and `emailAddress.py`'s
+header was corrected from "three call sites" to four, because a rule written down
+once is only worth having if the count of places it binds is kept true. The guard
+site here is the odd one of the four: nothing is *typed*, and the account is created
+all the same.
+
+**213. The CLI reuses `_prompt_code` rather than growing a twin.** `signup-google`
+and `login-google` read the token from a hidden prompt, never from a `--id-token`
+flag, and the argument is `_prompt_code`'s own written out one provider in advance:
+an argument lands in the shell's history file, in `ps` output for the duration, and
+in whatever the terminal is recording. An id_token is a better fit for that
+paragraph than the mailed codes it was written for - it is a live bearer credential
+for about an hour and the whole of the authorisation for the call - so the function
+gained a sentence and two callers rather than a copy. The stripping it does is right
+for the same reason it is right for a code and wrong for a password: a token is
+minted by a machine, so every character in it is Google's rather than the typist's.
+
+**The redirect flow is deliberately not built, and the reason is a setting this
+system has already decided not to have.** An authorization-code flow needs a
+`redirect_uri` - a public address for *this installation* - and there is no such
+setting, on purpose: `passwordResetMessage` argued that "any URL here would be
+invented - right on one installation and wrong on every other, and a promise no code
+keeps." Nor is there a browser front-end to redirect back to. So the verification
+core built here is the whole of what a redirect would need underneath it, and the
+redirect becomes a thin adapter over it in Phase 4, where TLS and a web front-end
+exist. The cost of not having it is that a person obtains a token from Google's OAuth
+2.0 Playground or their own client - which is why both CLI commands say so rather
+than pretending to be self-sufficient.
+
+**What is recorded rather than closed: an id_token is replayable for its lifetime**
+(about an hour). Nothing here can prevent it - the honest defences are TLS, which is
+Phase 4, and short lifetimes, which are Google's - so it is in `### Still open`
+rather than in a comment claiming the hole is shut. And **rate limiting gets more
+urgent rather than less**: this slice adds two unauthenticated writes that call out
+to a third party, which makes them the second and third members of the list
+`POST /password-resets` already leads.
 
 ### Still open
 
@@ -4635,7 +4807,8 @@ an over-limit withdrawal is.
 
   Two smaller things went the other way, and both were already on this list. An
   account holding no credential can gain its first password through this flow, which
-  no account can reach until Google OIDC lands (decision 190); and the paste fix
+  no account could reach until Google OIDC landed in 2c - and `SignUpWithGoogle` is
+  now the path that creates one (decision 190); and the paste fix
   decision 180 recorded and did not ship has now shipped, because the reset is the
   second caller that made extracting `_prompt_code` worth doing (decision 191).
 
@@ -4852,6 +5025,27 @@ an over-limit withdrawal is.
   already there is that a sweeper with no clock to run it is not a sweeper, which is
   why the plan's own option text ("an expiry policy, and a sweeper") was implemented
   as the first half only.
+- **The browser half of Google sign-in, deferred to Phase 4.** What shipped is a
+  verification core and two routes that accept a token. What did not ship is any way
+  for a *person* to obtain one without leaving this system: they use Google's OAuth
+  2.0 Playground or their own client, and both CLI commands say so rather than
+  implying otherwise. The authorization-code flow needs a `redirect_uri` - a public
+  address for *this installation* - and there is no setting for one, deliberately
+  (`passwordResetMessage`: "any URL here would be invented - right on one
+  installation and wrong on every other, and a promise no code keeps"), and no
+  browser front-end to come back to. Neither of those is a Google problem; both are
+  Phase 4's.
+- **A stolen Google id_token can be replayed until it expires, which is about an
+  hour.** Verification refuses everything it can refuse - signature, issuer,
+  audience, expiry, and an address Google has not proved - and none of that helps
+  once a valid token is in somebody else's hands, because a valid token *is* the
+  credential. TLS is the honest defence and TLS is Phase 4. Recorded here rather
+  than left as a comment claiming the hole is shut.
+- **An existing password account can never link a Google identity.** Declined by
+  decision 209 rather than overlooked: the 409 names the remedy, and a person who
+  holds both keeps two logins. What linking would need before it could be safe is
+  proof that whoever is at the Google end is whoever holds the password - which is
+  the password, presented again - and that is a flow nobody has asked for.
 
 ## Roadmap
 
@@ -4966,9 +5160,13 @@ is left with no exit (decision 106). Both were closed in 3a.
 
 **Phase 2c - the rest of it:**
 
-- Google OIDC signup, matching on the Google subject id rather than the email. This
-  is why `User` carries an optional `google_subject` and why `LogIn` already has a
-  branch for an account with no password credential.
+- ~~Google OIDC signup, matching on the Google subject id rather than the email.~~
+  It shipped as decisions 204-213, and both predictions held: `User` has carried an
+  optional `google_subject` since Phase 1, and `LogIn`'s branch for a
+  credential-less account was already written and already correct. The one thing the
+  groundwork did not anticipate is that the *proof* would arrive in a request body
+  rather than through a redirect - which is a property of Phase 4 not existing yet
+  rather than of this design.
 - Rate limiting on the auth endpoints first - login and signup are the ones worth
   brute-forcing - then on the API generally. It also carries the timing fix
   decision 81 documents. **And it is now the next thing owed rather than the next

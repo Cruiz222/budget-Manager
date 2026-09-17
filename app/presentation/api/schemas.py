@@ -634,6 +634,53 @@ class LogInIn(BaseModel):
         return self
 
 
+class GoogleTokenIn(BaseModel):
+    """A Google id_token, offered as proof of an identity.
+
+    **One field, and it is the only request body in this API that carries a live
+    credential belonging to somebody else.** Every other secret here is one this
+    system minted or one the caller chose; this one is a bearer token Google
+    signed, and it is the whole of the authorisation for the call. So
+    ``repr=False``, for ``SignUpIn``'s reason one provider over - a pydantic model
+    reprs its fields exactly as a dataclass does, and a traceback carrying this
+    value carries an hour of somebody's Google identity with it.
+
+    **No length rule, no format rule, no ``aud`` or ``sub`` or ``email`` field**,
+    and the absences are one decision rather than four. Everything a token asserts
+    is read out of the token by the adapter, and a field here for any of it would
+    be a value this layer accepted from the caller and the domain then had to
+    decide whether to believe - which is exactly the shape of bug signature
+    verification exists to prevent. A client cannot name a subject here, and it
+    cannot claim an address; the closest it can come is to send a token that says
+    those things, which is a request Google's key decides.
+
+    **The ``email_verified`` claim is not a field either**, and that one is worth
+    naming separately because it is the load-bearing fact of the whole flow: it
+    arrives inside the signed token, so it is the one place Google's answer cannot
+    be forged by whoever is holding the token.
+
+    **One schema for both routes**, unlike ``SignUpIn``/``LogInIn`` above, and the
+    difference is not an oversight to be tidied later. Those two split when a
+    login grew a way to name a number, because the two bodies stopped being the
+    same shape; these two genuinely take the same bytes today. **If either grows a
+    field, they split the same way and for the same reason** - and the direction to
+    expect is that sign-up grows one first, since a registration is where a display
+    name or a terms flag would land. Note also what the sharing costs: nothing here
+    distinguishes "create an account from this" from "log in with this", and it
+    should not - the path is what says which operation is meant, and a caller who
+    picked the wrong one gets ``DuplicateGoogleSubjectError``, which names the
+    remedy.
+    """
+
+    id_token: str = Field(
+        repr=False,
+        examples=["eyJhbGciOiJSUzI1NiIsImtpZCI6... a token from Google"],
+        description="The `id_token` Google issued. Obtain one with the OAuth 2.0 "
+        "Playground or a client library; the browser redirect that acquires one "
+        "is not built yet.",
+    )
+
+
 class EmailChangeIn(BaseModel):
     """The address to move to, and the proof that this is the account's owner asking.
 

@@ -1,10 +1,13 @@
 from app.infrastructure.settings import (
     DEFAULT_DATABASE_PATH,
     DEFAULT_PORT,
+    GoogleSettings,
     database_path,
     describe_configuration,
+    describe_google_configuration,
     describe_termii_configuration,
     from_environment,
+    google_from_environment,
     paystack_from_environment,
     termii_from_environment,
 )
@@ -387,4 +390,77 @@ class TestTheSmsProvider:
             )
             is None
         )
+
+
+class TestTheGoogleClientId:
+    """The fourth reader, and the only setting in this module that is not a secret.
+
+    Testing the *shape* would be four classes doing one job, so the tests below
+    are the things actually particular to this reader: that an absent value is
+    absent however it is spelled, and that the value is trimmed like every other
+    one - because a client id pasted out of the Google console carries a newline,
+    and a client id with a newline in it compares unequal to the ``aud`` claim in
+    every token Google will ever mint. That failure is a 401 on every sign-in from
+    a setting that looks, in any config listing, perfectly correct.
+    """
+
+    CLIENT_ID = "1234-abc.apps.googleusercontent.com"
+
+    def test_the_client_id_is_read(self):
+        settings = google_from_environment({"GOOGLE_CLIENT_ID": self.CLIENT_ID})
+
+        assert settings.client_id == self.CLIENT_ID
+
+    def test_no_client_id_means_no_settings(self):
+        """There is no half-configured state to be in, because there is one field.
+
+        Spelled out anyway, because "the only field is missing" is the case that
+        would be easy to let through as a settings object holding ``""`` - and
+        settings holding nothing would compare every token's audience against
+        nothing, refusing every sign-in while listing as configured.
+        """
+        assert google_from_environment({}) is None
+
+    def test_an_empty_string_counts_as_absent(self):
+        assert google_from_environment({"GOOGLE_CLIENT_ID": ""}) is None
+
+    def test_whitespace_counts_as_absent(self):
+        assert google_from_environment({"GOOGLE_CLIENT_ID": "   "}) is None
+
+    def test_surrounding_whitespace_is_trimmed(self):
+        settings = google_from_environment({"GOOGLE_CLIENT_ID": f" {self.CLIENT_ID}\n"})
+
+        assert settings.client_id == self.CLIENT_ID
+
+    def test_the_missing_variable_is_named(self):
+        assert describe_google_configuration({}) == "GOOGLE_CLIENT_ID is not set"
+
+    def test_a_complete_configuration_has_no_reason_to_give(self):
+        assert describe_google_configuration({"GOOGLE_CLIENT_ID": self.CLIENT_ID}) is None
+
+    def test_it_holds_no_secret(self):
+        """The one setting here that is not a credential, asserted so that the next
+        person to add a field has to argue with a failing test rather than a comment.
+
+        This reader deliberately has no client secret: nothing exchanges an
+        authorization code, so there is no secret for this server to hold. Should a
+        second field ever appear here it is because the redirect flow landed, and
+        that flow should be a deliberate diff - not a field that drifted in beside a
+        public identifier and inherited this module's expectations unexamined.
+        """
+        from dataclasses import fields
+
+        assert [field.name for field in fields(GoogleSettings)] == ["client_id"]
+
+    def test_it_is_not_a_mail_setting_and_does_not_depend_on_one(self):
+        """Stated in both directions, as the payment and Termii readers' versions are.
+
+        A Google client id does not configure mail, so an install with only this set
+        cannot send anything - and a complete mail configuration says nothing about
+        whether Google sign-in works. The two facts travel in different flows, which
+        is why ``describe_google_configuration`` is a function of its own rather than
+        a clause inside ``describe_configuration``.
+        """
+        assert google_from_environment(environment()) is None
+        assert from_environment({"GOOGLE_CLIENT_ID": self.CLIENT_ID}) is None
 

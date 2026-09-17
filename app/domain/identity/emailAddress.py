@@ -1,11 +1,11 @@
 """What an address must look like before anything further down can use it.
 
-**One predicate, three call sites, and they do not all read it the same way.**
+**One predicate, four call sites, and they do not all read it the same way.**
 ``has_real_domain`` answers a single question - is there a dot after the last
-``@`` - and the answer is used as a **guard** at the two places this system mints
-an address (``SignUp``, and the email-change request) and as a **courtesy** at the
-one place an address is handed to somebody else (``InitiateDeposit``, before a
-provider is asked to bill it).
+``@`` - and the answer is used as a **guard** at the three places this system
+mints an address (``SignUp``, the email-change request, and ``SignUpWithGoogle``)
+and as a **courtesy** at the one place an address is handed to somebody else
+(``InitiateDeposit``, before a provider is asked to bill it).
 
 The rule is the same rule, and the two readings are not the same thing:
 
@@ -25,6 +25,17 @@ too, for the opposite reason. At sign-up a strict rule that guesses wrong costs 
 retry; at deposit it costs a deposit. One predicate, read correctly at each site -
 which is decision 143's shape one job over, and the reason this file exists rather
 than a copy of the rule in each place.
+
+**The third guard site is the odd one and the rule still applies to it.** A Google
+sign-up does not read an address out of a form, so nothing is being *typed* there -
+but the account is created there, holding whatever Google reported, and that is the
+moment the address enters this system. A refusal costs the person a second Google
+account rather than a retry, which is a real cost and the smaller of the two: the
+alternative is an account whose address no payment provider will bill, discovered
+at the first deposit. Note also that Google's address is not automatically a real
+one under this rule - a Workspace account on an internal domain with no dot is
+exactly the shape this refuses, and refusing it at the door is decision 157 read as
+a guard rather than as a courtesy.
 
 **It lives in ``identity`` rather than beside the payer check**, because what an
 address *is* belongs to the aggregate that holds one (``User``), and the payments

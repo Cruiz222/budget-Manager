@@ -61,9 +61,21 @@ reason and with the same asymmetry one step further out. ``request_phone_verific
 is built for a caller who may not be anybody in this system at all - the account is
 what answering creates - which makes it the first service here whose subject does
 not yet exist rather than one whose subject cannot be proved. Its confirm joins the
-group whose warrant is a code. Read as a group, the six are one question asked four
-ways: *who is asking, and what proves it?* The answer for the newest pair is
-"nobody yet, and a text message".
+group whose warrant is a code.
+
+**The two Google services make that eight, and they are the first pair whose proof
+is not this installation's to mint.** Every warrant above is a value this system
+created and handed out: a code it mailed, a code it texted, a token it issued. What
+a Google service is handed instead is an assertion about somebody made by a party
+outside this system, and the check is a signature against keys that party publishes
+- so what these two are reachable by is not a mailbox or a handset but the ability
+to obtain a token from Google. Their asymmetry is the reset pair's exactly:
+``sign_up_with_google_service`` is built for a caller who may not be anybody yet,
+because the account is what presenting a valid token creates, while
+``log_in_with_google_service`` is built for one who already is. Read as a group, the
+eight are one question asked five ways: *who is asking, and what proves it?* The
+answer for the newest pair is "somebody a third party vouches for, and a signature
+this installation can check".
 """
 
 from datetime import datetime
@@ -74,6 +86,7 @@ from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.confirm_password_reset import ConfirmPasswordReset
 from app.application.identity.confirm_phone_sign_up import ConfirmPhoneSignUp
 from app.application.identity.log_in import LogIn
+from app.application.identity.log_in_with_google import LogInWithGoogle
 from app.application.identity.log_out import LogOut
 from app.application.identity.request_email_change import RequestEmailChange
 from app.application.identity.request_password_reset import RequestPasswordReset
@@ -82,6 +95,7 @@ from app.application.identity.request_phone_verification import (
 )
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
+from app.application.identity.sign_up_with_google import SignUpWithGoogle
 from app.application.payments.initiate_deposit import InitiateDeposit
 from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
@@ -93,6 +107,7 @@ from app.composition_root import (
     build_confirm_phone_sign_up,
     build_initiate_deposit,
     build_log_in,
+    build_log_in_with_google,
     build_log_out,
     build_plan_service,
     build_profile_service,
@@ -102,6 +117,7 @@ from app.composition_root import (
     build_resolve_actor,
     build_settler,
     build_sign_up,
+    build_sign_up_with_google,
     build_wallet_service,
 )
 from app.domain.identity.user import User
@@ -246,14 +262,17 @@ def profile_service(
 
 
 def sign_up_service(request: Request) -> SignUp:
-    """Registration, which is one of the five things reachable without a token.
+    """Registration, which is one of the nine unauthenticated writes this module builds.
 
     No ``current_actor`` parameter, and it cannot have one: signing up is how a
     person comes to be able to authenticate, so demanding a token would make the
     endpoint reachable only by those who no longer need it. That leaves it as an
-    unauthenticated write, which is inherent rather than a hole - and it is the
-    reason rate limiting is a real item in 2c, since this is the one endpoint
-    that will do tens of milliseconds of work for anybody who asks.
+    unauthenticated write, which is inherent rather than a hole. It is the first
+    of the nine, the same count ``tests/presentation/api/test_boundary.py``
+    keeps - and the reason rate limiting is a real item in 2c: this is the
+    endpoint that will spend tens of milliseconds of argon2 for anybody who asks,
+    and the Google pair at the bottom of this module is the only other pair that
+    spends anything at all.
 
     The hasher comes off ``app.state``, where ``create_app`` resolved it once.
     That is the same treatment the unit of work factory and the mail settings
@@ -270,8 +289,7 @@ def sign_up_service(request: Request) -> SignUp:
 
 
 def log_in_service(request: Request) -> LogIn:
-    """Login, the second of the five things reachable without a token, and the other
-    one that is a way in.
+    """Login, the second of those nine, and one of the ways in.
 
     **This endpoint is slow on purpose and must stay off the event loop.** It is
     a plain ``def``, so FastAPI runs it in its threadpool, which is what makes
@@ -280,6 +298,11 @@ def log_in_service(request: Request) -> LogIn:
     event loop and stall every other request for its duration. This is the first
     genuinely slow call in the API, so it is the first place that mistake would
     have mattered.
+
+    ``log_in_with_google_service`` below is the same act reached by a different
+    proof, and it does not share this paragraph: nothing on that path is slow on
+    purpose, because there is no password to compare and no cost parameter to
+    spend. Its own docstring carries what it does instead.
     """
     return build_log_in(
         unit_of_work_factory=request.app.state.unit_of_work_factory,
@@ -468,6 +491,72 @@ def confirm_phone_sign_up_service(request: Request) -> ConfirmPhoneSignUp:
     return build_confirm_phone_sign_up(
         unit_of_work_factory=request.app.state.unit_of_work_factory,
         password_hasher=request.app.state.password_hasher,
+    )
+
+
+def sign_up_with_google_service(request: Request) -> SignUpWithGoogle:
+    """Registering with a Google identity, for somebody who may not exist yet.
+
+    **No ``current_actor``, for ``sign_up_service``'s reason rather than the phone
+    dependency's above.** That one is built for a caller who may not be anybody here;
+    this one is built for a caller whose only proof was issued by somebody *else*,
+    about an identity this installation has never seen - and the account is what
+    presenting it creates. A session would refuse the whole flow, because the thing
+    being asked for is a way in.
+
+    **It is the one service in this module that leaves the process.** Every other
+    dependency here works on this database, this mail server or this SMS provider;
+    this one asks a third party whether a signature holds, and fetches that party's
+    public keys to do it. That is the whole reason the pair below is named in the
+    README's rate-limiting item rather than being left to the route's own comments,
+    and it is why the route that uses it takes no body a caller could make cheap.
+
+    **``verifier`` comes off ``app.state`` while every other collaborator here is
+    built per request, and the difference is the argument ``create_app`` writes
+    down.** A channel is a fresh conversation each time; the verifier holds Google's
+    signing keys in memory and rotates them itself, so building one per request
+    would re-fetch the JWKS on every signup and let a provider's rate limiter decide
+    how fast this endpoint is.
+
+    ``settings`` and ``verifier`` are handed over as the pair ``create_app``
+    resolved them - both, not one - so a request cannot present the builder with a
+    combination of the two that startup never produced. Nothing is read here: when
+    this installation has no client id both are ``None``, and the sentence naming
+    the missing variable is composed by the builder, for the reason
+    ``request_password_reset_service`` gives. Nothing in this module ever calls
+    ``describe_google_configuration``.
+    """
+    return build_sign_up_with_google(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.google,
+        verifier=request.app.state.google_verifier,
+    )
+
+
+def log_in_with_google_service(request: Request) -> LogInWithGoogle:
+    """Signing in with a Google identity, which is the other half of the pair above.
+
+    **No ``current_actor``**, and the reason is ``log_in_service``'s rather than the
+    one above: this is how a person comes to *have* a token, so demanding one would
+    make the endpoint reachable only by callers who no longer need it. It is the
+    ninth of the nine, and the last.
+
+    **It creates nothing, and that is what makes the refusal above it meaningful.**
+    A token naming no account here is a 401 in ``LogIn``'s own words; the remedy for
+    a caller who has none is ``POST /users/google``. So the two routes a person can
+    meet are "already an account" and "no account", and neither has to guess which
+    the caller meant - which is ``SignUp``'s find-or-create argument applied to a
+    second kind of proof.
+
+    Everything else is its sibling's: the same verifier off ``app.state``, the same
+    injected pair, the same 401 for a token that is not a Google token. What it adds
+    is the one thing this API has only ever done on a password - it hands back a
+    session, which is why ``POST /sessions`` exists at all.
+    """
+    return build_log_in_with_google(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.google,
+        verifier=request.app.state.google_verifier,
     )
 
 

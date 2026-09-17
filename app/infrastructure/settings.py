@@ -7,9 +7,10 @@ decision out of the domain. The reading is concentrated here so there is exactly
 one place to look when something is configured wrong - when a message does not
 arrive, or when a server is talking to the wrong database.
 
-It holds five unrelated things - mail settings, a payment provider's secret, an
-SMS provider's key and sender id, a database path and a session path - and that
-is a consequence of the sentence above rather than a failure of tidiness. The
+It holds six unrelated things - mail settings, a payment provider's secret, an
+SMS provider's key and sender id, a Google client id, a database path and a
+session path - and that is a consequence of the sentence above rather than a
+failure of tidiness. The
 alternative, a second module reading ``os.environ`` for the database or for
 Termii, would make the promise false, and the promise is the thing that makes
 configuration auditable. This module was ``notifications.email_settings`` until
@@ -28,6 +29,18 @@ about security:
   ability to tell this server that money arrived. ``TERMII_API_KEY`` is the same
   argument with a bill attached: a copy of it is a copy of this account's ability
   to spend, one text at a time, from anywhere on the internet.
+
+  **``GOOGLE_CLIENT_ID`` is the one setting here that is not a credential, and
+  it is deliberately still in this module.** It is public by construction - it
+  travels in every browser-side authorization request and is visible to anybody
+  who inspects the page - so it is not here because it needs hiding. It is here
+  because the rule above is about *where configuration comes from*, not about
+  secrecy: this module is the one place a deployment is described, and a setting
+  that lived somewhere else would be a setting nobody thinks to look for. The
+  consequence to be aware of is the opposite of the paragraph above: a client id
+  in a committed file leaks nothing, so the temptation to treat it casually is
+  harmless - while the file it sits in must still never hold the secret that
+  would.
 - **Configuration is not data.** Nothing in the database is a *setting*; it is
   the user's money and plans. A row that changed what the software did would be
   the first of its kind, and it would need its own interface, its own migration
@@ -323,6 +336,100 @@ def termii_from_environment(environ=None) -> TermiiSettings | None:
         api_key=_text(environ, "TERMII_API_KEY"),
         sender_id=_text(environ, "TERMII_SENDER_ID"),
     )
+
+
+@dataclass(frozen=True)
+class GoogleSettings:
+    """Everything one Google sign-in needs, and nothing else.
+
+    **One field, and there is no second one to add - no client secret.** That is
+    a property of the flow this system uses rather than an omission, and it is
+    worth stating plainly because every other integration in this module has a
+    secret and a reader will expect one here. Nothing in this codebase exchanges
+    an authorization code with Google: the client obtains an id_token itself and
+    presents it, so this server only ever *verifies* something Google signed. The
+    secret exists for the half of OAuth that asks Google for a token in exchange
+    for a code, and that half is not built - see the README's Phase 4, where the
+    redirect flow lands with the browser front-end.
+
+    So ``client_id`` is the whole of the configuration, and it is an *audience*
+    rather than a credential: it is what this server compares a token's ``aud``
+    claim against, to establish that the token was minted for this application
+    and not for some other one that also integrates Google. Without that
+    comparison every Google token on the internet would be a credential here,
+    which is why the field is required rather than optional - a reader that
+    returned settings without it would be a reader that turned verification into
+    a formality.
+
+    Frozen and behaviour-free, exactly as ``EmailSettings``, ``PaystackSettings``
+    and ``TermiiSettings`` are: it opens no connection, verifies nothing and can
+    be built by hand in a test without going near the environment. The JWKS
+    fetch, the signature check and the claim inspection all live in the adapter,
+    because a settings object that knew how to verify a JWT would be a settings
+    object with an opinion about a wire format.
+    """
+
+    client_id: str
+
+
+#: The Google variables with no sensible default, spelled as a tuple for
+#: ``REQUIRED``'s and ``TERMII_REQUIRED``'s reason: the message a person reads
+#: when this is unset names the variable, and a name is only worth composing if
+#: there is somewhere for it to come from.
+GOOGLE_REQUIRED = ("GOOGLE_CLIENT_ID",)
+
+
+def describe_google_configuration(environ=None) -> str | None:
+    """Why there is no Google configuration, in words a user can act on.
+
+    ``describe_termii_configuration``'s shape and its argument one channel over,
+    and the reason to keep them identical is the reason to have the function at
+    all: the sentence is composed **here** rather than at the raise site because
+    this module is the only reader of the environment, so the use case that
+    refuses cannot write it and the CLI and the API have to render one identical
+    sentence. What travels into the domain is a string, never a reader.
+
+    Returns ``None`` when the configuration is complete.
+    """
+    environ = os.environ if environ is None else environ
+
+    for name in GOOGLE_REQUIRED:
+        if _text(environ, name) is None:
+            return f"{name} is not set"
+
+    return None
+
+
+def google_from_environment(environ=None) -> GoogleSettings | None:
+    """Build the Google settings from the environment, or ``None`` if unset.
+
+    The fourth reader of this exact shape - ``from_environment`` for mail,
+    ``paystack_from_environment`` for payments, ``termii_from_environment`` for
+    texts, this one for Google sign-ins - and at four the pattern is no longer
+    something a reader has to infer from three examples.
+
+    ``None`` means this installation cannot accept a Google sign-in, which is a
+    normal state - a fresh clone, this test suite, a deployment nobody has
+    configured yet - and not an error. **It means the flow cannot run at all**,
+    which puts it with Termii's ``None`` rather than mail's: there is no
+    equivalent of "say nothing" or "accept nothing" available here, because a
+    token that cannot be verified is not a degraded sign-in but an unverified
+    one, and the only safe answer to that is to refuse. The refusal names the
+    variable - that is what ``describe_google_configuration`` above is for - so
+    an operator pointing this at a real deployment learns what to set rather than
+    that something went wrong.
+
+    A blank value counts as unset, for ``_text``'s reason everywhere else: a
+    variable set to spaces is one somebody meant to fill in, and treating it as a
+    client id would mean comparing every token's audience against whitespace -
+    which is a configuration that rejects every sign-in while looking, in any
+    config listing, like it is set.
+    """
+    environ = os.environ if environ is None else environ
+    if describe_google_configuration(environ) is not None:
+        return None
+
+    return GoogleSettings(client_id=_text(environ, "GOOGLE_CLIENT_ID"))
 
 
 def database_path(environ=None) -> str:

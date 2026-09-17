@@ -4,6 +4,7 @@ from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.confirm_password_reset import ConfirmPasswordReset
 from app.application.identity.confirm_phone_sign_up import ConfirmPhoneSignUp
 from app.application.identity.log_in import LogIn
+from app.application.identity.log_in_with_google import LogInWithGoogle
 from app.application.identity.log_out import LogOut
 from app.application.identity.request_email_change import RequestEmailChange
 from app.application.identity.request_password_reset import RequestPasswordReset
@@ -12,6 +13,7 @@ from app.application.identity.request_phone_verification import (
 )
 from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
+from app.application.identity.sign_up_with_google import SignUpWithGoogle
 from app.application.notifications.deliver_notifications import DeliverNotifications
 from app.application.notifications.deliver_pending_messages import (
     DeliverPendingMessages,
@@ -26,13 +28,19 @@ from app.application.planning.notify_upcoming_runs import NotifyUpcomingRuns
 from app.application.planning.run_due_plans import RunDuePlans
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.application.wallet_service import WalletService
+from app.domain.identity.googleIdentityVerifier import GoogleIdentityVerifier
 from app.domain.identity.password_hasher import PasswordHasher
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
+from app.infrastructure.identity.pyjwt_google_identity_verifier import (
+    PyJwtGoogleIdentityVerifier,
+)
 from app.infrastructure.settings import (
     EmailSettings,
+    GoogleSettings,
     PaystackSettings,
     TermiiSettings,
     describe_configuration,
+    describe_google_configuration,
     describe_termii_configuration,
 )
 from app.infrastructure.notifications.smtp_notification_channel import (
@@ -105,6 +113,40 @@ def provider_for(settings: PaystackSettings | None, provider=None):
     if settings is None:
         return None
     return PaystackPaymentProvider(secret_key=settings.secret_key)
+
+
+def google_verifier_for(
+    settings: GoogleSettings | None, verifier=None
+) -> GoogleIdentityVerifier | None:
+    """The Google verifier to trust: the injected one, PyJWT, or none at all.
+
+    ``provider_for``'s shape one integration along, and every part of that
+    docstring's argument transfers: both return ``None`` for an unconfigured
+    installation, both take an override that wins, and both are public because
+    ``create_app`` is a second caller outside this file.
+
+    **It is public here for a stronger version of the reason, and that reason is
+    worth stating because it is a performance decision rather than a tidy one.**
+    The adapter wraps a ``jwt.PyJWKClient``, which fetches Google's signing keys
+    once and then serves them from memory, rotating them when a token's ``kid`` is
+    not in the set. Building one per request would throw that cache away and make
+    every Google sign-in a network call to Google before it could even look at the
+    token - which is both slow and a way to get rate-limited by a provider whose
+    keys have not changed. So ``create_app`` resolves this once, at startup, and
+    the same object serves every request exactly as the payment provider does.
+
+    ``None`` is a value rather than a failure, and here it is stronger than it is
+    for payments: an installation with no client id cannot judge a token *at all*.
+    There is no degraded sign-in to fall back to, which is what
+    ``google_from_environment`` argues - the only answers are "verify" and
+    "refuse", and the refusal names the variable through
+    ``_no_google_account_reason`` below.
+    """
+    if verifier is not None:
+        return verifier
+    if settings is None:
+        return None
+    return PyJwtGoogleIdentityVerifier(settings)
 
 
 def _sms_channel_for(settings: TermiiSettings | None, channel=None):
@@ -580,17 +622,23 @@ def build_log_in(
 ) -> LogIn:
     """Wire up login, and note what this builder is the *only* source of.
 
-    A session token exists because this was called. There is no other path in the
-    codebase that writes a ``sessions`` row - ``build_sign_up`` does not, and
-    ``build_resolve_actor`` only reads - so "where do tokens come from" has a
-    one-line answer, and the answer is a use case a person has to satisfy with a
-    password.
+    A session token exists because this was called, **or because
+    ``build_log_in_with_google`` was** - and that second half was added when Google
+    sign-in landed, so the sentence above read "the only" for most of this file's
+    life and no longer does. What is left of the claim is the part that was doing
+    the work: there is no *other kind* of path. Nothing mints a token as a side
+    effect of reading something, no route returns one for a session that already
+    exists, and ``build_sign_up`` still does not write a ``sessions`` row. A token
+    comes from a login, and there are now two logins because there are two kinds of
+    proof - which is ``log_in``'s module docstring's subject, not this one's.
 
     The contrast with ``build_sign_up`` above is worth holding: that one needs the
     *same* hasher for a different verb. Hash-once and verify-many are two
     directions through one adapter, and both builders take it as an argument so
     that a test can substitute an adapter that recognises a password without
-    doing the work of one.
+    doing the work of one. ``build_log_in_with_google`` takes none, which is the
+    mechanical difference between the two logins: one compares a stored secret and
+    one never had a secret to compare.
     """
     return LogIn(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
@@ -898,3 +946,111 @@ def build_confirm_phone_sign_up(
         unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
         password_hasher=password_hasher or Argon2PasswordHasher(),
     )
+
+
+def build_sign_up_with_google(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: GoogleSettings | None = None,
+    verifier=None,
+) -> SignUpWithGoogle:
+    """Wire up registering the account a Google identity belongs to.
+
+    **No hasher, and here the absence is the feature rather than an omission.**
+    Four builders in this file take one, three of them for writing; this one and
+    its sibling below take none because nothing on this path is ever hashed - an
+    account arriving through Google has no password to store, and a hash invented
+    for it would be a password nobody chose. The hasher's absence is the
+    mechanical statement of what ``record_new_google_account`` does instead of
+    ``record_new_account``: one row rather than two.
+
+    No actor either, for ``build_request_password_reset``'s reason: the caller
+    cannot authenticate, and the token they present is the proof instead. A
+    dependency that demanded a session would refuse exactly the person the
+    endpoint exists for.
+
+    **This builder is where "no Google client id" becomes a refusal**, following
+    ``build_request_password_reset`` and ``build_request_phone_verification``
+    exactly: ``google_verifier_for`` returns ``None`` for an installation with no
+    client id, and the sentence naming the missing variable is composed *here*
+    because ``app.infrastructure.settings`` is the only module in the system that
+    reads the environment. A use case may not import it and an API dependency
+    cannot be seen by the CLI, so the sentence is made once where the
+    configuration is read and handed down as an argument.
+
+    The injected ``verifier`` is resolved first, so a test that passes a fake
+    never causes the real environment to be read at all - the same ordering the
+    two channel builders above use, and here it also means a suite can test this
+    whole feature without PyJWT ever being pointed at Google.
+    """
+    resolved = google_verifier_for(settings, verifier)
+    return SignUpWithGoogle(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        verifier=resolved,
+        unconfigured_reason=_no_google_account_reason(resolved),
+    )
+
+
+def build_log_in_with_google(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: GoogleSettings | None = None,
+    verifier=None,
+) -> LogInWithGoogle:
+    """Wire up exchanging a Google identity for a session.
+
+    ``build_sign_up_with_google``'s signature word for word, and the sameness is
+    worth noticing rather than skimming: the two halves of this feature take
+    exactly the same three arguments in exactly the same order, which is what
+    makes them two spellings of one wiring rather than two wirings that happen to
+    agree. The difference between them is entirely in what they *write* - a user
+    row against a session row - and that is stated where it can be read, in the two
+    use cases' own docstrings.
+
+    **It is the second builder in this file that writes a ``sessions`` row**, and
+    that is worth naming because ``build_log_in``'s docstring claims to be the only
+    source of tokens. It was, until this line existed; see that docstring, which
+    says so now. What is *not* shared is the hasher: ``build_log_in`` takes one to
+    compare a stored hash against, and there is no hash on this path at all, so a
+    password is never read - which is why the two builders that issue tokens do not
+    have the same signature.
+    """
+    resolved = google_verifier_for(settings, verifier)
+    return LogInWithGoogle(
+        unit_of_work_factory=unit_of_work_factory or SqliteUnitOfWorkFactory(),
+        verifier=resolved,
+        unconfigured_reason=_no_google_account_reason(resolved),
+    )
+
+
+def _no_google_account_reason(resolved) -> str | None:
+    """Why no Google sign-in can be judged here, in the one sentence both say.
+
+    ``_no_mail_account_reason``'s shape and ``_no_sms_account_reason``'s other
+    half - a prefix saying what is impossible, then ``describe_google_configuration``
+    naming the variable that would fix it - and the third of these functions is
+    what turns the pattern from a repeated decision into the house shape for a
+    channel that can be missing. Each one composes from *its own* reader, so an
+    install with mail and no Google says which variable is missing rather than
+    reporting an outage.
+
+    ``None`` when there is a verifier, because there is nothing to explain; and
+    the prefix alone when ``describe_google_configuration`` has nothing to add,
+    which happens only when the environment is complete and yet no settings and no
+    verifier reached this function - a caller that bypassed
+    ``google_from_environment``.
+
+    **The prefix is the part a person could not infer**, and here it says something
+    slightly different from the other two: a mail-less install cannot reset a
+    password, an SMS-less one cannot verify a number, and a Google-less one cannot
+    sign anybody in *at all*. There is no fallback flow for a client that arrived
+    holding an id_token - it either lets them in or it does not - which is why this
+    sentence is worth reading as the strongest of the three rather than the third
+    of a kind.
+    """
+    if resolved is not None:
+        return None
+    missing = describe_google_configuration()
+    reason = (
+        "this installation has no Google client id, so no Google sign-in can be "
+        "verified"
+    )
+    return f"{reason}: {missing}" if missing else reason

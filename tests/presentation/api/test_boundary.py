@@ -48,18 +48,20 @@ import pytest
 #: the safe side of the line - or deciding the line has moved.
 EXPECTED_OPERATIONS = {
     ("get", "/health"),
-    # Two of the seven unauthenticated writes, and the only routes on this list
+    # Two of the nine unauthenticated writes, and the only routes on this list
     # that need nobody: they are how a caller comes to have a credential at all.
-    # (The other five arrived later - the email change's confirm, the two
-    # password-reset routes and, last, the two phone-verification routes. They sit
-    # at the ends of this set rather than here because they are authorised by
-    # something else entirely: a code mailed to an address, or texted to a handset.
+    # (The other seven arrived later - the email change's confirm, the two
+    # password-reset routes, the two phone-verification routes, and last the two
+    # Google routes. They sit at the ends of this set rather than here because they
+    # are authorised by something else entirely: a code mailed to an address, a code
+    # texted to a handset, or a signature Google made over a token.
     # What they have in common with these two is only the absence of a bearer
     # token, and what they have in common with *each other* is a feature.)
     # They are listed here like everything else rather than held, because the
     # boundary is about what is *routable*, and the question of whether they should
     # be rate limited is a different one that lives in the README's open list -
-    # where the reset request has now joined it as the entry that most needs one.
+    # where the reset request has now joined it as the entry that most needs one,
+    # and the Google pair has joined it as the entries that leave the process.
     ("post", "/users"),
     ("get", "/users/me"),
     ("post", "/sessions"),
@@ -165,8 +167,8 @@ EXPECTED_OPERATIONS = {
     #
     # **The confirm used to be the third unauthenticated write in this API and the
     # only one authorised by a thing mailed rather than presented at the time.**
-    # Both halves of that sentence are now out of date, and the two entries below
-    # are why: there are seven unauthenticated writes rather than three, and the
+    # Both halves of that sentence are now out of date, and the entries below are
+    # why: there are nine unauthenticated writes rather than three, and the
     # reset confirm is authorised by a mailed code in the same sense this one is.
     # What is still true, and is the part that matters, is that the code exists
     # only because somebody already presented the account's password to mint it,
@@ -191,9 +193,10 @@ EXPECTED_OPERATIONS = {
     # to whatever mailbox that address names, so a path claiming ``/users/me``
     # would promise a check this feature is unable to perform.
     #
-    # **The request is the fifth unauthenticated write in this API and the first
-    # aimed at an account its caller has no claim on.** Rank the five and the ranking
-    # is the argument:
+    # **The request was the fifth unauthenticated write in this API when it landed,
+    # and the first aimed at an account its caller has no claim on.** (There are
+    # nine now - see the top of this list - and the ranking below is written against
+    # the five that existed then.) Rank the five and the ranking is the argument:
     # ``POST /users`` creates an account nobody had, ``POST /sessions`` exchanges a
     # secret the caller already knows, ``POST /email-changes/confirm`` acts on an
     # account the caller proved by password and then by mailbox, and
@@ -257,8 +260,8 @@ EXPECTED_OPERATIONS = {
     # answering the code creates. A path under ``/users/me`` would promise a check
     # there is nothing to perform it against.
     #
-    # **The request is the sixth unauthenticated write in this API and the only
-    # one that costs the installation money per call.** The reset request beside it
+    # **The request was the sixth unauthenticated write in this API when it landed,
+    # and is the only one that costs the installation money per call.** The reset request beside it
     # sends a mail through an account the operator already pays for; this one sends
     # a *text*, billed per message, through a provider, on an endpoint with no actor
     # and no rate limiter. It is the strongest entry in the README's rate-limiting
@@ -283,6 +286,47 @@ EXPECTED_OPERATIONS = {
     # caller holds two facts it can log in with, and the honest next step is
     # ``POST /sessions``.
     ("post", "/phone-verifications/confirm"),
+    # --- signing up with Google, added last ----------------------------------
+    #
+    # Two routes, split across two prefixes that both name a resource the caller
+    # does not own yet - ``/users/google`` and ``/sessions/google`` - and the split
+    # is the same one ``POST /users`` and ``POST /sessions`` have always had, said
+    # again for a third kind of proof. Registering and proving are separate acts,
+    # so a client holding a Google token makes two calls with it; the token is
+    # reusable inside its lifetime, so the second call costs a round trip and no
+    # second credential.
+    #
+    # **The pair is the eighth and ninth unauthenticated writes in this API**, and
+    # of the seven that came before they most resemble the phone pair: both were
+    # added as two halves of one feature, both create an account without a password
+    # the caller typed, and both are unauthenticated because the proof they carry
+    # is not a session. The differences are the two worth knowing. A phone signup
+    # costs the installation money and proves a handset; this costs it a *network
+    # call to a third party* and proves an identity held by somebody else.
+    #
+    # **What the caller cannot say is the whole of the safety argument**, and it is
+    # stronger than any other entry on this page: there is no field for a subject,
+    # an address or a verification flag anywhere in the request, and the schema is
+    # one opaque string. Everything the account is created *from* arrives inside a
+    # signature this installation checks against Google's published keys and
+    # against its own client id - so a client cannot name a subject here any more
+    # than it can name a user id on ``POST /users``.
+    #
+    # What a stranger can make this server do with them: cause a signature check
+    # and a key lookup, and - if they hold a genuine token for an address Google
+    # has not verified - nothing at all, which is ``UnverifiedGoogleEmailError``.
+    # It is the README's rate-limiting item's third member, because both halves are
+    # unauthenticated writes that leave the process.
+    ("post", "/users/google"),
+    #
+    # The second half, and the only route in this API that issues a session on
+    # something other than a password. ``LogInWithGoogle`` never creates an account
+    # - a token naming no account here is a 401 with ``LogIn``'s own sentence - so
+    # the remedy for a caller who has no account is the route above, and the remedy
+    # for one who has is this. That separation is what keeps ``POST /users/google``'s
+    # 409 meaningful, and it is ``SignUp``'s find-or-create argument applied to a
+    # second kind of proof rather than restated.
+    ("post", "/sessions/google"),
 }
 
 #: Balance changes that are still held, each one because the movement's far end

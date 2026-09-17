@@ -33,7 +33,9 @@ from app.domain.planning.plannedAction import PlannedAction
 from app.presentation.api.schemas import (
     ConfirmEmailChangeIn,
     ConfirmPasswordResetIn,
+    ConfirmPhoneSignUpIn,
     EmailChangeIn,
+    GoogleTokenIn,
     LogInIn,
     SignUpIn,
 )
@@ -315,14 +317,25 @@ class TestTheTwoPresentationsAgree:
 class TestThePasswordIsNotInTheRepr:
     """A secret in a repr is a secret in a log, and ``schemas.py`` claims otherwise.
 
-    Six fields across five models set ``Field(repr=False)``, and their docstrings say
-    what it buys: without it, a model caught in an unexpected error writes the secret
-    into whatever records the exception - the same hazard ``PlainPassword.__repr__``
-    closes one layer down. That is a claim about a leak, so it gets a test rather
-    than a comment. The fields are ``SignUpIn.password``, ``LogInIn.password``,
-    ``EmailChangeIn.password``, ``ConfirmEmailChangeIn.token`` and both fields of
-    ``ConfirmPasswordResetIn`` - and the last three arrived with the two
-    mailbox-credential flows rather than with the first two.
+    Nine fields across seven models set ``Field(repr=False)``, and their docstrings
+    say what it buys: without it, a model caught in an unexpected error writes the
+    secret into whatever records the exception - the same hazard
+    ``PlainPassword.__repr__`` closes one layer down. That is a claim about a leak,
+    so it gets a test rather than a comment. The fields are
+    ``SignUpIn.password``, ``LogInIn.password``, ``EmailChangeIn.password``,
+    ``ConfirmEmailChangeIn.token`` and both fields of ``ConfirmPasswordResetIn`` -
+    which arrived with the two mailbox-credential flows rather than with the first
+    two - then ``ConfirmPhoneSignUpIn``'s two with the phone flow, and
+    ``GoogleTokenIn.id_token`` last.
+
+    **The count is written out because it has already gone stale once.** This
+    paragraph said "six fields across five models" and stayed saying it through the
+    whole phone slice, which added two more - so the phone model's redaction was
+    never asserted anywhere, and nothing failed. The lesson is not that the number
+    matters but that a prose count next to code is true only until the next field,
+    which is the same warning ``test_boundary.py`` attaches to
+    ``EXPECTED_OPERATIONS``. A model added here without a test below shows up as
+    this sentence being wrong rather than as a missing assertion.
 
     It lives in this file because this is where the request and response *shapes* are
     pinned, and because it is otherwise easy to read as covered: the API's own tests
@@ -386,6 +399,49 @@ class TestThePasswordIsNotInTheRepr:
             ConfirmPasswordResetIn(token="THE-SECRET", password="THE-SECRET")
         )
 
+    def test_the_texted_code_model_hides_the_code_too(self):
+        """``ConfirmPhoneSignUpIn`` is the shape above, one channel over.
+
+        **It is here because this test was missing and nothing noticed.** The class
+        docstring counted six fields across five models and went on counting them
+        through the whole phone slice - so the phone confirm's ``code``, which
+        creates an account and spends the installation's money on the way to doing
+        it, had its redaction asserted nowhere. The gap surfaced while the Google
+        model below was being added, which is the ordinary way one surfaces: by
+        reading the sentence that was supposed to enumerate them.
+
+        A texted code and not a mailed one, so it does not belong in the test above
+        whatever the resemblance - the two flows differ in what they prove and in
+        what a leaked code costs, and a name that said "mailed" over this one would
+        be the kind of small untruth this suite spends its docstrings avoiding.
+
+        Both fields are secrets, and there is no control to offer for the reason the
+        test above gives: the whole body is the credential.
+        """
+        assert "THE-SECRET" not in repr(
+            ConfirmPhoneSignUpIn(code="THE-SECRET", password="THE-SECRET")
+        )
+
+    def test_the_google_token_model_hides_the_token(self):
+        """**The one field in this API that is a credential belonging to somebody else.**
+
+        Every other secret in this class is one this system minted or one the caller
+        chose: a password, a mailed code, a texted code. An id_token is a bearer
+        token *Google* signed, it is the whole of the authorisation for the call,
+        and whoever holds it can turn it into a session here without knowing
+        anything else about the account. So a repr in a traceback is not a leaked
+        password its owner can choose again - it is an hour of somebody's Google
+        identity, written to a log on a machine whose operator need not be them.
+
+        ``GoogleTokenIn`` has one field and it is that one, so there is no control
+        available here: a repr that printed nothing at all would pass, and would be
+        correct. Asserted anyway for the reason the two tests above are - the
+        exposure is in-process, so nothing that goes through ``client`` can see it,
+        and ``TestRegistering::test_the_token_is_not_printed`` over in the Google
+        file is checking the *other* direction.
+        """
+        assert "THE-SECRET" not in repr(GoogleTokenIn(id_token="THE-SECRET"))
+
     def test_and_the_address_is_still_there(self):
         """The control. Without it both tests above pass for a repr that says nothing.
 
@@ -411,6 +467,11 @@ class TestThePasswordIsNotInTheRepr:
         confirm has to read ``body.token`` to claim the row and ``body.password`` to
         hash it, so a redaction that made either unreachable would not be a leak
         fixed but a feature deleted.
+
+        ``GoogleTokenIn`` is the third case and the most tempting to "fix": the
+        adapter is handed ``body.id_token`` and verifies it, so a field that had been
+        made private to keep it out of a repr would refuse every Google sign-in
+        while leaving every assertion above green.
         """
         assert SignUpIn(email="ada@example.com", password="THE-SECRET").password == "THE-SECRET"
 
@@ -419,3 +480,4 @@ class TestThePasswordIsNotInTheRepr:
         assert body.token == "THE-SECRET"
         assert body.password == "THE-SECRET"
         assert LogInIn(email="ada@example.com", password="THE-SECRET").password == "THE-SECRET"
+        assert GoogleTokenIn(id_token="THE-SECRET").id_token == "THE-SECRET"

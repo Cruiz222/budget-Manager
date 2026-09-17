@@ -24,7 +24,7 @@ there is load.
 
 from fastapi import FastAPI
 
-from app.composition_root import provider_for
+from app.composition_root import google_verifier_for, provider_for
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
@@ -32,6 +32,7 @@ from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHas
 from app.infrastructure.settings import database_path as configured_database_path
 from app.infrastructure.settings import (
     from_environment,
+    google_from_environment,
     paystack_from_environment,
     termii_from_environment,
 )
@@ -60,6 +61,8 @@ def create_app(
     paystack_settings=None,
     payment_provider=None,
     termii_settings=None,
+    google_settings=None,
+    google_verifier=None,
 ) -> FastAPI:
     """Build the application.
 
@@ -134,6 +137,31 @@ def create_app(
     So the seam for a test is the same one the mail tests use - the channel builder
     inside ``composition_root`` - rather than a fourth thing on ``app.state`` that
     no route would ever read.
+
+    ``google_settings`` - the Google configuration, a ``GoogleSettings``. ``None``
+    means "read this installation's configuration", and an installation without
+    ``GOOGLE_CLIENT_ID`` resolves to ``None`` - a supported state, and the state a
+    fresh clone is in. It is Termii's ``None`` rather than mail's: this
+    installation cannot judge a Google token, and there is no "do without it"
+    available for a flow whose entire input is that token.
+
+    ``google_verifier`` - the ``GoogleIdentityVerifier`` port, and it is a
+    parameter for the reason ``payment_provider`` is: it is the seam a test
+    substitutes. The contrast with ``termii_settings`` above is the one worth
+    drawing out, because the two look like the same kind of thing and are not.
+    Nothing on ``app.state`` holds an SMS channel; a channel is built per request
+    inside a builder, because each send is a fresh conversation and there is
+    nothing to keep. **A verifier is kept, and it is kept on purpose**, because the
+    adapter holds Google's signing keys in memory and rotates them itself -
+    building one per request would re-fetch the JWKS on every sign-in, which is
+    slower and is a way to be rate-limited by a provider whose keys have not
+    changed. So this is the payment provider's shape rather than the SMS channel's,
+    and ``google_verifier_for`` carries the argument.
+
+    ``None`` for both is a supported state rather than an error, and the two are
+    resolved together rather than independently - settings without a verifier is an
+    installation that *could* verify, a verifier without settings is a test. The
+    same pair-wise reasoning ``paystack_settings``/``payment_provider`` gets above.
     """
     application = FastAPI(
         title="Budget Manager",
@@ -175,6 +203,14 @@ def create_app(
     )
     application.state.termii = (
         termii_from_environment() if termii_settings is None else termii_settings
+    )
+    application.state.google = (
+        google_from_environment() if google_settings is None else google_settings
+    )
+    application.state.google_verifier = (
+        google_verifier_for(application.state.google)
+        if google_verifier is None
+        else google_verifier
     )
 
     errors.install(application)

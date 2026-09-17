@@ -1,4 +1,21 @@
-"""Proving an identity: the one operation that hands out a session."""
+"""Proving an identity with a password.
+
+Handing out a session is no longer this module's alone. ``LogInWithGoogle`` issues
+one from a Google id_token, and the shared half - building a ``Session``, saving
+it, committing, returning a ``LoggedIn`` - is the same act reached by a different
+proof. The two are separate use cases rather than one with a branch, for the reason
+``sign_up`` gives about find-or-create: the proof a caller offers is the thing
+that decides which operation they are performing, and a single entry point taking
+"an identifier and a password, or a token" would be two operations wearing one
+name.
+
+What is *shared* between them is the refusal, and only the refusal is shared. The
+timing oracle this module spends real effort closing does not exist on the Google
+path at all: there is no stored hash to compare against, so there is no branch
+that returns early when no credential is found, and the token's verification costs
+the same whether or not the subject is known. That asymmetry is why these are two
+modules instead of one.
+"""
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,7 +38,22 @@ from app.domain.identity.user import User
 #: is back. There are four paths to it below - two entry points, each able to find
 #: no account or the wrong password - and a fifth is the kind of change somebody
 #: makes while adding a feature.
-_REFUSAL = "those details did not match an account"
+#:
+#: **It is public, and it became public with Google sign-in.** ``LogInWithGoogle``
+#: raises ``InvalidCredentialsError`` with these same words for a different fact -
+#: a verified Google identity that names no account here - and it *imports* them
+#: rather than composing its own. That is a deliberate reversal of the leading
+#: underscore: a name imported across a module boundary is part of what that
+#: module offers, and leaving it private while reaching for it from elsewhere is a
+#: comment saying "do not do this" that the code then does anyway.
+#:
+#: What did **not** change is the test's copy of it.
+#: ``tests/application/identity/test_log_in.py`` still writes the sentence out by
+#: hand, and should: a test that imported this would agree with it by
+#: construction, so the thing worth pinning - that the *value* does not drift -
+#: would stop being checked at all. Production shares it because drift there is a
+#: bug; the suite duplicates it because drift there is the signal.
+REFUSAL = "those details did not match an account"
 
 
 @dataclass(frozen=True)
@@ -236,7 +268,7 @@ class LogIn:
         # covers it, and it is there to be read: it is what says the account below
         # exists, which the session's ``user.user_id`` depends on.
         if user is None or encoded is None or not matched:
-            raise InvalidCredentialsError(_REFUSAL)
+            raise InvalidCredentialsError(REFUSAL)
 
         session, token = Session.issue(user.user_id, now)
         uow.sessions.save(session)

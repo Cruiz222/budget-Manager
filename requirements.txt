@@ -59,3 +59,38 @@ argon2-cffi==25.1.0
 # integration that decides whether money is credited has no third-party
 # dependency in it at all.
 httpx==0.28.1
+
+# Verifying a Google sign-in. A runtime dependency since Phase 2c, and the first
+# line in this file that is a **deliberate departure from the stdlib streak** -
+# which is why the paragraph above is the right place to start reading it.
+#
+# That paragraph says the webhook's half of the Paystack integration "has no
+# third-party dependency in it at all", and it is true because the standard
+# library *has* HMAC. This is the same instinct one step further along, and it is
+# where the instinct stops being a virtue: stdlib has no RSA, so checking a Google
+# signature without a library means implementing PKCS#1 v1.5 verification by hand
+# around a public key parsed from a JWKS document. That is not a smaller
+# dependency, it is a hand-rolled one - and the failure mode of getting it subtly
+# wrong is that forged tokens verify. So the streak is honoured where it can be
+# and broken here, in the open, rather than bent to look unbroken.
+#
+# Only the *extra* is needed for verification: ``PyJWT`` alone signs and decodes
+# HMAC and leaves RS256 unavailable, so ``crypto`` is what brings
+# ``cryptography`` in and what makes ``algorithms=["RS256"]`` mean anything. The
+# adapter is the only thing that imports either, so nothing in the domain or the
+# application layer has heard of this line - the same shape the argon2 paragraph
+# above describes, and for the same reason.
+#
+# **No client secret comes with it, and that is a property of the flow rather
+# than an omission.** Nothing here exchanges an authorization code, so there is no
+# secret to hold and none to configure; the only setting this feature adds is a
+# client id. That is what makes this flow cheaper to run than the redirect one, and
+# it is also the half that is deliberately deferred to Phase 4 - see the README.
+#
+# **Confirm the number below on the first install.** It is pinned the way the rest
+# of this file is, but the pin was written without a ``pip`` run available in the
+# environment that authored it, which is the one thing this file's convention
+# cannot supply from memory: every other line here records what pip actually
+# resolved, and this one records what it is expected to. An install that disagrees
+# is telling you the number, not breaking anything.
+PyJWT[crypto]==2.10.1

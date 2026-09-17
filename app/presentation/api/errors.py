@@ -60,15 +60,19 @@ from fastapi.responses import JSONResponse
 
 from app.domain.identity.exception import (
     DuplicateEmailError,
+    DuplicateGoogleSubjectError,
     DuplicatePhoneError,
     EmailChangeAlreadyUsedError,
     EmailChangeExpiredError,
     EmailUnchangedError,
+    GoogleProviderError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
+    InvalidGoogleTokenError,
     InvalidPasswordResetTokenError,
     InvalidPhoneVerificationTokenError,
     InvalidSessionError,
+    NoGoogleAccountError,
     NoMailAccountError,
     NoSmsAccountError,
     PasswordResetAlreadyUsedError,
@@ -155,12 +159,27 @@ from app.domain.payments.exception import DepositAlreadyInitiatedError
 #: account yet - nothing else, with one class, because a caller who could tell them
 #: apart has an oracle and the remedy is identical. The 401 is the same 401 for the
 #: same reason: a credential was presented, looked up, and was not good enough.
+#:
+#: ``InvalidGoogleTokenError`` is the fifth, and it is the first member of this list
+#: whose credential neither this system minted nor the caller chose - it is a
+#: signature Google made over an assertion about somebody. It fits the grade in the
+#: same words rather than by analogy: the request presented a credential, the
+#: credential was checked, and it was not good enough. **Its collapse is the widest
+#: of the five and the reason is the same one**: unknown, malformed, expired, signed
+#: by the wrong key, issued to *another application* and issued by another issuer
+#: are one class on the wire, because the remedy is one thing - get a fresh token -
+#: and because telling a forger which check their forgery failed is telling them how
+#: to fix it. The ``aud`` case is worth naming inside that list rather than leaving
+#: it as one of five, since it is the one a caller can reach *by accident*: a
+#: perfectly good Google token, for somebody else's product, is not a credential
+#: here and must not be treated as one.
 UNAUTHORIZED = (
     InvalidSessionError,
     InvalidCredentialsError,
     InvalidEmailChangeTokenError,
     InvalidPasswordResetTokenError,
     InvalidPhoneVerificationTokenError,
+    InvalidGoogleTokenError,
 )
 
 #: The resource is not there for the actor asking. One status, one body, whatever
@@ -262,6 +281,17 @@ NOT_FOUND = (
 #: small as a phone number's. The grade is unchanged by that: the request is well
 #: formed, the number is a real number, and it is the state of the world that
 #: refuses it.
+#:
+#: ``DuplicateGoogleSubjectError`` is the third of that family and the first that is
+#: about a *link* rather than a value. An address and a number are things a person
+#: types and could have typed differently; a Google subject is an opaque identifier
+#: issued to one account by a third party, and there is exactly one of it per
+#: account. So what refuses this request is "that Google identity already has an
+#: account here" - the plainest possible statement about a row that exists. It is
+#: deliberately not folded into ``DuplicateEmailError`` beside it even though both
+#: can be returned by the same route, because the two remedies differ and a caller
+#: that got one name for both would have to guess: *use another address*, against
+#: *log in*.
 CONFLICT = (
     InsufficientFundsError,
     WalletFrozenError,
@@ -276,6 +306,7 @@ CONFLICT = (
     DuplicateFundNameError,
     DuplicateEmailError,
     DuplicatePhoneError,
+    DuplicateGoogleSubjectError,
     PlanNotActiveError,
     PlanNotPausedError,
     PlanAlreadyFinishedError,
@@ -442,7 +473,47 @@ class PaymentsUnconfiguredError(ApiError):
 #: a number has no second proof, because the reason to believe somebody holds a
 #: handset *is* a message arriving on it. So the 503 is the only true answer rather
 #: than the kinder one.
-UNAVAILABLE = (NoMailAccountError, NoSmsAccountError)
+#:
+#: **``NoGoogleAccountError`` is the third and the first that is not about a channel
+#: this installation runs.** The two above say "this deployment cannot reach you the
+#: way the flow requires"; this one says "this deployment cannot check what you
+#: showed me" - the same shape one step further back, and the disclosure argument
+#: transfers with it, since the body names ``GOOGLE_CLIENT_ID`` for the same reason
+#: the others name theirs. What is new is that the missing variable is one **no
+#: caller could supply**: a person who wanted to reset a password on a mail-less
+#: install could not fix it either, but at least the setting is about reaching
+#: *them*. This one is purely the operator's, which is why the 503 is not merely the
+#: kinder answer but the only true one - "change what you sent" is not available
+#: here in any form.
+#:
+#: It is a distinct class from ``GoogleProviderError``, which is also a 503 and
+#: describes the opposite situation: Google configured and *unreachable*. The two
+#: are worth keeping apart for the reason the code above gives about 401s and 404s -
+#: one is a fact about the deployment that the deployment can fix, the other is a
+#: fact about the world that nobody can. Both are 503s because both mean "come back
+#: later" rather than "change your request", which is the property this grade is
+#: defined by rather than a coincidence of two classes landing together.
+#:
+#: **``GoogleProviderError`` is the fourth member, and the first that is not about a
+#: missing setting.** The three above are all "this installation has nothing to work
+#: with"; this one is "it has everything and could not reach the far end" - and it
+#: belongs in this tuple rather than in the 400 fall-through for the reason
+#: ``GoogleProviderError``'s own docstring gives at length: an SMS provider failure
+#: is about *the message*, and a key set that could not be fetched is a fact about
+#: the server, so no change to the request would alter it. Leaving it out would be
+#: the exact failure this module's header warns about - a refusal falling through to
+#: a 400 and telling a caller their token was wrong when it was never read.
+#:
+#: It is the one member here that is reachable while the installation is *correctly
+#: configured*, which is what makes it worth asserting separately: the three above
+#: are testable by clearing a variable, and this one needs Google to be unreachable
+#: while ``GOOGLE_CLIENT_ID`` is set.
+UNAVAILABLE = (
+    NoMailAccountError,
+    NoSmsAccountError,
+    NoGoogleAccountError,
+    GoogleProviderError,
+)
 
 
 def _grade(exc: MoneyError) -> int:

@@ -24,6 +24,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from app.composition_root import build_log_in, build_sign_up
+from app.domain.identity.exception import InvalidGoogleTokenError
+from app.domain.identity.googleIdentity import GoogleIdentity
+from app.domain.identity.googleIdentityVerifier import GoogleIdentityVerifier
 from app.domain.identity.password import PlainPassword
 from app.domain.identity.password_hasher import PasswordHasher
 from app.domain.identity.user import User
@@ -33,7 +36,7 @@ from app.infrastructure.payments.paystack_payment_provider import (
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
-from app.infrastructure.settings import TermiiSettings
+from app.infrastructure.settings import GoogleSettings, TermiiSettings
 from app.presentation.cli import _write_token
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
@@ -327,17 +330,30 @@ SETTINGS_VARIABLES = (
     "BUDGET_DB",
     "BUDGET_SESSION",
     "PAYSTACK_SECRET_KEY",
-    # ``TERMII_API_KEY`` and ``TERMII_SENDER_ID`` are the newest pair, and they are
-    # here for the same class of reason ``BUDGET_SESSION`` is - with one difference
-    # that makes them the more urgent of the two. A developer with an SMS key
-    # exported does not merely get a *wrong* value; ``build_request_phone_verification``
-    # would resolve the real ``TermiiSmsChannel`` from the environment, and the
-    # suite would then open a socket and send a **billable text message** from
-    # whichever test ran first. Nothing would fail: the code would be texted to a
-    # number no test owns and the assertion would be about a channel the test never
-    # held. Clearing them is what keeps the seam a seam.
+    # ``TERMII_API_KEY`` and ``TERMII_SENDER_ID`` are a pair rather than two
+    # separate entries, and they are here for the same class of reason
+    # ``BUDGET_SESSION`` is - with one difference that makes them the more urgent
+    # of the two. A developer with an SMS key exported does not merely get a
+    # *wrong* value; ``build_request_phone_verification`` would resolve the real
+    # ``TermiiSmsChannel`` from the environment, and the suite would then open a
+    # socket and send a **billable text message** from whichever test ran first.
+    # Nothing would fail: the code would be texted to a number no test owns and the
+    # assertion would be about a channel the test never held. Clearing them is what
+    # keeps the seam a seam.
     "TERMII_API_KEY",
     "TERMII_SENDER_ID",
+    # ``GOOGLE_CLIENT_ID`` is the newest entry and the quietest of the failures
+    # here, which is exactly why it belongs in this list rather than near it. The
+    # Termii pair above fails loudly and expensively - a billable text message is
+    # sent and nothing complains. This one fails *silently in the other
+    # direction*: ``build_sign_up_with_google`` would resolve a real
+    # ``PyJwtGoogleIdentityVerifier`` pointed at Google's actual JWKS, and every
+    # forged token in the suite would then verify against it, because the audience
+    # it compared against would be a real client id rather than the fixture's.
+    # Nothing would fail there either, and nothing would be sent anywhere - the
+    # tests would simply stop testing what they name, asserting about an identity
+    # no fixture built. There is no observable symptom to notice.
+    "GOOGLE_CLIENT_ID",
 )
 
 
@@ -695,6 +711,38 @@ _TERMII_RECIPIENT_ALPHABET = frozenset("0123456789")
 #: this is written out rather than imported.
 _TERMII_MAX_SENDER_ID_LENGTH = 11
 
+#: A client id shaped the way Google issues them, and recognisable as a test value.
+#:
+#: Not a secret - a client id is public by construction, which is why
+#: ``settings.py`` says the one setting it holds that is not a credential is still
+#: a setting. What this value *is* is an **audience**: the composer root passes the
+#: adapter a ``GoogleSettings`` holding it, and the adapter compares every token's
+#: ``aud`` claim against it. That means the tests below are testing the comparison
+#: rather than merely filling a field - a token minted for any other client id must
+#: be refused, and ``TEST_OTHER_GOOGLE_CLIENT_ID`` is what makes that expressible.
+TEST_GOOGLE_CLIENT_ID = "1234567890-testvalue.apps.googleusercontent.com"
+
+#: A different application's client id, for the audience check.
+#:
+#: **The value that makes the most important refusal in this feature testable.**
+#: A token Google signed for somebody else's application is a real, valid,
+#: correctly-signed Google token - so a verifier that skipped the audience
+#: comparison would accept it, and every Google-integrated application on the
+#: internet would be a way into this one. A suite that only ever minted tokens for
+#: its own client id could not see that, which is why this constant exists rather
+#: than being written inline where it is used.
+TEST_OTHER_GOOGLE_CLIENT_ID = "9999999999-other.apps.googleusercontent.com"
+
+#: A complete Google configuration, for the tests that need the configured branch.
+#:
+#: One field, so unlike ``TEST_TERMII_SETTINGS`` there is no half-filled state to
+#: fall into - which is the small advantage of the id_token flow over the redirect
+#: one and the reason ``GoogleSettings`` has no second field. It is a constant
+#: anyway rather than an argument spelled out per file, so that the client id the
+#: adapter compares against and the one the test mints tokens for are visibly the
+#: same value.
+TEST_GOOGLE_SETTINGS = GoogleSettings(client_id=TEST_GOOGLE_CLIENT_ID)
+
 
 class FakeSmsChannel(SmsChannel):
     """An SMS channel that records instead of sending, and refuses what Termii refuses.
@@ -780,6 +828,98 @@ def build_sms_channel():
 
     def _build(**kwargs) -> FakeSmsChannel:
         return FakeSmsChannel(**kwargs)
+
+    return _build
+
+
+class FakeGoogleIdentityVerifier(GoogleIdentityVerifier):
+    """A verifier that reads a script instead of checking a signature.
+
+    Not a mock: it implements the real port, and anything that passes with this
+    passes with the real adapter as far as the calling code is concerned. What it
+    replaces is the cryptography, and there is no honest way to have that in a
+    fixture - a signature check is a fact about RSA and about Google's private
+    key, and a fake that "verified" one would be asserting a fact it does not
+    have.
+
+    **So "this token is valid" here means "the test said so"**, and that is the
+    whole of the seam. It is why this fake is a *recording stub* rather than the
+    provider-faithful double ``FakeSmsChannel`` and ``FakePaymentProvider`` are:
+    those two reproduce rules their provider enforces on the wire (Termii's
+    recipient alphabet, Paystack's reference alphabet), and the thing that went
+    wrong in this codebase twice was a *wire* constraint no fake had written down.
+    Here the wire is a signature this fixture cannot compute. The constraints that
+    could be reproduced - the pinned algorithm, the audience check, the issuer, the
+    expiry window, the two spellings of ``email_verified`` - are all decided by
+    ``jwt.decode`` inside the adapter, so they are written down a second time in
+    ``tests/infrastructure/identity/test_pyjwt_google_identity_verifier.py``,
+    against real signed tokens and a keypair generated there. That file is where
+    this feature's equivalent of the Paystack lesson lives; this class is not it.
+
+    **Two things it does reproduce, and both matter to the tests above it.** An
+    untouched token is refused with ``InvalidGoogleTokenError``, so the common
+    path is reachable; and every identity it hands back is a real ``GoogleIdentity``,
+    so a test cannot use this fake to assert something the domain would refuse -
+    ``email_verified="false"`` cannot be smuggled through a fixture, because
+    ``GoogleIdentity`` will not hold it.
+
+    ``attempts`` holds every token presented, which is what lets a test say
+    *when* a refusal happened rather than only that it did - the difference
+    between a duplicate-address refusal raised before verification and one raised
+    after it is not visible in the exception alone.
+    """
+
+    def __init__(self, identities=None, failures=()):
+        self.attempts: list = []
+        self._identities = dict(identities or {})
+        self._failures = list(failures)
+
+    def mint(self, subject, email, email_verified=True) -> str:
+        """Register an identity and return a token that resolves to it.
+
+        The token is a readable placeholder rather than a JWT, and that is
+        deliberate: a fake that produced something JWT-shaped would invite a test
+        to assert about its structure, and the structure is the one thing this
+        fixture is not modelling. Tests that care about the token's shape use the
+        real adapter and a real keypair.
+
+        ``email_verified`` is passed straight into ``GoogleIdentity``, so an
+        unverified address produces a genuine unverified identity - which is what
+        makes "the use case refuses an unverified address" testable at this layer
+        rather than only through the adapter.
+        """
+        identity = GoogleIdentity(
+            subject=subject, email=email, email_verified=email_verified
+        )
+        token = f"fake-google-token-{len(self._identities) + 1}"
+        self._identities[token] = identity
+        return token
+
+    def verify(self, id_token: str) -> GoogleIdentity:
+        self.attempts.append(id_token)
+
+        if self._failures:
+            raise self._failures.pop(0)
+
+        identity = self._identities.get(id_token)
+        if identity is None:
+            raise InvalidGoogleTokenError(
+                "that is not a valid Google identity token: unknown to this fake"
+            )
+
+        return identity
+
+
+@pytest.fixture
+def build_google_verifier():
+    """Return a fresh :class:`FakeGoogleIdentityVerifier`.
+
+        build_google_verifier()                        # nothing verifies yet
+        build_google_verifier(failures=[...])          # the first call raises
+    """
+
+    def _build(**kwargs) -> FakeGoogleIdentityVerifier:
+        return FakeGoogleIdentityVerifier(**kwargs)
 
     return _build
 

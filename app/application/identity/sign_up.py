@@ -37,11 +37,16 @@ class SignUp:
     "there is now an account" to mean something slightly different. See that
     module for why it is a module rather than a private method here.
 
-    **This is one of only two writes in the system nobody has to authenticate
-    for**, the other being the login it feeds. That is inherent rather than a
-    hole: they are how you come to have credentials. It is also why rate limiting
-    is a real item in 2c and not a nicety - an unauthenticated write that runs
-    argon2 and grows a table is a thing that can be done to you in bulk.
+    **This is one of four writes in the system nobody has to authenticate for**,
+    and the count is worth keeping because it grew. The original two were this and
+    the login it feeds; Google sign-in added the other pair -
+    ``SignUpWithGoogle`` and ``LogInWithGoogle`` - which are unauthenticated in the
+    same sense and for the same reason, since the proof they carry is a token
+    rather than a session. That is inherent rather than a hole: these are how you
+    come to have credentials. It is also why rate limiting is a real item in 2c and
+    not a nicety - an unauthenticated write that runs argon2 and grows a table is a
+    thing that can be done to you in bulk, and the Google pair adds two more that
+    each make a network call to a third party on the way.
 
     **There are two rules about an address here, and they are different rules
     from different places.** The *shape* rule - fold it, it must not be empty, it

@@ -58,12 +58,17 @@ OTHER_TYPED = "08098765432"
 #: imported from ``log_in``**.
 #:
 #: Deliberately a second copy, for the reason the Termii recipient alphabet is
-#: written down twice in this project: a test that imported ``log_in._REFUSAL``
+#: written down twice in this project: a test that imported ``log_in.REFUSAL``
 #: would agree with the code by construction, and what is being pinned is that the
 #: *value* does not drift across branches - imported, this file would stay green
 #: while a branch grew a clarifying clause, which is the failure and not the thing
 #: checked. It is a message a client receives as ``detail``, so it is a contract
 #: and re-wording it deliberately should have to touch this line.
+#:
+#: ``REFUSAL`` is public now - ``LogInWithGoogle`` imports it, and that module's
+#: docstring records why production shares the string where this file duplicates
+#: it. The constant having a name at all does not change the argument above: the
+#: copy here is what fails when somebody re-words one of the two use cases.
 _SHARED_REFUSAL = "those details did not match an account"
 
 

@@ -17,14 +17,14 @@ and which do not - is legible by reading the files rather than by inferring it
 from what is missing. ``tests/presentation/api/test_boundary.py`` asserts the
 missing half.
 
-``password_resets`` is the newest module and the first whose two paths are under
-prefixes that name no resource the caller owns. Every other file here answers
-"whose is this?" somewhere in its paths - ``/users/me``, ``/wallets/{id}``,
-``/sessions/current``. This one cannot, because the caller is a person who cannot
-log in: the account is inferred from an address and the mail goes to whatever
-mailbox that address names. So the paths are bare plurals, and the absence of a
-``/me`` is a true statement about the feature rather than a router that forgot to
-say whose it was.
+``password_resets`` was the newest module before ``phone_verifications``, and it is
+the first whose two paths are under prefixes that name no resource the caller owns.
+Every other file here answers "whose is this?" somewhere in its paths -
+``/users/me``, ``/wallets/{id}``, ``/sessions/current``. This one cannot, because
+the caller is a person who cannot log in: the account is inferred from an address
+and the mail goes to whatever mailbox that address names. So the paths are bare
+plurals, and the absence of a ``/me`` is a true statement about the feature rather
+than a router that forgot to say whose it was.
 
 ``profiles`` is beside ``users`` rather than inside it, and the split is the same
 one the schema makes between a ``User`` and a ``Profile``: an account and the
@@ -42,4 +42,17 @@ answering the code creates. It is also the only module in the API whose request
 half **costs the installation money per call**, which is worth knowing when
 somebody comes looking for what an unauthenticated stranger can make this server
 do: the answer is one text message, billed, per request.
+
+The Google pair is the first feature here that gets **no module of its own**, and
+the reason is the split this file is built on rather than convenience.
+``POST /users/google`` and ``POST /sessions/google`` are the same two acts
+``users`` and ``sessions`` already own - create an identity, and turn one into a
+token - reached by a third kind of proof. A ``google`` module would therefore have
+had to answer "whose is this?" twice for two routes whose answers are the two files
+that already exist, and what it bought would be nothing while what it cost is the
+reader who looks for registration in ``users`` and finds most of it. The price of
+the split is two docstrings in which "the only one" stopped being true, and that is
+the same discipline the boundary test's list applies to routes: a claim about
+counts is corrected in place rather than left standing next to the code that
+falsified it.
 """

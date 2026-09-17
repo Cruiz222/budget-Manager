@@ -132,6 +132,7 @@ from app.composition_root import (
     build_confirm_phone_sign_up,
     build_deliverer,
     build_log_in,
+    build_log_in_with_google,
     build_log_out,
     build_notification_deliverer,
     build_notifier,
@@ -144,6 +145,7 @@ from app.composition_root import (
     build_resolve_actor,
     build_scheduler,
     build_sign_up,
+    build_sign_up_with_google,
     build_wallet_service,
 )
 from app.domain.identity.profile import Profile
@@ -174,6 +176,7 @@ from app.infrastructure.settings import (
     DEFAULT_DATABASE_PATH,
     describe_configuration,
     from_environment,
+    google_from_environment,
     paystack_from_environment,
     session_path as configured_session_path,
     termii_from_environment,
@@ -391,7 +394,7 @@ def _prompt_password(confirm: bool) -> str:
 
 
 def _prompt_code(label: str) -> str:
-    """Ask for a code that was mailed, invisibly, and return it stripped.
+    """Ask for a mailed code or a Google token, invisibly, and return it stripped.
 
     ``getpass`` for ``_prompt_password``'s reason, and the argument is stronger
     here rather than weaker. A password is a secret its owner chose and can change;
@@ -409,14 +412,26 @@ def _prompt_code(label: str) -> str:
     There is no confirmation prompt, unlike ``signup``. A mistyped password at
     sign-up creates an account nobody can open, which is why that one asks twice;
     a mistyped code simply does not match anything and is refused with the refusal
-    that says so, and the person is holding the mail it came from.
+    that says so, and the person is holding the mail it came from - or, for one of
+    the Google tokens below, can obtain another the same way they obtained the first.
 
-    **The label is a parameter because two commands prompt for two different
-    codes**, and the difference is not cosmetic: "confirmation code" belongs to an
-    address change and "reset code" to a password reset, and a person who has asked
-    for one and is looking at a prompt naming the other would reasonably wonder
-    whether they were in the right command. Two constants at the call sites rather
-    than two functions, because everything below the label is identical.
+    **The label is a parameter because the commands prompt for different values**,
+    and the difference is not cosmetic: "confirmation code" belongs to an address
+    change, "reset code" to a password reset, and "Google id_token" to the pair
+    below - and a person who has asked for one and is looking at a prompt naming
+    another would reasonably wonder whether they were in the right command. Labels
+    at the call sites rather than one function each, because everything below the
+    label is identical.
+
+    **The Google pair is what turns "a code that was mailed" into a description
+    that is merely usually true**, and it is the strongest case for everything
+    argued above rather than an exception to it. An id_token is a live bearer
+    credential for about an hour: it is the whole of the authorisation for the call,
+    exactly as a mailed code is, with the window widened from fifteen minutes to
+    sixty. It also has the property a code does not, which is that the person did
+    not ask this system for it and so has it only in a browser or another
+    application - which is the subject of the two commands' own docstrings rather
+    than of this function.
 
     **The value is stripped, and that is the fix decision 180 recorded and did not
     ship.** ``getpass`` returns exactly what was typed, so a code selected with a
@@ -428,6 +443,12 @@ def _prompt_code(label: str) -> str:
     means nothing. Stripping is safe because the alphabet a token is drawn from
     contains no whitespace at all, so a stripped code is either the code or a
     different string that was never going to match.
+
+    **Stripping is right for a Google token for the same reason and not by
+    analogy**: a JWT is three base64url segments joined by dots, minted by a machine
+    and pasted by a human, and every character in it is Google's rather than the
+    typist's. So it is the same distinction as the one below - a value this system
+    or its provider minted, against a secret a person chose.
 
     What is deliberately *not* stripped is a password, in ``_prompt_password``
     above: ``PlainPassword``'s docstring makes that argument in full, and it turns
@@ -641,14 +662,18 @@ def build_parser() -> argparse.ArgumentParser:
     # They are top-level rather than nested under a noun, because there is no
     # noun that covers them - ``account signup`` would suggest the others act
     # on an account too, and logging out discards a token rather than touching
-    # one. And they are *eight* rather than three now, which is what an address
-    # change of its own, then a password reset, then a phone signup added to this
-    # file: ``confirm-email`` and ``confirm-password-reset`` are each authorised by
-    # a code mailed out, so neither needs a session and both belong here rather
-    # than beside the command that asks for them - ``reset-password`` is here
-    # because the person running it is locked out and has no session to offer, and
-    # ``signup-phone``/``confirm-phone`` are here because the account is what
-    # answering the texted code creates, so there is nothing yet to log in as.
+    # one. And they are *ten* rather than three now, which is what an address
+    # change of its own, then a password reset, then a phone signup and, last, a
+    # Google signup added to this file: ``confirm-email`` and
+    # ``confirm-password-reset`` are each authorised by a code mailed out, so
+    # neither needs a session and both belong here rather than beside the command
+    # that asks for them - ``reset-password`` is here because the person running it
+    # is locked out and has no session to offer, and ``signup-phone``/
+    # ``confirm-phone`` are here because the account is what answering the texted
+    # code creates, so there is nothing yet to log in as. ``signup-google`` and
+    # ``login-google`` are the pair whose warrant comes from neither this system nor
+    # the person at the terminal - it is a token Google signed - which makes them
+    # the only commands here that need configuration before they can do anything.
     signup_parser = subparsers.add_parser(
         "signup",
         help="register an address, with a password to prove it later",
@@ -689,6 +714,19 @@ def build_parser() -> argparse.ArgumentParser:
     # an account and expires in ten minutes; the password is a secret that must
     # never be an argument. Nothing is taken from argv by this command at all.
 
+    # ``signup-google`` sits here rather than at the end of the group, for the reason
+    # ``signup-phone`` sits beside ``signup``: it is the same act through a third
+    # kind of proof, and the account it creates is the subject of the pair. There is
+    # no ``confirm-google`` beside it, and the absence is a property of the flow
+    # rather than of this file: the token is verified in the same call that creates
+    # the account, so the two halves a phone signup needs - ask, then answer - have
+    # no second half here. Nothing is taken from argv at all; see ``_prompt_code``
+    # for why the token is read rather than passed.
+    subparsers.add_parser(
+        "signup-google",
+        help="register the account a Google id_token describes",
+    )
+
     login_parser = subparsers.add_parser(
         "login", help="obtain a session token and store it at --session"
     )
@@ -711,6 +749,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # No --password, for the reason every other command here omits it: an argument
     # lands in the history file. See ``_prompt_password``.
+
+    # ``login-google`` sits beside the two above rather than being an extra flag on
+    # one of them, for the reason ``login-phone`` gives one step further out: there
+    # is no identifier here to classify even by shape, because the account is
+    # whichever one the token names. So the command name is the only thing that can
+    # say which proof is being presented, and the token itself is read at a prompt
+    # rather than taken from argv - see ``_prompt_code``, which this shares with
+    # every command that needs a value the caller was given rather than chose.
+    subparsers.add_parser(
+        "login-google",
+        help="obtain a session token from a Google id_token, and store it at --session",
+    )
 
     subparsers.add_parser(
         "logout", help="discard the stored token and end the session"
@@ -1227,6 +1277,48 @@ def _signup(args, factory) -> int:
     return 0
 
 
+def _signup_google(args, factory, google) -> int:
+    """Register the account a Google id_token describes, and start no session.
+
+    **``_signup``'s shape with a third kind of proof**, including the refusal to
+    sign in afterwards, and the reason is the one written there: creating an
+    identity and proving you hold it are separate acts, and the first session on a
+    machine must not come from a command that checked nothing the person knew. So
+    this prints the same kind of "next: run ..." line, naming the Google login
+    rather than the password one.
+
+    **It is the only command in this file that needs configuration before it can
+    read its own input**, and the contrast with ``signup-phone`` is the useful one.
+    That command needs Termii to *send* something, so its refusal is about reaching
+    the person; this needs a client id to *check* something, so its refusal is about
+    being able to read the only thing it was given. On an installation with no
+    ``GOOGLE_CLIENT_ID`` no version of this command could work, and the refusal names
+    the missing variable rather than blaming the token - the arrangement
+    ``_reset_password`` has, with the sentence composed by
+    ``build_sign_up_with_google`` rather than here.
+
+    **Where the token comes from is not this command's business, and it is worth
+    saying anyway.** Today it is the OAuth 2.0 Playground or the operator's own
+    client, because the browser flow that would obtain one *for a person* is Phase
+    4 - it needs a redirect address this system deliberately has no setting for. So
+    this is the last half of a flow whose first half does not exist here yet, and it
+    says so rather than implying the CLI can produce a token.
+
+    Because the account may already exist, the two refusals a person meets here are
+    worth knowing before running it: ``DuplicateGoogleSubjectError`` if this Google
+    account already has one, and ``DuplicateEmailError`` if this address does. The
+    second is the interesting one - the address is *not* linked to the Google
+    identity, deliberately, and the body says which of the two happened because the
+    remedies differ.
+    """
+    user = build_sign_up_with_google(
+        unit_of_work_factory=factory, settings=google
+    ).execute(_prompt_code("Google id_token: "), datetime.now())
+    print(f"registered {user.email} ({user.user_id})")
+    print("next: run 'login-google' to start a session")
+    return 0
+
+
 def _signup_phone(args, factory, termii) -> int:
     """Ask for a code that will let a number create an account.
 
@@ -1321,11 +1413,12 @@ def _confirm_phone(args, factory) -> int:
 def _login(args, factory) -> int:
     """Obtain a token for an address and put it where every later command looks.
 
-    **The commands that write the session file are this one and ``login-phone``**,
-    which is worth knowing when something goes wrong with the CLI's identity:
-    there is exactly one place a token can come from, and both of them reach it
-    through ``_start_session`` below. It is a password typed at a prompt, and
-    which of the two commands asked for it changes only which lookup ran.
+    **The commands that write the session file are this one, ``login-phone`` and
+    ``login-google``**, which is worth knowing when something goes wrong with the
+    CLI's identity: there is exactly one place a token can come from, and all three
+    reach it through ``_start_session`` below. Two of them ask for a password typed
+    at a prompt and one reads a token Google signed; which of the three ran changes
+    only what was proved and which lookup it fed.
 
     Overwriting an existing session is not refused. Logging in as somebody else
     while already signed in is a normal thing to want, and the alternative - a
@@ -1370,14 +1463,49 @@ def _login_phone(args, factory) -> int:
     )
 
 
+def _login_google(args, factory, google) -> int:
+    """Obtain a token from a Google id_token, and put it where later commands look.
+
+    **The third command that writes the session file**, and it reaches it through
+    ``_start_session`` exactly as the other two do - ``_login``'s docstring makes
+    the argument for one place a token can come from, and this command is why that
+    sentence stopped naming two.
+
+    **It creates nothing**, which is the half worth checking against
+    ``signup-google`` above: an unknown subject is ``InvalidCredentialsError`` - the
+    same refusal, in the same words, that a wrong password gets - so somebody who
+    has never registered here is told to log in rather than being quietly
+    registered. A create-or-log-in command would have made "the address was free"
+    and "the proof held" one answer, and it would be the find-or-create this
+    codebase spent a phase removing.
+
+    **The token is read at a prompt rather than taken from argv**, sharing
+    ``_prompt_code`` with every command that handles a value the caller was *given*
+    rather than chose. The argument there is stronger for this one than for any
+    code: an id_token is a live bearer credential for about an hour, so a copy left
+    in the shell's history file or in a terminal's scrollback is a session on this
+    machine that somebody else can start.
+
+    Where it comes from is ``_signup_google``'s paragraph, and it applies here with
+    more force - that command only creates an account, while this one turns
+    whatever it is handed into the session this machine will act as.
+    """
+    return _start_session(
+        args,
+        build_log_in_with_google(
+            unit_of_work_factory=factory, settings=google
+        ).execute(_prompt_code("Google id_token: "), datetime.now()),
+    )
+
+
 def _start_session(args, logged_in: LoggedIn) -> int:
     """Write the token to the session file and report what was signed in as.
 
     **The one place a token reaches the disk**, which ``_login``'s docstring
     claimed for itself for as long as it was the only command that could produce
-    one. It is a function now rather than a paragraph because there are two, and
-    the guarantee has to survive the second: a session file written somewhere else
-    would be a second answer to "who is this machine signed in as", free to
+    one. It is a function now rather than a paragraph because there are three, and
+    the guarantee has to survive each of them: a session file written somewhere
+    else would be a second answer to "who is this machine signed in as", free to
     disagree with the first.
 
     The token goes in whole and the *session* is not written at all - only the
@@ -2794,6 +2922,15 @@ def main(argv=None) -> int:
     # missing SMS account is a refusal composed by the builder that needs one - see
     # ``_signup_phone``.
     termii = termii_from_environment()
+    # And one read of the Google configuration, which is a third read for
+    # ``termii``'s reason and one step further out again: it is not a channel this
+    # installation sends through but a *key it checks against*, so the two commands
+    # that need it are the only ones here whose input arrives already signed by
+    # somebody else. There is no ``deferred_reason`` beside it either, and the
+    # asymmetry is the same one: a missing mail account is worked around, and a
+    # missing client id is a refusal composed by the builder that needs one - see
+    # ``_signup_google``.
+    google = google_from_environment()
     try:
         # --- the commands that need nobody ----------------------------------
         #
@@ -2822,14 +2959,26 @@ def main(argv=None) -> int:
         # at all, and ``confirm-phone`` is what creates one. There is no token for
         # either to read, which is what makes this the one flow in the file whose
         # subject is a number rather than a person.
+        #
+        # ``signup-google`` and ``login-google`` are here for the same reason as the
+        # password pair above, with the proof swapped: one creates an account from
+        # an identity somebody else vouched for, the other turns that identity into
+        # a session. Neither can resolve an actor - the first because the account is
+        # what the token creates, the second because a session is what it is asking
+        # for - so both are dispatched above the actor line, and a machine that has
+        # never logged in can run either.
         if args.command == "signup":
             return _signup(args, factory)
+        if args.command == "signup-google":
+            return _signup_google(args, factory, google)
         if args.command == "signup-phone":
             return _signup_phone(args, factory, termii)
         if args.command == "confirm-phone":
             return _confirm_phone(args, factory)
         if args.command == "login":
             return _login(args, factory)
+        if args.command == "login-google":
+            return _login_google(args, factory, google)
         if args.command == "login-phone":
             return _login_phone(args, factory)
         if args.command == "logout":

@@ -202,7 +202,7 @@ class InvalidSessionError(IdentityError):
     pass
 
 
-#: The address and password do not match an account.
+#: The proof offered does not match an account.
 #:
 #: **Deliberately one refusal for two situations** - no account holds that
 #: address, or the password is wrong for the account that does. ``LogIn`` raises
@@ -211,6 +211,16 @@ class InvalidSessionError(IdentityError):
 #: which ones are registered without ever guessing a password. This is decision 55
 #: - a foreign wallet reports as a missing one - applied to the thing that hands
 #: out identities rather than the things that hold money.
+#:
+#: **A third situation joined it with Google sign-in, and it is raised by
+#: ``LogInWithGoogle``.** A verified Google token whose subject names no account
+#: here is the same fact as an unknown address - the caller offered proof of an
+#: identity this system does not have - so it gets the same sentence, and the two
+#: use cases share the string rather than each composing one. The oracle argument
+#: above is weaker for the Google path (a token is not guessable, so a caller
+#: cannot walk a list of subjects) and the refusal is shared anyway, because a
+#: second copy of a refusal sentence is a second thing to keep in step and there
+#: is no reading under which the caller should learn which of the two failed.
 class InvalidCredentialsError(IdentityError):
     pass
 
@@ -531,6 +541,161 @@ class PhoneVerificationExpiredError(IdentityError):
 #: number rather than an address, which is why this class is raised by more than one
 #: use case rather than by the signup alone.
 class NoSmsAccountError(IdentityError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Signing in with Google
+# ---------------------------------------------------------------------------
+#
+# **The first group in this file that is not about an aggregate of this system.**
+# Every class above describes a row this codebase owns and can map wrongly. The
+# three type-guards below describe a *report* - what Google asserted in a token it
+# signed - and the four refusals after them describe what this system does with
+# such a report. That is why the section is split where it is, and the split is
+# the same one every group above makes: a type-guard means the adapter built a
+# malformed value out of claims, and a refusal is a real answer to a real caller.
+#
+# Read with ``app.domain.identity.googleIdentity``, which carries the argument for
+# why the verification result is a value object at all rather than a tuple, and
+# with ``app.domain.identity.googleIdentityVerifier``, which carries the argument
+# for why it reports facts rather than enforcing this system's policy about them.
+class InvalidGoogleIdentitySubjectError(IdentityError):
+    """The identity's ``sub`` is not a non-empty string.
+
+    ``InvalidUserGoogleSubjectError`` one layer up and deliberately not the same
+    class. That one guards a value this system is about to *store* against a
+    ``UNIQUE`` column; this one guards a claim that arrived over the network. The
+    two happen to test the same shape today - Google issues the same opaque
+    string either way - but they answer to different failures, and collapsing
+    them would mean a change to how tokens are read had to be reasoned about in
+    terms of how accounts are written.
+    """
+
+
+class InvalidGoogleIdentityEmailError(IdentityError):
+    """The identity's ``email`` is not a non-empty string.
+
+    **The type check and not the address rule**, for the reason
+    ``InvalidPhoneVerificationPhoneError`` gives: an address that is a string but
+    badly shaped is refused by ``checked_email`` as ``InvalidUserEmailError``,
+    because that rule is ``User``'s and is deliberately shared. This class exists
+    for what that rule cannot describe - a claim that is not even a string, or one
+    that is blank, which is an adapter reading the wrong claim rather than a
+    person typing a bad address.
+    """
+
+
+class InvalidGoogleIdentityEmailVerifiedError(IdentityError):
+    """The identity's ``email_verified`` is not a real ``bool``.
+
+    **A real ``bool`` rather than something merely truthy, and that strictness is
+    the whole of this class.** The obvious reading of a claim called
+    ``email_verified`` is ``if claims["email_verified"]``, which is what makes
+    this the one field here where being permissive is actively dangerous: Google
+    has shipped the claim as the *string* ``"false"``, and ``bool("false")`` is
+    ``True``. So the adapter must normalise, and this class is what refuses the
+    adapter that forgot - rather than letting ``"false"`` read as "Google says
+    this address is proved", which is the one reading that turns the address into
+    a credential for the account.
+    """
+
+
+#: The id_token is unknown, malformed, expired, or not ours.
+#:
+#: **One class for all of those**, and the reason is ``InvalidSessionError``'s:
+#: the remedy is identical in every case - obtain a fresh token - and telling them
+#: apart would describe a forgery to the forger. A caller who could distinguish
+#: "wrong signature" from "expired" would learn which part of a guess was close,
+#: which is the only feedback an attacker here has any use for.
+#:
+#: The three cases that are *not* about the caller are folded in deliberately. A
+#: token minted for a different application, a token from a different issuer, and
+#: a token signed by a key that is not Google's all mean the same thing to this
+#: system - this is not proof of anything - and a named class for each would be
+#: three ways to say one sentence.
+#:
+#: Derived from ``IdentityError`` rather than from a provider-specific root
+#: because it is a *refusal about a request*, which is exactly what everything
+#: else in this file is. The class below is the one that is about the provider.
+class InvalidGoogleTokenError(IdentityError):
+    pass
+
+
+#: Google says it has not proved the address on this identity.
+#:
+#: **The load-bearing refusal of this feature**, and it is a policy about a report
+#: rather than a check inside the verifier - which is why it is here and not
+#: folded into the adapter. The chain it closes runs through code that already
+#: ships: ``RequestPasswordReset`` mails a code *to the address the account holds*
+#: and deliberately has no credential check, precisely so that an account with no
+#: password can set its first one. So an account holding an address Google had not
+#: proved would have a working reset code mailed to whoever controls that address
+#: - and that person, not the Google account's holder, could then take the account.
+#:
+#: It is its own class rather than an ``InvalidGoogleTokenError`` because the two
+#: mean different things to the person: that one says "your proof is no good, get
+#: another", and this one says "your proof is fine and Google has not finished
+#: proving your address". The remedy for this is to use a different Google
+#: account, which is not something the caller could infer from the other sentence.
+class UnverifiedGoogleEmailError(IdentityError):
+    pass
+
+
+#: This Google account already has an account here.
+#:
+#: Raised by the sign-up, and it is the sibling of ``DuplicateEmailError`` rather
+#: than a reuse of it - the two are different collisions with different remedies.
+#: That one says the *address* is taken and the answer is to sign up with another
+#: one; this one says the *Google identity* is taken and the answer is to log in.
+#: A caller that could not tell them apart would be told to do the wrong thing.
+#:
+#: It is reachable at sign-up only because a client called the create route for an
+#: account that already exists - the log-in route is where this identity belongs,
+#: and a caller that meant to log in has made a mistake this sentence names.
+class DuplicateGoogleSubjectError(IdentityError):
+    pass
+
+
+#: This installation could not reach Google, so a token could not be checked.
+#:
+#: **Deliberately a different grade from ``SmsProviderError``, which is a 400**, and
+#: the difference is the kind of question being asked rather than the kind of
+#: provider answering. An SMS refusal is about *the message* - this handset, this
+#: sender id, this balance - so a caller can fix it by asking differently. A JWKS
+#: fetch that fails is a fact about the *installation*: Google's keys could not be
+#: retrieved because this server has no route to them, and no change to the
+#: request would alter that. So it grades with ``NoMailAccountError`` and
+#: ``NoSmsAccountError`` as a 503, which is the honest answer, rather than telling
+#: the caller their token was wrong when it was never read.
+#:
+#: It exists at all because the port cannot express "I could not ask" as a
+#: ``GoogleIdentity``. A verifier that returned something would be asserting a
+#: fact it does not have.
+class GoogleProviderError(IdentityError):
+    pass
+
+
+#: This installation has no Google client id, so no token can be judged.
+#:
+#: **The third member of the "this deployment cannot do that" group**, after
+#: ``NoMailAccountError`` and ``NoSmsAccountError``, and it is the same fact one
+#: configuration over: a flow that cannot run at all until an operator sets a
+#: variable, refused in words that name the variable - see
+#: ``describe_google_configuration``.
+#:
+#: **It is distinguishable from ``GoogleProviderError`` above on purpose, and the
+#: two will look alike at a glance.** That one says Google could not be reached;
+#: this one says there is nothing here pointed at Google at all. Both are 503s
+#: because both are facts about the installation rather than about the request,
+#: but the remedies are different people's work - one is the network, the other is
+#: a missing line in a config - and an operator reading a log needs to know which.
+#:
+#: It is raised before anything is verified, and unlike the two channel refusals
+#: it is raised without a token having been read at all: a client id is what
+#: verification is *against*, so there is no such thing as a partial attempt when
+#: one is absent.
+class NoGoogleAccountError(IdentityError):
     pass
 
 
