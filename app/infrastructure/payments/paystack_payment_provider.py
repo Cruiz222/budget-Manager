@@ -20,10 +20,22 @@ each of them names the statuses it will interpret, which is the one thing about 
 call that only its caller knows. See ``_request``. The other two cost nothing:
 proving a webhook is standard-library HMAC over bytes, and answering what this
 account will collect is a field this class was constructed with.
+
+**This module logs, and it is the first in ``app/`` that does.** A real deposit
+leaves a trail at the far end - a transaction in the Paystack dashboard with a
+reference on it - and until this, nothing on this side produced a line an
+operator could put beside it. The rule is narrow on purpose: **the reference and
+the outcome, never the payload and never the payer.** Payloads are a third
+party's text (see ``_request``), and the payer's address is the one field of
+theirs this system holds in the clear. Structured logging, a level policy and
+somewhere to ship these lines are checklist item i17 and remain open; what is
+here is the front edge of it, configures nothing, and inherits whatever the
+process configured - uvicorn in a deployment, the root logger in a test.
 """
 
 import hashlib
 import hmac
+import logging
 from decimal import Decimal
 from urllib.parse import quote
 
@@ -36,6 +48,7 @@ from app.domain.payments.exception import (
     InvalidProviderAnswerError,
     PayerEmailRefusedError,
     PaymentProviderError,
+    PaymentProviderUnavailableError,
 )
 from app.domain.payments.paymentIntent import PaymentIntent
 from app.domain.payments.paymentProvider import PaymentProvider
@@ -43,6 +56,8 @@ from app.domain.payments.providerAnswer import ProviderAnswer
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
 from app.domain.payments.providerEvent import ProviderEvent
 from app.domain.payments.providerOutcome import ProviderOutcome
+
+logger = logging.getLogger(__name__)
 
 #: Where Paystack lives. A module constant rather than a setting, because there
 #: is no second value it could sensibly take in production - the sandbox and the
@@ -309,14 +324,45 @@ class PaystackPaymentProvider(PaymentProvider):
 
         data = response.get("data")
         if not isinstance(data, dict):
-            # Reached on a wrong secret key, which is the common case by a wide
-            # margin: Paystack answers 401 with ``{"status": false, "message":
-            # "Invalid key"}`` and no ``data`` at all. Naming it here is the
-            # difference between a legible configuration error and a ``KeyError``
-            # three frames deeper with nothing about the provider in it.
+            # **Two unrelated facts reach this line, and one sentence used to
+            # describe both of them.** ``AUTHENTICATION_FAILURES`` is in
+            # ``answers``, so a ``401``/``403`` travels past the refusal branch
+            # above and arrives here - Paystack answers a rejected key with
+            # ``{"status": false, "message": "Invalid key"}`` and no ``data`` at
+            # all, which is the common case by a wide margin. The other way in is
+            # a ``2xx`` whose body carried no transaction, which is the provider
+            # or this adapter failing and says nothing about the key.
+            #
+            # Both used to leave through one message that opened *"the provider
+            # accepted the call"* - false in the first case, where the provider
+            # had just refused it - and neither left a log line. **A live run
+            # paid for that**: an installation holding a bad key and an
+            # installation whose provider answered an empty ``2xx`` produced
+            # byte-identical output, no ledger row and no log, and the only way
+            # to tell them apart was to stop using this API and point ``curl`` at
+            # Paystack instead. The provider had said which it was, and this
+            # frame - which held both the status and the provider's own words -
+            # was the one place it could not be read.
+            #
+            # So the status decides the sentence now, and ``_refusal_sentence``
+            # still writes the refusal half so the one place a refusal becomes
+            # words stays one place.
+            words = _provider_words(response)
+            logger.warning(
+                "the provider answered the initialize call with %s and no "
+                "transaction%s",
+                status,
+                words,
+            )
+            if status >= 400:
+                raise InvalidPaymentIntentError(
+                    f"{_refusal_sentence(status, response)}; a rejected secret key "
+                    "is the usual reason"
+                )
             raise InvalidPaymentIntentError(
-                "the provider accepted the call but returned no transaction; "
-                "the secret key is the usual reason"
+                f"the payment provider answered {status} with no transaction in "
+                "the body; that is the provider or this adapter failing, and not "
+                "a key this installation could correct"
             )
 
         try:
@@ -326,6 +372,21 @@ class PaystackPaymentProvider(PaymentProvider):
             raise InvalidPaymentIntentError(
                 f"the provider's response has no {missing.args[0]}"
             ) from None
+
+        # The one line a real deposit most needs, and the one this file had no way
+        # of producing until now: the reference the payer will be charged under,
+        # and the name Paystack will file it under. Those two are the join between
+        # this system's ledger and the provider's dashboard, and when a payer
+        # rings up about a payment the first question is whether a collection was
+        # opened at all - which is a question this line answers without anybody
+        # reading a database. At ``info`` because it happens once per deposit
+        # rather than once per request, and because a deposit is the event this
+        # whole service exists to make happen.
+        logger.info(
+            "opened a collection under %s (the provider files it as %s)",
+            reference,
+            provider_reference,
+        )
 
         return PaymentIntent(
             authorization_url=authorization_url,
@@ -445,11 +506,24 @@ class PaystackPaymentProvider(PaymentProvider):
         payload: dict | None = None,
         answers: frozenset[int] = frozenset(),
     ) -> tuple[int, dict]:
-        """One authenticated JSON call, or a ``PaymentProviderError``.
+        """One authenticated JSON call, or a payment error.
 
         Every failure leaves through the same door, and the door is the port's
         contract rather than tidiness: a caller has one thing to catch, and it
-        cannot accidentally treat a provider outage as an ordinary result.
+        cannot accidentally treat a provider outage as an ordinary result. The
+        door is ``PaymentError`` - which is the tree, not one class - and there
+        are two rooms behind it. See below.
+
+        **Two failures, and the split between them is a real-money audit's
+        doing.** ``PaymentProviderError`` is the provider *refusing*: it read the
+        request and said no, the request will be refused again, and the caller
+        has something to change. ``PaymentProviderUnavailableError`` is the
+        provider being unaskable: a transport failure, a ``5xx``, or a ``200``
+        whose body is not JSON - none of which says anything about the request,
+        all of which may work in a minute. They were one class, and the cost was
+        that a **timeout told a payer their deposit request was malformed** while
+        Paystack may have created the collection anyway. The grades follow the
+        split: 400 for a refusal, 503 for the rail.
 
         **``answers`` is the statuses this call will interpret**, and it is a
         parameter because only the caller knows which those are. A status is a
@@ -465,10 +539,12 @@ class PaystackPaymentProvider(PaymentProvider):
         those statuses back instead of eating them. The status travels with the
         body so the caller has both.
 
-        **``raise_for_status`` before the body is read**, so that a 500 with an
-        HTML error page produces "the provider rejected this call" rather than a
-        JSON decode error. The status is included in the message because it is
-        the part a human acts on.
+        **The status is checked before the body is read**, so that a 500 with an
+        HTML error page produces "the provider failed this call with 500" rather
+        than a JSON decode error. The status is included in the message because it
+        is the part a human acts on. The 5xx branch is tested first, ahead of
+        ``answers``, because a status this file was told to interpret is still the
+        provider breaking rather than answering something.
 
         **The body is still not carried, and what is carried instead is narrower
         than it looks.** A response body is a third party's text and may quote the
@@ -494,9 +570,11 @@ class PaystackPaymentProvider(PaymentProvider):
         here, where the status code is the whole of what is knowable.
 
         A wrong key that answers with something other than JSON is the one case
-        that does not reach that branch, and it is a ``PaymentProviderError``
-        instead - which is not a worse answer, only a less specific one, and it
-        is still a refusal rather than a crash.
+        that does not reach that branch, and it is a
+        ``PaymentProviderUnavailableError`` instead - a body that is not JSON is
+        the far end being broken rather than a request being refused, and the
+        specific "your key is wrong" sentence is not reachable when there is no
+        JSON to read a message out of anyway.
 
         No retry, and that is a decision rather than an omission. The reference
         this call carries is the provider's own idempotency key, so a retry here
@@ -520,11 +598,42 @@ class PaystackPaymentProvider(PaymentProvider):
                 timeout=self._timeout,
             )
         except httpx.HTTPError as failure:
-            raise PaymentProviderError(
+            # The line an operator needs most and had none of: which call to the
+            # provider stopped working, and how. The path carries the reference on
+            # the lookup and nothing on the initialize, which is the join key to
+            # Paystack's dashboard either way.
+            logger.warning(
+                "could not reach the payment provider at %s %s: %s",
+                method,
+                path,
+                type(failure).__name__,
+            )
+            raise PaymentProviderUnavailableError(
                 f"could not reach the payment provider: {type(failure).__name__}"
             ) from failure
 
+        if response.status_code >= 500:
+            # Before ``answers`` is consulted, because a status this file was told
+            # to interpret is still the provider breaking rather than answering -
+            # ``answers`` names statuses that mean something about the thing asked
+            # about, and none of them is a 5xx. See the docstring.
+            logger.warning(
+                "the payment provider failed %s %s with %s",
+                method,
+                path,
+                response.status_code,
+            )
+            raise PaymentProviderUnavailableError(
+                _refusal_sentence(response.status_code, _json_or_none(response))
+            )
+
         if response.status_code >= 400 and response.status_code not in answers:
+            logger.warning(
+                "the payment provider refused %s %s with %s",
+                method,
+                path,
+                response.status_code,
+            )
             raise PaymentProviderError(
                 _refusal_sentence(
                     response.status_code, _json_or_none(response)
@@ -534,7 +643,12 @@ class PaystackPaymentProvider(PaymentProvider):
         try:
             return response.status_code, response.json()
         except ValueError as failure:
-            raise PaymentProviderError(
+            logger.warning(
+                "the payment provider answered %s %s with a body that is not JSON",
+                method,
+                path,
+            )
+            raise PaymentProviderUnavailableError(
                 "the payment provider returned a body that is not JSON"
             ) from failure
 

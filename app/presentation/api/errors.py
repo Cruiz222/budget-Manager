@@ -123,6 +123,7 @@ from app.domain.planning.exception import (
 from app.domain.payments.exception import (
     CurrencyNotCollectableError,
     DepositAlreadyInitiatedError,
+    PaymentProviderUnavailableError,
 )
 
 #: We do not know who is asking, or the proof offered did not hold.
@@ -571,11 +572,21 @@ class RateLimitedError(ApiError):
 #: configured*, which is what makes it worth asserting separately: the three above
 #: are testable by clearing a variable, and this one needs Google to be unreachable
 #: while ``GOOGLE_CLIENT_ID`` is set.
+#:
+#: **``PaymentProviderUnavailableError`` is the fifth, and it is
+#: ``GoogleProviderError``'s shape one provider over** - configured correctly,
+#: far end unreachable. A live-money audit put it here, and the sentence it
+#: replaced is the argument: the payment adapter used to raise
+#: ``PaymentProviderError`` for a timeout as well as for a refusal, which fell
+#: through to a 400 and told a payer their deposit request was unacceptable when
+#: the truth was that Paystack had not answered. The two are now separate classes
+#: and only the refusal is a 400. See ``PaymentProviderUnavailableError``.
 UNAVAILABLE = (
     NoMailAccountError,
     NoSmsAccountError,
     NoGoogleAccountError,
     GoogleProviderError,
+    PaymentProviderUnavailableError,
 )
 
 

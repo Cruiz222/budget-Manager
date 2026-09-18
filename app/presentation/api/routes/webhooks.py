@@ -37,6 +37,7 @@ cannot be read at all (400 - the same). See ``errors`` for both.
 """
 
 import json
+import logging
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Header, Request
@@ -57,6 +58,8 @@ from app.presentation.api.errors import (
 )
 
 router = APIRouter(tags=["webhooks"])
+
+logger = logging.getLogger(__name__)
 
 #: The header Paystack signs with, spelled the way the wire spells it.
 SIGNATURE_HEADER = "x-paystack-signature"
@@ -134,6 +137,17 @@ def receive_paystack_event(
     so making the caller branch on the difference would be a branch with no
     consumer.
 
+    **That sentence about the log was not true when it was written, and it is
+    now.** There was no server log: this module and every other in ``app/``
+    imported no ``logging`` at all, so a forged webhook, a replayed one and an
+    unknown reference left exactly the same trace - none. The line below is what
+    the paragraph above always promised, and it is deliberately the narrowest one
+    that keeps the promise: **whether a signature was presented at all**, and
+    never the body, never the header's value, and never a comparison of the two.
+    "Absent" and "present but not this installation's" is the whole of what is
+    knowable, and calling them one thing in the log would put an operator back
+    where they started.
+
     **The provider is a dependency, so an unconfigured install never gets here.**
     ``dependencies.payment_provider`` raises a 503 when there is no adapter -
     which must never be a 401, because a 401 tells Paystack to stop sending and
@@ -146,24 +160,42 @@ def receive_paystack_event(
     and the body says which it was.
     """
     if not provider.verify_signature(body, signature):
+        logger.warning(
+            "refused a webhook whose signature %s",
+            "was not presented at all" if signature is None else "did not match",
+        )
         raise InvalidWebhookSignatureError(
             "the signature does not match this installation's payment provider"
         )
 
     payload = _json_object(body)
-    event = EVENTS.get(_event_name(payload))
+    event_name = _event_name(payload)
+    event = EVENTS.get(event_name)
 
     if event is None:
         # Acknowledged, and deliberately without parsing the rest: an event this
         # deployment does not act on has no fields worth validating, and
         # refusing one for a missing reference would be this API inventing a
         # requirement for a message it is going to ignore anyway.
+        logger.info("ignored a webhook event: %s", event_name)
         return schemas.WebhookAck(
             outcome=SettlementOutcome.EVENT_IGNORED.value,
             detail="this installation does not settle this kind of event",
         )
 
     settled = settler.settle(_outcome_from(event, payload))
+    # One line per signed event that reached settlement, carrying the outcome and
+    # the reference. **The reference is the whole value of the line**: it is the
+    # join between this ledger and Paystack's dashboard, and it is the only field
+    # that lets somebody holding a payment in front of them find out what this
+    # system did with it. The outcome is here because ``AMOUNT_DISAGREES`` and
+    # ``UNKNOWN_REFERENCE`` are money that arrived and was not credited, and a
+    # log an operator has to reconstruct that from is a log that gets ignored.
+    logger.info(
+        "a webhook settled %s: %s",
+        settled.reference or "(no reference)",
+        settled.outcome.value,
+    )
     return schemas.WebhookAck(
         outcome=settled.outcome.value,
         reference=settled.reference,

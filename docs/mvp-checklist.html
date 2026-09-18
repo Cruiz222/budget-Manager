@@ -505,7 +505,7 @@
     </p>
 
     <div class="stats">
-      <div class="stat"><b>3,205</b><span>tests passing, 534s</span></div>
+      <div class="stat"><b>3,213</b><span>tests, run pending</span></div>
       <div class="stat"><b>52</b><span>commits on main</span></div>
       <div class="stat"><b>Phases 1–3</b><span>built, except the items below</span></div>
       <div class="stat"><b>Phase 4</b><span>not started</span></div>
@@ -669,7 +669,9 @@
         <div class="item-body">
           <label class="item-title" for="i12">A live check of Paystack's reference alphabet</label>
           <p class="why">The accepted character set is written down from memory in three places, and no run anywhere asks Paystack what it currently accepts. The suite can prove the code and the double agree with the rule as it was written down — which is exactly the distinction that let the deposit route sit broken behind 2,042 green tests. Worth doing before this system takes a real payment.</p>
-          <p class="evidence"><code>app/domain/money/reference.py</code><code>decisions 151–155</code></p>
+          <p class="why"><strong>The run reached the far end on 2026-09-18, and this is partly answered.</strong> Its first act found a configuration split of our own (<code>BUDGET_DB</code>, decision 246) and its second a stale process holding a placeholder key — neither of which is anything Paystack does. Once past both, a real 100.00 NGN deposit under the reference <code>96f71fe1-12ad-4b60-a06f-75911614579a.run-1</code> was accepted and settled: <strong>42 characters, carrying hyphens and a dot, echoed back verbatim as <code>data.reference</code></strong>. So every reference this system <em>mints</em> is now known to be one the provider takes, which is the half that matters operationally.</p>
+          <p class="why"><strong>What that does not settle, and why this stays open.</strong> The characters a caller may supply are a wider set than the ones we mint: <code>=</code> and <code>,</code> are in <code>REFERENCE_ALPHABET</code> and have never been sent, and the deliberate absence of a length rule means a caller's key is bounded only by the alphabet. A 42-character reference is not a 200-character one. The remaining check is two <code>curl</code> probes costing seconds — see decision 247.</p>
+          <p class="evidence"><code>app/domain/money/reference.py</code><code>decisions 151–155</code><code>decisions 246–247</code></p>
         </div>
       </li>
 
@@ -688,7 +690,8 @@
         <input class="tick" type="checkbox" id="i13" data-id="ci">
         <div class="item-body">
           <label class="item-title" for="i13">CI that runs the suite on every push</label>
-          <p class="why">3,136 tests currently run only when somebody types <code>pytest</code>, and there is no <code>.github/</code> directory. The README's own line: tests that nobody runs automatically are a liability that feels like an asset. It is also the cheapest item on this list.</p>
+          <p class="why">3,209 tests currently run only when somebody types <code>pytest</code>, and there is no <code>.github/</code> directory. The README's own line: tests that nobody runs automatically are a liability that feels like an asset. It is also the cheapest item on this list.</p>
+          <p class="why"><s>3,209 tests</s> 3,213, by hand — the suite has not been re-run since the grade split, the <code>--db</code> repair and the <code>InvalidPaymentIntentError</code> split, so this counter is an arithmetic expectation rather than an observation. It is corrected from the real output the first time that output exists.</p>
           <p class="evidence"><code>.github/</code><code>README.md Phase 4</code></p>
         </div>
       </li>
@@ -724,8 +727,8 @@
         <input class="tick" type="checkbox" id="i17" data-id="logging">
         <div class="item-body">
           <label class="item-title" for="i17">Structured logging and error tracking</label>
-          <p class="why"><code>app/</code> imports no <code>logging</code> at all, so an operator has a cron tick log and nothing else. The reconciler's whole job is to raise an alarm nobody is currently listening for in a place anyone looks.</p>
-          <p class="evidence"><code>app/</code> (no <code>logging</code> import)</p>
+          <p class="why"><s><code>app/</code> imports no <code>logging</code> at all, so an operator has a cron tick log and nothing else.</s> <strong>Half-shipped, and deliberately not ticked.</strong> <code>app/</code> now logs on the money path: the adapter at both outbound calls, the webhook route at both of its refusals and every settlement, and one line at boot saying whether this deployment holds a Paystack test key or a live one. What is <em>not</em> done is everything the item actually names — there is no structured format, no level policy, no request correlation and nowhere to ship the lines, so they go to whatever the process configured. It stays open until an operator can find a deposit by reference without grepping a terminal.</p>
+          <p class="evidence"><code>app/infrastructure/payments/paystack_payment_provider.py</code><code>app/presentation/api/routes/webhooks.py</code><code>decisions 242–244</code></p>
         </div>
       </li>
 

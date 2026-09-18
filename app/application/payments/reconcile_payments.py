@@ -212,13 +212,15 @@ class ReconcilePayments:
         try:
             answer = self._provider.outcome_for(reference)
         except PaymentError as failure:
-            # The whole payments root rather than ``PaymentProviderError``: an
-            # ask can fail by not completing (unreachable, refused) or by not
-            # being understood (a response with no transaction in it, a status
-            # this adapter does not know), and both are the same fact to this
-            # loop - no answer was obtained. Catching the root is what keeps that
-            # one branch instead of a list that a future error type would have to
-            # be added to.
+            # The whole payments root rather than one of the two provider errors:
+            # an ask can fail by not completing (``PaymentProviderUnavailableError``
+            # - unreachable, or the far end broken) or by being refused
+            # (``PaymentProviderError``) or by not being understood (a response
+            # with no transaction in it, a status this adapter does not know), and
+            # all of them are the same fact to this loop - no answer was obtained.
+            # Catching the root is what keeps that one branch instead of a list
+            # that a future error type would have to be added to, and it is why
+            # the split of the two provider errors needed no change here.
             return ReconciledPayment(
                 reference=reference,
                 outcome=ReconciliationOutcome.FAILED,

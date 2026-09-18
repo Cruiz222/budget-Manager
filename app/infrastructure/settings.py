@@ -234,9 +234,39 @@ class PaystackSettings:
     pretending to have done it now would be the worse mistake - a redacted
     ``repr`` reads as "this type is safe to print", which is a claim nothing here
     has earned.
+
+    ``mode`` is the one thing this record says about the key, and it says it
+    without saying the key. A Paystack secret begins ``sk_test_`` or ``sk_live_``,
+    so the prefix is enough to answer the question that matters more than any
+    other at boot: **is this deployment about to take people's real money?** Both
+    directions of getting that wrong are bad and only one is loud - a test key in
+    production takes no money and is found in a minute, while a live key in a
+    staging environment takes real money from real cards while everybody believes
+    they are testing. The mode is logged once at startup for that reason, and it
+    is a *property* rather than a field so it cannot drift from the key it
+    describes.
     """
 
     secret_key: str
+
+    @property
+    def mode(self) -> str:
+        """``"test"``, ``"live"``, or ``"unrecognised"``.
+
+        **A third answer rather than a guess**, and the guess it refuses is the
+        dangerous one: defaulting an unknown prefix to ``"live"`` would put a
+        false alarm in every operator's log, and defaulting it to ``"test"``
+        would say "no real money here" about a key nobody has checked. Neither is
+        knowable from a string this code does not control, so the string is
+        reported as what it is. Paystack's own key format is the authority and
+        this is a courtesy read of it - which is why nothing branches on this
+        value. Nothing does: it is here to be printed.
+        """
+        if self.secret_key.startswith("sk_test_"):
+            return "test"
+        if self.secret_key.startswith("sk_live_"):
+            return "live"
+        return "unrecognised"
 
 
 def paystack_from_environment(environ=None) -> PaystackSettings | None:

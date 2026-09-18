@@ -27,8 +27,18 @@ work. Writing ``async def`` would not make them concurrent; it would run them on
 the event loop and block every other request while one query ran. The
 distinction is easy to get backwards, and getting it backwards is invisible until
 there is load.
+
+**This module logs, for exactly one reason, and it is not diagnostics.** A
+deployment configured with a *live* Paystack key takes real money from real
+cards, and there is nothing about running it that says so - both modes use the
+same host, the same endpoints and the same code, and are told apart only by which
+secret key was put in the environment. A live key where somebody meant to put a
+test one is the one configuration mistake in this system that moves money, and it
+is silent in both directions. So the mode is printed once at boot. Nothing
+branches on it; see ``_report_payment_mode``.
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -67,6 +77,56 @@ from app.presentation.api.routes import (
     wallets,
     webhooks,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _report_payment_mode(application: FastAPI) -> None:
+    """Say, once at boot, whether this process can take real money.
+
+    **The only configuration fact this system prints**, and the reason it is this
+    one is that it is the only mistake here that is both silent and expensive.
+    Paystack's sandbox and its live service are the same host and the same
+    endpoints; a deployment is in one mode or the other solely by which secret
+    key was exported, and nothing else about a running server distinguishes them.
+    A live key exported into somebody's staging shell takes real money from real
+    cards while every log line, every test and the dashboard all look like
+    testing - and the operator finds out from a card statement.
+
+    **Nothing branches on the value.** This function does not refuse to start on
+    a live key, because a live key is the correct state of a production
+    deployment and refusing would take the money down to protect it. It does not
+    refuse an unrecognised key either, for the reason ``PaystackSettings.mode``
+    gives: this is a courtesy read of a format this code does not own, and a
+    deployment whose key Paystack has changed the shape of must keep serving.
+    What it does is put one line where an operator already looks.
+
+    ``info`` for a mode that is known, because both are states the deployment is
+    supposed to be in - and ``warning`` for a key whose mode cannot be read off
+    it, because that is the one case where the answer to "are we taking real
+    money" is *nobody can tell from here*, which is a thing somebody should fix.
+    A deployment with no key at all says so at ``info``: payments being off is
+    the ordinary state of a fresh clone, not a fault.
+    """
+    settings = application.state.paystack
+    if settings is None:
+        logger.info("payments are off: no PAYSTACK_SECRET_KEY is set")
+        return
+
+    if settings.mode == "unrecognised":
+        logger.warning(
+            "PAYSTACK_SECRET_KEY does not begin with 'sk_test_' or 'sk_live_', so "
+            "whether this deployment takes real money cannot be read off it - "
+            "check the key against the Paystack dashboard"
+        )
+        return
+
+    logger.info(
+        "payments are configured against Paystack's %s service%s",
+        settings.mode,
+        " - this deployment takes real money" if settings.mode == "live" else "",
+    )
 
 
 def create_app(
@@ -275,6 +335,8 @@ def create_app(
             application.state.rate_limit_warm_error = None
         except Exception as exc:  # see the docstring: boot must not depend on it
             application.state.rate_limit_warm_error = exc
+
+        _report_payment_mode(application)
 
         flusher = None
         if flush_seconds > 0:

@@ -59,10 +59,25 @@ wire would mean the freeze-confirmation dance to set up a state whose only
 relevance is to a check three layers down. And there is no test that a deposit
 lands in a pot - because it cannot, and ``test_boundary.py`` is where that
 absence is recorded.
+
+**The newest pair here is about the provider failing, and it is the one this file
+was missing for its whole life.** ``PaymentsUnconfiguredError`` was the only
+unavailability a deposit could meet, and it is the *easy* one - it happens before
+anything is read. The harder one is a provider that is configured, reachable in
+principle, and not answering: a timeout, or Paystack's own 500. Both left as
+``PaymentProviderError``, which grades 400, so a payer was told their request was
+unacceptable while a collection may have been open on the far end. The pair of
+tests at the end of ``TestTheRefusals`` asserts the split from the outside - a
+503 for the rail, still a 400 for a refusal - because that is the only way to
+assert that a *client* would do the right thing with each.
 """
 
 import pytest
 
+from app.domain.payments.exception import (
+    PaymentProviderError,
+    PaymentProviderUnavailableError,
+)
 from tests.conftest import TEST_USER_PASSWORD
 from tests.presentation.api.conftest import ALICE, BOB
 
@@ -516,3 +531,65 @@ class TestTheRefusals:
 
         assert response.status_code == 503
         assert response.json()["error"] == "PaymentsUnconfiguredError"
+
+    def test_a_provider_that_cannot_be_reached_is_a_503_and_not_a_400(
+        self, client, a_wallet, payment_provider
+    ):
+        """**The live-money audit's fix, asserted where a client actually meets it.**
+
+        Every branch of ``PaystackPaymentProvider._request`` that is not a refusal
+        used to leave as ``PaymentProviderError``, which is not in any of
+        ``errors``' lists and therefore fell through to a **400** - so a timeout,
+        or Paystack's own 500, arrived at a payer as "there is something
+        unacceptable in your request". There was nothing unacceptable in it, and
+        the sentence sent them to edit a form.
+
+        The assertion that matters is the second one, and it is the reason this
+        test is in this file rather than in the adapter's: **a client that saw a
+        400 would not retry**, and a timeout on ``initialize`` may well have left
+        a collection open. A 503 is this codebase's way of saying "come back
+        later", which is the only useful thing to tell them.
+
+        The queue is drained by the one call, so nothing here depends on ordering;
+        and the wallet is the fixture's, so the refusal is reached through a
+        request that would otherwise have succeeded.
+        """
+        headers, wallet_id = a_wallet()
+        payment_provider.fail_next(
+            PaymentProviderUnavailableError("could not reach the payment provider")
+        )
+
+        response = client.post(
+            deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers
+        )
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "PaymentProviderUnavailableError"
+
+    def test_a_provider_that_refuses_is_still_a_400(
+        self, client, a_wallet, payment_provider
+    ):
+        """**The control, without which the test above proves nothing.**
+
+        A 503 for everything would pass the test above and be just as wrong in the
+        other direction: a caller whose request the provider *refused* has
+        something to change, and telling them "come back later" would have them
+        retrying a request that will be refused identically for ever. The two
+        classes are siblings rather than one inheriting the other precisely so
+        that neither can stand in for the other, and this pair is what says so.
+        """
+        headers, wallet_id = a_wallet()
+        payment_provider.fail_next(
+            PaymentProviderError(
+                "the payment provider refused the call with 400: "
+                "Invalid character in transaction reference "
+                "(invalid_character_in_reference)"
+            )
+        )
+
+        response = client.post(
+            deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers
+        )
+
+        assert response.status_code == 400
+        assert response.json()["error"] == "PaymentProviderError"

@@ -174,6 +174,7 @@ from app.domain.planning.savingsPlan import SavingsPlan
 from app.domain.planning.schedule import Schedule
 from app.infrastructure.settings import (
     DEFAULT_DATABASE_PATH,
+    database_path as configured_database_path,
     describe_configuration,
     from_environment,
     google_from_environment,
@@ -631,19 +632,46 @@ def build_parser() -> argparse.ArgumentParser:
         description="A personal savings wallet with deposit, withdraw and "
         "named locked pots (fund open/deposit/lock/release/extend/list).",
     )
+    # Where the database lives, defaulted rather than read here.
+    #
+    # ``configured_database_path()`` is called at parse time, which is the one
+    # moment ``os.environ`` is read for this setting - so it is read exactly
+    # once, by ``app.infrastructure.settings``, exactly as ``--session``'s own
+    # default below is. Reading ``os.environ`` here would be the second reader of
+    # the environment this codebase has been keeping out, and it would be the one
+    # that made the promise false.
+    #
+    # **This defaulted to the bare constant until a live run caught it, and the
+    # comment that used to stand here defended the mistake.** It said the two
+    # settings were alike because ``--db``'s default "is a constant that module
+    # owns" - which is true, and is exactly the problem: a constant cannot read
+    # ``BUDGET_DB``, and ``BUDGET_DB`` is what ``create_app`` reads. So the CLI
+    # and the API resolved to *different files* on any machine where the variable
+    # was set, and the failure wears the most confusing mask available: the CLI
+    # opens a wallet, the API answers 404 about that wallet, and both are right
+    # about the database they are looking at. README decision 71 already claimed
+    # the variable overrode both defaults; this is the line that makes the claim
+    # true rather than the line that records it. See decision 246.
     parser.add_argument(
         "--db",
-        default=DEFAULT_DATABASE_PATH,
-        help=f"SQLite database file (default: {DEFAULT_DATABASE_PATH})",
+        default=configured_database_path(),
+        help=f"SQLite database file (default: $BUDGET_DB, else "
+        f"{DEFAULT_DATABASE_PATH})",
     )
     # Where the token lives, defaulted rather than read here.
     #
-    # ``configured_session_path()` is called at parse time, which is the one
+    # ``configured_session_path()`` is called at parse time, which is the one
     # moment ``os.environ`` is read for this setting - so it is read exactly
     # once, by ``app.infrastructure.settings``, exactly as ``--db``'s own default
-    # is a constant that module owns. Reading ``os.environ`` here would be the
-    # second reader of the environment this codebase has been keeping out, and it
-    # would be the one that made the promise false.
+    # above is. Reading ``os.environ`` here would be the second reader of the
+    # environment this codebase has been keeping out, and it would be the one
+    # that made the promise false.
+    #
+    # **The two settings are now alike, and that is a repair rather than the
+    # original state.** This comment used to draw the comparison against
+    # ``--db``'s default being "a constant that module owns", which was the bug
+    # written down as a virtue - a constant reads no variable. See the note on
+    # ``--db`` above and decision 246.
     #
     # Unlike ``--db`` there is no unlogged-in default path that works, and that
     # is not a gap: a token cannot be defaulted the way a filename can, because a

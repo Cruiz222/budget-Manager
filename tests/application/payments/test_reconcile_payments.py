@@ -39,7 +39,7 @@ from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.notifications.notificationKind import NotificationKind
-from app.domain.payments.exception import PaymentProviderError
+from app.domain.payments.exception import PaymentProviderUnavailableError
 from app.domain.payments.providerAnswer import ProviderAnswer
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
 from app.domain.payments.providerEvent import ProviderEvent
@@ -423,7 +423,7 @@ class TestWhatTheProviderAnswers:
         provider = build_payment_provider(
             answers={
                 "dep-1": settled_answer("dep-1", "1000"),
-                "dep-2": PaymentProviderError("the provider is unreachable"),
+                "dep-2": PaymentProviderUnavailableError("the provider is unreachable"),
                 "dep-3": settled_answer("dep-3", "3000"),
             }
         )

@@ -69,7 +69,7 @@ from app.domain.payments.exception import (
     DepositAlreadyInitiatedError,
     PayerEmailMissingError,
     PayerEmailRefusedError,
-    PaymentProviderError,
+    PaymentProviderUnavailableError,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
@@ -999,12 +999,12 @@ class TestWhenTheProviderFails:
         """
         wallet = build_wallet()
         provider = build_payment_provider(
-            failures=[PaymentProviderError("the provider is down")]
+            failures=[PaymentProviderUnavailableError("the provider is down")]
         )
         service, factory = a_deposit_service(tmp_path, provider)
         seed(factory, wallet, payer)
 
-        with pytest.raises(PaymentProviderError):
+        with pytest.raises(PaymentProviderUnavailableError):
             service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")
 
         assert rows(factory, wallet) == []
@@ -1018,15 +1018,21 @@ class TestWhenTheProviderFails:
         gets through - which is the shape a caller needs: a provider outage is
         worth retrying, and a retry must not be refused as a duplicate by a
         dedupe that counted an attempt which never happened.
+
+        **The error is the unavailable one, and that is what makes the retry a
+        coherent thing to do.** A refusal would be refused again with the same
+        request; an outage is the case the caller is entitled to try again, which
+        is why the grade for it is a 503 with a "come back later" meaning rather
+        than a 400 telling them to edit the form.
         """
         wallet = build_wallet()
         provider = build_payment_provider(
-            failures=[PaymentProviderError("the provider is down")]
+            failures=[PaymentProviderUnavailableError("the provider is down")]
         )
         service, factory = a_deposit_service(tmp_path, provider)
         seed(factory, wallet, payer)
 
-        with pytest.raises(PaymentProviderError):
+        with pytest.raises(PaymentProviderUnavailableError):
             service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")
 
         result = service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")

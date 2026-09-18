@@ -1181,8 +1181,10 @@ class FakePaymentProvider(PaystackPaymentProvider):
     one.
 
     What the replacement keeps is the contract: a reference in, a ``PaymentIntent``
-    out, and ``PaymentProviderError`` raised rather than a sentinel returned when
-    it cannot do its job. ``requests`` records every call so a test can ask what
+    out, and a ``PaymentError`` raised rather than a sentinel returned when it
+    cannot do its job - either of the two provider errors, since which one a real
+    far end produces is its own business and the test is what decides which it is
+    asserting about. ``requests`` records every call so a test can ask what
     was sent - which is how "the provider was told the payer's email and nothing
     else about them" is assertable.
 
@@ -1191,7 +1193,9 @@ class FakePaymentProvider(PaystackPaymentProvider):
     ``FakeChannel`` uses, and for the same reason: it makes "the retry gets
     through" expressible without any further arrangement. It belongs to the
     deposit path alone; a reconciler test that wants a lookup to fail scripts
-    that into ``answers`` instead, where it can name the row.
+    that into ``answers`` instead, where it can name the row. ``fail_next``
+    appends to the same queue for the tests that cannot use the constructor -
+    see below.
 
     **And it refuses what Paystack refuses**, which is the one thing that changed
     after a bug this double could not see. The alphabet below is written out here
@@ -1249,6 +1253,25 @@ class FakePaymentProvider(PaystackPaymentProvider):
         self._provider_reference = provider_reference
         self._answers = dict(answers or {})
 
+    def fail_next(self, failure: Exception) -> None:
+        """Queue one failure for the next ``initialize_deposit``, after wiring.
+
+        ``failures`` is a constructor argument, and the route tests cannot use it:
+        ``tests/presentation/api/conftest.py`` builds the application once per
+        test with a working provider, and the object a route test holds is the one
+        already on ``app.state``. Reaching into ``_failures`` from a test would
+        work and is exactly the thing this suite does not do - a test that touches
+        a double's private queue is a test that breaks the first time the queue is
+        a name other than a list.
+
+        The lookup direction needs no equivalent: ``answers`` is keyed by
+        reference and a value may be an exception, so a reconciler test scripts a
+        failing row without any ordering. This is that same affordance for the
+        half that has no key to hang it on, because ``initialize_deposit`` is
+        asked about nothing in particular.
+        """
+        self._failures.append(failure)
+
     def initialize_deposit(
         self, *, reference: str, amount: Money, email: str
     ) -> PaymentIntent:
@@ -1298,10 +1321,18 @@ def build_payment_provider():
     """Return a fresh :class:`FakePaymentProvider`.
 
         build_payment_provider()                              # every call works
-        build_payment_provider(failures=[PaymentProviderError("down")])
+        build_payment_provider(failures=[PaymentProviderUnavailableError("down")])
         build_payment_provider(secret_key="sk_test_other")     # a key nothing signs with
         build_payment_provider(answers={"dep-1": an_answer})   # what a lookup says
         build_payment_provider(currencies=frozenset({USD}))    # enabled for dollars
+
+    ``failures`` takes whichever of the two provider errors the test is about, and
+    the choice is the assertion: ``PaymentProviderError`` is a refusal (a 400, and
+    the caller has something to change) while
+    ``PaymentProviderUnavailableError`` is the rail being unaskable (a 503, and
+    the same request may work in a minute). The double raises whatever it is
+    handed rather than choosing, because which one a real provider produces is a
+    fact about the far end.
     """
 
     def _build(**kwargs) -> FakePaymentProvider:

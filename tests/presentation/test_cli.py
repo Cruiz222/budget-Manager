@@ -4,7 +4,8 @@ from uuid import uuid4
 
 import pytest
 
-from app.presentation.cli import main
+from app.infrastructure.settings import DEFAULT_DATABASE_PATH
+from app.presentation.cli import build_parser, main
 from tests.conftest import session_path_for, signed_in
 
 
@@ -39,6 +40,54 @@ def run(db_path, *argv):
     of: its storage, and its identity.
     """
     return main(["--db", db_path, "--session", session_path_for(db_path), *argv])
+
+
+class TestWhereTheDatabaseComesFrom:
+    """``--db``'s default, which is a thing the suite had never once looked at.
+
+    **Every other test in this directory passes ``--db`` explicitly** - through
+    ``run`` above, or spelled out at the two call sites that build their own
+    argv - so the *default* was exercised by nothing. A default nothing exercises
+    is a default that can be wrong for as long as nobody reads it, and this one
+    was: it named the constant rather than asking ``settings``, so ``BUDGET_DB``
+    moved the API's database and left the CLI's where it was.
+
+    The symptom is worth writing down because it does not look like a
+    configuration bug. The CLI opens a wallet and prints its id; the API is asked
+    to open a collection against that id and answers 404; and both programs are
+    correct about the file each of them is actually holding. Nothing raises, and
+    no log line disagrees with another.
+
+    ``build_parser()`` is called *inside* each test rather than in a fixture, and
+    that is the mechanism under test rather than a style: the default is resolved
+    at parse time, so setting the variable after a parser exists would change
+    nothing. See decision 246.
+    """
+
+    def test_the_default_is_the_database_the_api_reads_too(self, tmp_path, monkeypatch):
+        elsewhere = str(tmp_path / "elsewhere.db")
+        monkeypatch.setenv("BUDGET_DB", elsewhere)
+
+        parsed = build_parser().parse_args(["open", "--currency", "NGN"])
+
+        assert parsed.db == elsewhere
+
+    def test_without_the_variable_it_is_the_file_the_cli_has_always_used(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("BUDGET_DB", raising=False)
+
+        parsed = build_parser().parse_args(["open", "--currency", "NGN"])
+
+        assert parsed.db == DEFAULT_DATABASE_PATH
+
+    def test_a_typed_flag_still_wins_over_the_variable(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BUDGET_DB", str(tmp_path / "elsewhere.db"))
+        typed = str(tmp_path / "typed.db")
+
+        parsed = build_parser().parse_args(["--db", typed, "open", "--currency", "NGN"])
+
+        assert parsed.db == typed
 
 
 def opened_wallet_id(db_path, capsys):

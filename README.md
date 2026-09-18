@@ -4893,6 +4893,341 @@ and the 400 is what says the door still opens for a currency the rail collects.
   is no outbound rail for a destination or a payout currency to be checked against. When
   one exists, this is the decision it will have to answer to.
 
+### Failing to reach the provider is not failing to ask it properly
+
+The first slice of the client's work, and it began where this file keeps saying it must: with a
+reading of the real-money path rather than with the client. Building a UI on top of the deposit
+route means writing code that has to decide what to *show* a payer when a call fails, and reading
+`_request` to find out what it says turned up a grade that was wrong.
+
+**240. The provider-failure grade was a 400, and the sentence it produced sent payers to edit a
+form.** `errors._grade` grades by falling through: 503 for `UNAVAILABLE`, 401, 404, 409, and **400
+for everything else**. `PaymentProviderError` was in none of the four lists, so every failure of
+every outbound call arrived as *"there is something unacceptable in your request"*. Three of
+`_request`'s four failure branches are not that:
+
+- `paystack_payment_provider.py:522` - `httpx.HTTPError`, which is **a timeout as much as a dead
+  network**. The single most likely way a real deposit fails.
+- `:527` - `status_code >= 400 and not in answers`, which is written as though it meant "the
+  provider refused" and also catches **Paystack's own 5xx**.
+- `:534` - a `200` whose body is not JSON, which is a proxy in the way.
+
+A refusal is a fact about the request: it will be refused again, and the caller has something to
+change, so a 400 is right for it and stays. The other three are facts about the *rail*: the request
+may be perfectly good, the same request may work in a minute, and there is nothing for the caller to
+correct. The cost of collapsing them was not cosmetic. **A client that read a 400 would not retry** -
+the grade is exactly the signal a UI branches on - and a timeout on `/transaction/initialize` may
+well have left a collection open on the far end. So a payer whose money was already taken was shown
+"your deposit request is unacceptable" and given a form to edit.
+
+The repair is a split rather than a rewrite. **`PaymentProviderUnavailableError`** takes those three
+branches and grades **503**; `PaymentProviderError` keeps the 4xx refusal and grades 400. The 5xx
+check sits *before* `answers` is consulted, because a status this file was told to interpret is still
+the provider breaking rather than answering something - none of the statuses `answers` names is a
+5xx, and if one ever is, the provider being broken outranks it.
+
+**241. The two classes are siblings rather than one inheriting the other, and that is what makes the
+tests honest.** Making the new error a subclass would have kept every `except PaymentProviderError`
+working - including `reconcile_payments.py`'s, and including eleven `pytest.raises` sites in the
+adapter's own test file. It was rejected because a hierarchy makes the *wrong* assertion pass:
+`pytest.raises(PaymentProviderError)` around a timeout would have gone on passing while claiming the
+failure was a refusal. As siblings, every one of those call sites had to be read and re-decided, and
+each is now a statement about which kind of failure it is. That is the same reasoning that keeps
+`PayerEmailMissingError` and `PayerEmailRefusedError` apart, and the same one that puts
+`CurrencyNotCollectableError` in this tree rather than beside `WalletClosedError` (decision 238).
+
+The precedent for the grade was already in the table and had been for a while: **`GoogleProviderError`
+is in `UNAVAILABLE`** for exactly this shape - a provider configured correctly and unreachable. The
+new member is that one provider over. A 502 was considered and refused: this codebase's 503 means
+"this installation cannot serve *this* right now", which is what a dead provider means here, and a
+second upstream-shaped grade would be a distinction no caller acts on differently.
+
+**242. A real deposit now leaves a trace, and it is the front edge of i17 rather than i17.**
+`app/` imported no `logging` at all, which checklist item i17 records and which is a strange state
+for a service that takes money: a deposit leaves a trail at the far end - a transaction in the
+Paystack dashboard with a reference on it - and nothing on this side produced a line an operator
+could put beside it. What is added is deliberately narrow:
+
+- **`paystack_payment_provider.py`** - `info` when a collection is opened (the reference, and the
+  name the provider files it under), `warning` for each of the four failure branches, `warning` on
+  the socket failing before a request is sent.
+- **`routes/webhooks.py`** - `info` for every signed event that reached settlement, with the
+  outcome and the reference; `info` for an event this installation does not settle; `warning` for a
+  signature refusal.
+- **`app.py`** - one line at boot, for the reason 244 gives.
+
+**The rule is the reference and the outcome, never the payload and never the payer.** Payloads are a
+third party's text and `_request`'s docstring already argues at length against quoting them; the
+payer's address is the one field of theirs this system holds in the clear and there is no reason for
+it to reach a log. The reference is the join between this ledger and Paystack's dashboard, which is
+what makes it the field worth carrying. Structured logging, a level policy, and somewhere to ship
+these lines are i17 and stay open; nothing here configures anything or adds a dependency, and the
+lines inherit whatever the process configured - uvicorn in a deployment, the root logger in a test.
+
+**243. `webhooks.py` promised a distinction that lived "in the server's log", and there was no
+server log.** The route's docstring has said since it was written that an absent signature and a
+wrong one are one response because *"which of the three it was is a distinction that exists in the
+server's log and nowhere in the response"*. That was a claim about a facility that did not exist. It
+does now, and it is the narrowest line that keeps the promise: **whether a signature was presented
+at all**, never the body, never the header's value, never a comparison of the two. "Absent" and
+"present but not this installation's" is the whole of what is knowable - an altered body and a
+wrong signature are the same fact from here - and calling those one thing would put an operator back
+where they started.
+
+**244. The deployment says once, at boot, whether it can take real money.** Paystack's sandbox and
+its live service share a host, a set of endpoints and every line of this code; a deployment is in
+one mode or the other solely by which secret key was exported. A live key exported into a staging
+shell takes real money from real cards while the dashboard, the logs and the tests all look like
+testing, and the operator finds out from a card statement. **It is the only configuration mistake in
+this system that is both silent and expensive**, which is why it is the one thing `create_app` prints.
+
+`PaystackSettings.mode` reads the key's `sk_test_`/`sk_live_` prefix and returns `"test"`, `"live"`,
+or **`"unrecognised"`** - a third answer rather than a guess, because the guess it refuses is the
+dangerous one: defaulting an unknown prefix to `"live"` puts a false alarm in every operator's log,
+and defaulting it to `"test"` says "no real money here" about a key nobody has checked. **Nothing
+branches on the value.** A live key does not stop the server starting, because a live key is the
+correct state of a production deployment and refusing would take the money down to protect it. The
+unrecognised case is the only `warning`, because it is the one where the answer to "are we taking
+real money" is *nobody can tell from here*.
+
+**245. What the split hands the client.** Once a timeout means "the far end may have acted", the
+retry rule changes, and this is the deposit route's consequence rather than the adapter's: **the
+client should send its own `ref`.** `POST /wallets/{id}/deposits` defaults the key to a fresh
+`uuid4()` when the body carries none, so a client that retries after a 503 opens a *second*
+collection while the first is still live - and the payer meets two checkouts for one intention. With
+a reference of its own, the retry lands on `DepositAlreadyInitiatedError`, which is a 409 naming a
+row that exists rather than a second row that should not. The route is unchanged; what changed is
+that the adapter's refusal to say "nothing happened" is now visible to whoever writes the client.
+
+**Verified.** `python -m pytest tests/ -q`, with the pair in
+`tests/presentation/api/test_deposits.py` as the assertion that matters: a provider that cannot be
+reached answers **503 `PaymentProviderUnavailableError`** and a provider that *refuses* still answers
+**400 `PaymentProviderError`**, both driven through the real route against the real error handlers.
+The second is the control without which the first proves nothing - a 503 for everything would pass
+it and be exactly as wrong in the other direction, sending a caller to retry a request that will be
+refused identically for ever. In the adapter's own file the split is pinned at the level below:
+a 500, a timeout, a `ConnectError` and a non-JSON body each assert the new class for `initialize`
+*and* for the lookup, because the reconciler's most common real failure is a cron run on a machine
+whose network is briefly down, and a job that logged that as a bad row would send somebody looking
+at the ledger.
+
+**What this does not close.** The live test-key run - the thing this whole slice is a preparation
+for - has not happened yet, and the assumptions it exists to settle are unchanged: whether the
+webhook's `data.amount` is gross or net, whether `data.currency` comes back as sent, whether our
+reference alphabet and its lack of a length rule survive the far end, and what the test key's
+minimum amount is. None of those is answerable from this repository, and every one of them is a
+sentence in this file that a run would either confirm or correct. Also unchanged: the balance cap is
+still not consulted at settlement (i4, a policy question), abandoned charges still accumulate as
+PENDING rows the reconciler re-asks about for ever (i10), chargebacks are still acknowledged and
+ignored (i9), and there is still no rail out (i8).
+
+**246. `BUDGET_DB` moved the API's database and left the CLI's where it was, and decision 71 had
+already claimed otherwise.** Found the moment a live run was actually attempted: the CLI registered
+an account and opened a wallet, the API was pointed at the wallet, and `POST
+/wallets/{id}/deposits` answered **404 about a wallet that plainly existed**. Nothing was wrong with
+either program. They were reading two different files.
+
+`settings.database_path()` reads `BUDGET_DB` and falls back to `DEFAULT_DATABASE_PATH`, and it was
+wired into exactly one caller - `create_app` at `app.py:280`. The CLI's `--db` took
+`default=DEFAULT_DATABASE_PATH`, the bare constant, and `cli.py` did not import `database_path` at
+all. So on any machine where the variable was set - a deployment, or a run deliberately keeping a
+throwaway database away from the repository - **the two presentations resolved to different files**,
+which is the precise thing decision 71 was written to prevent. That decision says, in as many words:
+*"The same constant, `DEFAULT_DATABASE_PATH`, is now the default for both the CLI's `--db` and the
+API's `create_app`, so the two presentations resolve to one file rather than to two identical string
+literals that could drift. `BUDGET_DB` overrides it."* The first clause was true and the last was
+not, and the gap between them is this bug.
+
+**The failure mode is worth stating because it looks like nothing.** A constant cannot read an
+environment variable, so the CLI happily wrote a wallet to `./budget.db` while the API read
+`$BUDGET_DB`; the CLI then printed a wallet id the API had never heard of. There is no exception, no
+stack trace, and no two log lines that disagree - each process is correct about the database it is
+holding. What a person sees is a 404 on a resource they created seconds ago, which reads as a bug in
+the wallet lookup or in session resolution rather than as a configuration split.
+
+**The comment beside the default defended the mistake, which is why it lasted.** It read: *"exactly
+as `--db`'s own default is a constant that module owns"* - written to explain why `--session`, two
+lines below, is defaulted from `configured_session_path()` rather than read inline. The reasoning
+about `os.environ` was right; the comparison was the bug written down as a virtue. `--session` and
+`--db` were never alike: one resolved through `settings`, the other named its constant, and the
+comment asserted the resemblance that was missing.
+
+**The fix is one line, and it is the same line `--session` already had.** `--db` defaults to
+`configured_database_path()`, imported as `configured_database_path` for the same reason
+`configured_session_path` is - so the parse-time read is still the single read `settings`'s docstring
+promises, and *"this is the only module in the codebase that reads `os.environ`"* stays true. A typed
+`--db` still wins, because a default loses to an explicit flag. The help text now names the variable
+the way `--session`'s does.
+
+**Why no test caught it, and why the new ones are shaped the way they are.** All thirteen CLI call
+sites in the suite pass `--db` explicitly - through `run` in `tests/presentation/test_cli.py`, or
+spelled out where a test builds its own argv - so the *default* was exercised by nothing at all.
+A default that nothing exercises is a default that can be wrong indefinitely, and this one was wrong
+for as long as it existed without a single red test. `TestWhereTheDatabaseComesFrom` therefore calls
+`build_parser()` **inside** each test rather than in a fixture, because the default is resolved at
+parse time: setting the variable after a parser exists would assert nothing. Three tests, and the
+third is the control - the first two would both pass if the flag were being ignored in favour of the
+variable, and the point is that an explicit `--db` still beats `BUDGET_DB`.
+
+**What this does not change.** `DEFAULT_DATABASE_PATH` is still the fallback and still the constant
+`settings` owns; the CLI still ships a working default on a machine with nothing configured. And
+`tests/conftest.py`'s clearing is untouched - `BUDGET_DB` remains in `SETTINGS_VARIABLES`, so the new
+tests rest on `monkeypatch.setenv` *after* that fixture has unset it, which is the only arrangement
+in which they mean anything.
+
+**The live run, in progress.** The test-key run of Stage 1a began on 2026-09-18 and has produced two
+findings without yet reaching Paystack at all, which is itself the finding worth recording: *a run is
+not only a way to ask the provider a question, it is the only thing that exercises the whole setup,
+and both of these were about our own wiring rather than anything the far end does.*
+
+The first was `BUDGET_DB` splitting the CLI's database from the API's - decision 246. The second:
+with the CLI and API finally pointed at one file, `POST /wallets/{id}/deposits` answered **503
+`PaymentsUnconfiguredError`**, because `PAYSTACK_SECRET_KEY` had been exported into the terminal
+driving the CLI and not into the one running uvicorn. Two shells, two environments, one variable
+each - and the failure is indistinguishable, from the caller's side, from a deployment that has
+genuinely not been configured.
+
+**That second one is decision 244 collecting on the argument it made.** The boot line was added on
+the claim that a person should not have to infer an installation's payment state from a 503 on a
+route they were told to call; on the run it was the only thing on either machine that said what was
+wrong, and it had said it before the first request arrived. It is worth noting that the 503 itself
+was exactly right and is not a defect - `PaymentsUnconfiguredError` is the correct grade for an
+unconfigured install, the refusal lands at `dependencies.payment_provider` *before* the wallet is
+read, so no ledger row was written and no payer was sent anywhere, and the route's docstring argues
+that ordering is the feature. What the run confirms is not the grade but the sequence: the refusal
+arrived before any read, which is the first time that claim has been observed rather than asserted.
+
+What the run still owed when this paragraph was written was the `initialize` call, the checkout and
+the `charge.success` that decides whether `data.amount` is gross or net. The first two have since
+happened - see decision 247 - and the third has not.
+
+**The third finding, and the first one that is about this code rather than about a shell.** With
+uvicorn finally holding a key, the deposit reached Paystack and came back as
+`InvalidPaymentIntentError` - *"the provider accepted the call but returned no transaction; the
+secret key is the usual reason"*. Reading the path rather than the sentence: `_request` passes
+``401``/``403`` through as an *answer* because ``AUTHENTICATION_FAILURES`` is in ``answers``, the
+``status >= 400 and status not in AUTHENTICATION_FAILURES`` branch above therefore does not catch
+them, and the ``data = response.get("data")`` check below is what fires. That check is reached by
+**two facts that have nothing to do with each other**: a key the provider rejected, and a ``2xx``
+that carried no transaction. Both produce this identical body, and the body is a ``400`` - so a
+caller is told to correct their request when the likeliest cause is a configuration value.
+
+**And the sentence is wrong in the case it was written for.** It opens *"the provider accepted the
+call"*, which is true only of the second fact; on a ``401`` the provider rejected the call, said so
+in ``message``, and this frame had both the status and that message in hand and discarded them. The
+comment above the check asserts the reachability claim correctly - *"reached on a wrong secret key,
+which is the common case by a wide margin"* - but nothing in the code carries the one word that
+would let a reader tell the common case from the rare one. **The remedy is the same shape as
+decision 243's**: this adapter now logs, and the two facts this branch cannot tell apart are exactly
+the two an operator needs told apart, so the line belongs here. It is left unwritten for now because
+the leading hypothesis is the dull one - the run was using a placeholder key - and a fix aimed at a
+bug that a corrected key makes unreachable would be inventing a defect to have found one. What the
+run has established is the *shape* of the gap: an installation configured with a bad key and an
+installation whose provider answered an empty ``2xx`` are indistinguishable from the client, from
+the ledger, and - as the code stands - from the log.
+
+**The run's fourth observation is a confirmation rather than a defect, and it is worth its line.**
+`budget.db: 1 wallet(s)` alongside `/tmp/live-run.db: 1 wallet(s)` is decision 246 caught in the act:
+the first attempt's wallet really did land in the repository while the API was reading the throwaway
+file, and the check printed both because both existed. The fix is what made the second attempt land
+in the right one.
+
+**And the third finding was then confirmed to be a real gap rather than a hypothesis, by the one
+route that could get around it.** With a genuine `sk_test_` key, `curl` against
+`/transaction/initialize` answered **200** with a complete `data` object - `authorization_url`,
+`access_code`, `reference` - for the same account and the same currency the API was failing on. The
+API, meanwhile, kept answering `InvalidPaymentIntentError`. The process was the reason: `provider_for`
+resolves the adapter once inside `create_app`, so a server started with the placeholder key keeps
+that key for its lifetime, and correcting the environment in another shell changes nothing about a
+running process. That part is ordinary and needs no decision.
+
+**What needs one is that the API could not say so.** The deposit's refusal was byte-identical to the
+refusal a genuinely broken provider would have produced, and there was no way from the response, the
+ledger or the log to tell a key Paystack had rejected from a `2xx` that carried no transaction. The
+only reason the run got past it is that `curl` was pointed at Paystack *around* this system - which
+is the same shape of workaround, in the same file, that decision 137's `invalid_character_in_reference`
+story describes. **Both times the provider had already said the answer and this repository was the
+only place it could not be read.** The remedy is now small and named: the branch that raises
+`InvalidPaymentIntentError` holds `status` and the provider's own `message`, and the two cases it
+cannot separate are exactly the two an operator needs separated. That remedy has since been written -
+see decision 248 - because the run made the case for it faster than the run could finish.
+
+**247. The deposit loop ran against Paystack, and `data.amount` is gross.** On 2026-09-18 the whole
+path went end to end for the first time, against the test service - a wallet at
+`96f71fe1-12ad-4b60-a06f-75911614579a`, a 100.00 NGN collection under the reference
+`96f71fe1-12ad-4b60-a06f-75911614579a.run-1`, a healthy `POST /wallets/{id}/deposits` answering 201
+with an `authorization_url`, the payer's checkout paid, and the row settled by the reconciler as
+`charge_succeeded applied to a deposit`. The balance afterwards read `available: 100.00 NGN`. **The
+number is the finding: not 98.50, not 99.25, not 100 less a processing fee.**
+
+That answers assumption 1 of the run's table, and it was the one that could have invalidated the
+entire rail. `settle_payment.py:97` refuses when `row.amount != outcome.amount`, so a provider
+reporting the amount *net* would have made **every** real deposit an `AMOUNT_DISAGREES`: the payer's
+money taken, nothing credited, and the row re-asked about by every subsequent reconcile run for
+ever. **The suite could not have caught it**, and this is the cleanest example of why the run
+existed: every webhook and lookup body in `tests/` was written by this repository, so a repository
+that assumed gross would have gone on agreeing with itself indefinitely.
+
+**Assumption 2 falls to the same settlement, because `Money.__eq__` compares the currency as well as
+the number** - `self.amount == other.amount and self.currency == other.currency`. A `data.currency`
+that came back as anything but `NGN` would have failed this comparison and the row would not have
+credited. So the currency guard's output side is confirmed too: what was sent is what came back, and
+the disagreement the guard exists to make unrepresentable did not occur.
+
+**The reference survived the round trip, which is the other thing only a live run could settle.**
+`96f71fe1-12ad-4b60-a06f-75911614579a.run-1` is 42 characters and carries both hyphens and a dot;
+Paystack accepted it as the idempotency key and echoed it back as `data.reference`, which is the
+value this system stores as `provider_reference` and the value an arriving webhook will have to match
+on. Until this run, decision 149's separator and decision 151's alphabet were a *reading of Paystack's
+prose* - quoted from a rejection message, and checked against nothing. What is now observed is the
+half that matters operationally: **every reference this system mints is one the far end takes.**
+
+**Scope, because overclaiming here is the expensive kind.** This is the `/transaction/verify` path -
+the one the reconciler drives. The webhook's `charge.success` body is a different code path that
+happens to carry the same field names, and **it has still never been seen**. What is proven is that
+Paystack reports a settled collection gross in answer to a lookup *this system performs*; what is not
+proven is that the pushed event agrees. Since the webhook is how the money normally arrives - the
+reconciler is the safety net, not the road - that remains the last unverified link in the rail, and
+it is the one the tunnelled `charge.success` exists to close.
+
+**What else the run leaves open, in the order it matters.** The webhook, as above. Then the parts of
+i12 that this did not touch: `=`, `,` and the deliberately-absent length rule are still untested -
+what is proven is that the references *this system mints* are accepted, which is narrower than "the
+alphabet is right", and a caller-supplied `ref` is bounded only by the alphabet. Finally, the test
+key's minimum amount: 100.00 NGN was accepted, and where the floor sits is still unknown, which
+matters only for deposits smaller than a naira and is therefore the least urgent of the three.
+
+**248. The branch that reports "no transaction" now says which of two things happened.** Decision
+247's run spent a full round on a refusal that could not be read, so the one word the provider had
+already supplied was made to reach the sentence. The branch is
+`initialize_deposit`'s `if not isinstance(data, dict)`, and the argument for changing it is entirely
+in what reaches it: **two facts that share nothing but an absence of `data`.** A ``401``/``403`` gets
+there because ``AUTHENTICATION_FAILURES`` is in ``answers``, so the refusal branch above it does not
+catch them; a ``2xx`` with an empty body gets there because nothing else would. The first is a
+credential this installation can correct, the second is a provider or an adapter failing, and the
+old message - *"the provider accepted the call but returned no transaction; the secret key is the
+usual reason"* - named the first in both cases while opening with a clause that was **false** in the
+first case, since a ``401`` is the provider explicitly refusing the call.
+
+**The test gap is the sharper half of the story.** Of the branch's two reachable states, the ``401``
+had a test and the ``2xx`` had none - so the sentence was pinned in the case where it was merely
+misleading and free to drift in the case where it was actively wrong. The new test is
+`test_an_empty_two_hundred_is_not_reported_as_a_bad_key`, and its assertion is that the phrase
+*"secret key"* is **absent**: a test asserting only that some sentence was raised would have passed
+against the version that sent an operator to check a key that was fine. That is the same shape as
+decision 241's argument for siblings over a hierarchy - the assertion that matters is the one the
+wrong implementation would fail.
+
+**What was deliberately not changed is the grade.** `InvalidPaymentIntentError` still falls through
+`errors._grade` to a **400**, and a rejected key is arguably a **503** - "this installation cannot
+serve" is exactly what a wrong secret key means, and it is the grade
+``PaymentsUnconfiguredError`` already takes next door. Making it 503 would be wrong for the other
+half of the branch, though, because a malformed ``2xx`` from a healthy provider is not a
+configuration fact about this installation either; the honest fix is to split the class as decision
+241 split its sibling, and that is a change to make on its own evidence rather than as a rider on a
+logging repair. It is named here so the next reader does not have to rediscover that the grade is
+load-bearing and wrong in one direction.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**

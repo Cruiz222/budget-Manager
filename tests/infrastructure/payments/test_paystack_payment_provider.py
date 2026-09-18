@@ -40,6 +40,7 @@ from app.domain.payments.exception import (
     InvalidProviderAnswerError,
     PayerEmailRefusedError,
     PaymentProviderError,
+    PaymentProviderUnavailableError,
 )
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
 from app.domain.payments.providerEvent import ProviderEvent
@@ -381,8 +382,12 @@ class TestWhenTheProviderSaysNo:
     """Every failure leaves through one door, and that is the port's contract.
 
     A caller has one thing to catch, and it cannot accidentally treat a provider
-    outage as an ordinary result. These four are the ways a call fails, and the
-    class they arrive as is the assertion in each one.
+    outage as an ordinary result. The door is ``PaymentError`` - the tree the
+    port's docstring names - and behind it are **two rooms**, which is what a
+    live-money audit split apart: a provider that *refused* the call
+    (``PaymentProviderError``) and a provider that could not be asked
+    (``PaymentProviderUnavailableError``). These are the ways a call fails, and
+    the class they arrive as is the assertion in each one.
     """
 
     def test_a_wrong_key_is_a_legible_configuration_error(self, provider, requesting):
@@ -404,6 +409,32 @@ class TestWhenTheProviderSaysNo:
 
         assert "secret key" in str(refused.value)
 
+    def test_an_empty_two_hundred_is_not_reported_as_a_bad_key(
+        self, provider, requesting
+    ):
+        """**The other fact that reaches the same line, and the one nothing tested.**
+
+        A ``2xx`` carrying no transaction is the provider - or this adapter -
+        failing, and no key change fixes it. Until a live run, this case and the
+        ``401`` above left through a single sentence naming the secret key, so an
+        operator whose provider was broken was sent to check a credential that was
+        fine; and because the message was identical in both directions, there was
+        no way to tell which one they were holding.
+
+        The assertion is deliberately the **absence** of that word. It is the half
+        that used to be wrong, and a test asserting only that a sentence exists
+        would have passed against the version that sent people to the wrong place.
+        """
+        requesting.response = httpx.Response(200, json={"status": True})
+
+        with pytest.raises(InvalidPaymentIntentError) as refused:
+            provider.initialize_deposit(
+                reference="ps_ref_1", amount=an_amount("5000"), email="p@localhost"
+            )
+
+        assert "secret key" not in str(refused.value)
+        assert "200" in str(refused.value)
+
     def test_a_response_missing_the_url_is_refused(self, provider, requesting):
         requesting.response = httpx.Response(
             200, json={"status": True, "data": {"reference": "ps_ref_1"}}
@@ -416,45 +447,93 @@ class TestWhenTheProviderSaysNo:
 
         assert "authorization_url" in str(refused.value)
 
-    def test_a_refused_status_is_a_provider_error(self, provider, requesting):
-        """A 500 from the far end, reported as a refusal and nothing more.
+    def test_a_failed_status_is_an_unavailable_provider(self, provider, requesting):
+        """**A 500 from the far end, which is not a refusal and must not read as one.**
 
         The status is in the message because it is what a human acts on. The body
         here is an HTML error page and so carries no provider words - which is the
         other half of the amendment above: ``_provider_words`` contributes only
         when the provider sent the two fields it documents as its error contract.
+
+        **This test used to assert ``PaymentProviderError``, and the change is the
+        point of the class it asserts now.** A 500 says nothing about the request,
+        so it fell through to a 400 and told a payer their deposit was
+        unacceptable; a client reading that would send them back to the form
+        rather than back to the button. The two classes are siblings rather than
+        one inheriting the other, so this test cannot pass by accident under the
+        old name.
         """
         requesting.response = httpx.Response(500, text="<html>oops</html>")
 
-        with pytest.raises(PaymentProviderError) as refused:
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
             provider.initialize_deposit(
                 reference="ps_ref_1", amount=an_amount("5000"), email="p@localhost"
             )
 
         assert "500" in str(refused.value)
 
-    def test_an_unreachable_provider_is_a_provider_error(self, provider, requesting):
+    def test_a_failed_lookup_is_an_unavailable_provider(self, provider, requesting):
+        """The same status through the other method, because ``_request`` is shared.
+
+        Worth its own test rather than being inferred: the lookup is what the
+        reconciler runs, and a 5xx there reported as a refusal would be a cron job
+        that logged a provider outage as a bad row.
+        """
+        requesting.response = httpx.Response(503, text="<html>oops</html>")
+
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
+            provider.outcome_for("ps_ref_1")
+
+        assert "503" in str(refused.value)
+
+    def test_an_unreachable_provider_is_an_unavailable_provider(
+        self, provider, requesting
+    ):
         """The socket-level failure, kept distinct from a refusal by nobody.
 
         ``httpx``'s own exception does not escape: a caller that had to catch
         ``httpx.ConnectError`` would be a caller that knows what library this
         adapter uses, which is the thing the port exists to prevent.
+
+        **A timeout arrives here too**, which is the case the split was drawn for:
+        a slow provider and a dead one are the same exception to ``httpx``, and
+        both mean "the far end did not answer" rather than "the request was
+        wrong". Neither means nothing happened - a timeout on ``initialize`` may
+        leave a collection open, which is why the reference is an idempotency key.
         """
         requesting.raises = httpx.ConnectError("connection refused")
 
-        with pytest.raises(PaymentProviderError) as refused:
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
             provider.initialize_deposit(
                 reference="ps_ref_1", amount=an_amount("5000"), email="p@localhost"
             )
 
         assert "ConnectError" in str(refused.value)
 
-    def test_a_body_that_is_not_json_is_a_provider_error(self, provider, requesting):
+    def test_a_timeout_is_an_unavailable_provider(self, provider, requesting):
+        """The specific transport failure a real deposit meets most often."""
+        requesting.raises = httpx.ReadTimeout("the provider said nothing")
+
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
+            provider.initialize_deposit(
+                reference="ps_ref_1", amount=an_amount("5000"), email="p@localhost"
+            )
+
+        assert "ReadTimeout" in str(refused.value)
+
+    def test_a_body_that_is_not_json_is_an_unavailable_provider(
+        self, provider, requesting
+    ):
         """A 200 carrying an HTML error page, which is what a proxy in the way
-        produces - and ``json.loads`` would raise a ``ValueError`` at the caller."""
+        produces - and ``json.loads`` would raise a ``ValueError`` at the caller.
+
+        Unavailable rather than a refusal because a body that cannot be read is
+        the far end being broken: there is no ``message`` to quote and nothing in
+        the request to correct.
+        """
         requesting.response = httpx.Response(200, text="<html>not json</html>")
 
-        with pytest.raises(PaymentProviderError):
+        with pytest.raises(PaymentProviderUnavailableError):
             provider.initialize_deposit(
                 reference="ps_ref_1", amount=an_amount("5000"), email="p@localhost"
             )
@@ -470,7 +549,7 @@ class TestWhenTheProviderSaysNo:
         """
         requesting.raises = httpx.ConnectError("connection refused")
 
-        with pytest.raises(PaymentProviderError):
+        with pytest.raises(PaymentProviderUnavailableError):
             provider.initialize_deposit(
                 reference="ps_ref_1", amount=an_amount("5000"), email="p@localhost"
             )
@@ -599,12 +678,19 @@ class TestWhatARefusalSays:
         outbound methods cannot disagree about how a refusal reads - which is the
         drift this project has already been bitten by once, in a reference string
         that had two homes and disagreed with itself.
+
+        **And the sentence is one home for both *kinds*, which this test now
+        pins.** ``_refusal_sentence`` writes the words for a 4xx refusal and for a
+        5xx alike; only the class it is raised inside differs. So the status below
+        is a 500 and the assertions are unchanged from when it was a 400 - the
+        provider's own words survive the split, and what changed is who is told
+        what to do about them.
         """
         requesting.response = httpx.Response(
             500, json={"message": "Something went wrong", "code": "server_error"}
         )
 
-        with pytest.raises(PaymentProviderError) as refused:
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
             provider.outcome_for("ps_ref_1")
 
         assert "Something went wrong" in str(refused.value)
@@ -875,25 +961,38 @@ class TestLookingUpACollection:
 
         assert "quantum" in str(refused.value)
 
-    def test_a_body_that_is_not_json_is_a_provider_error(self, provider, requesting):
+    def test_a_body_that_is_not_json_is_an_unavailable_provider(
+        self, provider, requesting
+    ):
+        """The lookup half of the same case, and it is the reconciler's path.
+
+        A cron job that read a proxy's HTML error page as a *refusal* would log a
+        broken far end as a bad row and stop - and the deposit it was asking about
+        would sit PENDING for ever with the operator told the wrong thing about
+        why.
+        """
         requesting.response = httpx.Response(200, text="<html>not json</html>")
 
-        with pytest.raises(PaymentProviderError):
+        with pytest.raises(PaymentProviderUnavailableError):
             provider.outcome_for("ps_ref_1")
 
-    def test_a_refused_status_is_a_provider_error(self, provider, requesting):
-        """A 500 is nobody's answer, so it leaves through the one door."""
+    def test_a_failed_status_is_an_unavailable_provider(self, provider, requesting):
+        """A 500 is nobody's answer, so it leaves through the rail's door."""
         requesting.response = httpx.Response(500, text="<html>oops</html>")
 
-        with pytest.raises(PaymentProviderError) as refused:
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
             provider.outcome_for("ps_ref_1")
 
         assert "500" in str(refused.value)
 
-    def test_an_unreachable_provider_is_a_provider_error(self, provider, requesting):
+    def test_an_unreachable_provider_is_an_unavailable_provider(
+        self, provider, requesting
+    ):
+        """And the reconciler's most common real failure: a cron run on a machine
+        whose network is briefly down, which must not be reported as a bad row."""
         requesting.raises = httpx.ConnectError("connection refused")
 
-        with pytest.raises(PaymentProviderError) as refused:
+        with pytest.raises(PaymentProviderUnavailableError) as refused:
             provider.outcome_for("ps_ref_1")
 
         assert "ConnectError" in str(refused.value)
