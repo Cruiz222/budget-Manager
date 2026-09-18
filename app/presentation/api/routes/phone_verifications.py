@@ -38,6 +38,7 @@ from app.application.identity.request_phone_verification import (
 from app.presentation.api import schemas, translate
 from app.presentation.api.dependencies import (
     confirm_phone_sign_up_service,
+    request_phone_verification_rate_limit,
     request_phone_verification_service,
 )
 
@@ -51,6 +52,7 @@ router = APIRouter(tags=["identity"])
 )
 def request_phone_verification(
     body: schemas.PhoneVerificationRequestIn,
+    _: None = Depends(request_phone_verification_rate_limit),
     service: RequestPhoneVerification = Depends(request_phone_verification_service),
 ) -> schemas.PhoneVerificationAcceptedOut:
     """Text a code to a number, so whoever holds the handset can create an account.
@@ -93,6 +95,14 @@ def request_phone_verification(
     limits it is that it cannot read anything, cannot name an account, and cannot
     spend anything except a row the same number will supersede - and that the code
     it sends reaches only a handset somebody is holding.
+
+    **This is the route whose limiter is protecting money rather than CPU or
+    reputation**, and it is the tightest ceiling in the table for that reason: each
+    admitted call hands a real charge to an SMS provider. The subject is the number
+    in the body, which is the one thing here that is not the caller - the number
+    need not exist and need not be theirs, so the per-number budget is what stops
+    one handset being flooded and the ceiling is what stops a list of them being
+    walked. It runs before the service, so a refused request reaches no provider.
     """
     return translate.phone_verification_accepted_out(
         service.execute(body.phone, datetime.now())

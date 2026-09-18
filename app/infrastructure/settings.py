@@ -7,9 +7,10 @@ decision out of the domain. The reading is concentrated here so there is exactly
 one place to look when something is configured wrong - when a message does not
 arrive, or when a server is talking to the wrong database.
 
-It holds six unrelated things - mail settings, a payment provider's secret, an
-SMS provider's key and sender id, a Google client id, a database path and a
-session path - and that is a consequence of the sentence above rather than a
+It holds seven unrelated things - mail settings, a payment provider's secret, an
+SMS provider's key and sender id, a Google client id, a database path, a session
+path, and how often the rate limiter writes its counters down - and that is a
+consequence of the sentence above rather than a
 failure of tidiness. The
 alternative, a second module reading ``os.environ`` for the database or for
 Termii, would make the promise false, and the promise is the thing that makes
@@ -95,6 +96,24 @@ DEFAULT_DATABASE_PATH = "budget.db"
 #: written in the README and in ``BUDGET_SESSION``, and expanded at the point of
 #: use where a wrong guess is visible.
 DEFAULT_SESSION_PATH = "~/.config/budget/session"
+
+#: How often the rate limiter writes its in-process counts to the database, in
+#: seconds, and the one setting here that is about *this process* rather than
+#: about the world it talks to.
+#:
+#: Thirty seconds is chosen against the loss it bounds rather than against any
+#: measurement: an unclean stop loses at most the increments since the last
+#: flush, so the number trades write traffic against how much of a budget a
+#: crash hands back. It is short enough that a restart mid-attack does not
+#: meaningfully refill a counter and long enough that a quiet installation is
+#: not writing to disk on a timer for nothing.
+#:
+#: ``0`` is a real value and means *no flusher at all* - the limiter still
+#: limits, from memory, and simply does not persist. That is what the HTTP test
+#: suite uses, because a thread per test application would be hundreds of
+#: threads costing wall clock to prove something the cold layer's own tests
+#: prove directly by calling ``flush``.
+DEFAULT_RATE_LIMIT_FLUSH_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -485,3 +504,52 @@ def session_path(environ=None) -> str:
     return os.path.expanduser(
         _text(environ, "BUDGET_SESSION") or DEFAULT_SESSION_PATH
     )
+
+
+def rate_limit_flush_seconds(environ=None) -> float:
+    """How often the rate limiter persists its counters, in seconds.
+
+    ``RATE_LIMIT_FLUSH_SECONDS`` when it is set to something non-blank, and
+    ``DEFAULT_RATE_LIMIT_FLUSH_SECONDS`` otherwise - the same absent-means-default
+    shape as ``database_path`` and ``session_path``, and for the same reason:
+    there is no state in which a flush interval is unknown, only one in which
+    nobody has expressed a preference.
+
+    **``0`` means no flusher and is the only value with a meaning beyond its
+    number.** It is not "flush extremely often" and it is not "disabled
+    limiter": the limits keep being enforced from memory and stop surviving a
+    restart. A test application sets it to zero rather than tolerating a thread.
+
+    **A value that is not a number, or is negative, raises** - and the raise is
+    deliberate rather than an unlucky consequence of ``float()``. Tolerating "30s"
+    by falling back to the default would silently ignore what an operator wrote,
+    and the failure that follows is the quiet kind: the setting reads as
+    configured and something else is in force. A negative value is worse than
+    merely wrong, because ``threading.Event.wait`` returns immediately for a
+    negative timeout - so a negative interval is not a flusher that never runs,
+    it is a thread that never *sleeps*, spinning on the database as fast as the
+    disk allows. Refusing it at the point of configuration is the only place the
+    difference between "0" and "-1" can still be explained to somebody.
+
+    Raising here means a typo in this variable stops the server at startup, which
+    is the right trade for a control whose whole job is to be running: a startup
+    failure names the variable in the traceback, while a silently ignored value
+    is discovered when a limit fails to hold.
+    """
+    environ = os.environ if environ is None else environ
+    value = _text(environ, "RATE_LIMIT_FLUSH_SECONDS")
+    if value is None:
+        return DEFAULT_RATE_LIMIT_FLUSH_SECONDS
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise ValueError(
+            f"RATE_LIMIT_FLUSH_SECONDS is not a number: {value!r}"
+        ) from None
+
+    if seconds < 0:
+        raise ValueError(
+            f"RATE_LIMIT_FLUSH_SECONDS cannot be negative: {value!r}"
+        )
+    return seconds

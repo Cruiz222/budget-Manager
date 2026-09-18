@@ -36,6 +36,7 @@ from app.presentation.api import schemas, translate
 from app.presentation.api.dependencies import (
     confirm_email_change_service,
     current_actor,
+    request_email_change_rate_limit,
     request_email_change_service,
 )
 
@@ -51,6 +52,7 @@ router = APIRouter(tags=["identity"])
 def request_email_change(
     body: schemas.EmailChangeIn,
     actor: User = Depends(current_actor),
+    _: None = Depends(request_email_change_rate_limit),
     service: RequestEmailChange = Depends(request_email_change_service),
 ) -> schemas.EmailChangeOut:
     """Ask to move this account to a new address, if you can prove the password.
@@ -85,6 +87,16 @@ def request_email_change(
     request whose code did not arrive is a request nobody can answer. See
     ``RequestEmailChange`` for why that one is allowed to fail the request while
     the notice at confirm time is not.
+
+    **The limiter sits below ``current_actor``, and that order is a decision.**
+    ``request_email_change_rate_limit`` declares ``current_actor`` as its own
+    dependency, so the actor is resolved - and a bad token refused as a 401 -
+    before the limiter is consulted. Returning 429 to a caller who has not proved
+    who they are would answer a question they have no standing to ask, and would
+    be a behaviour change on this route, which is the only limited one behind a
+    session. It also means the subject it counts is the *account*, since the
+    actor is the one thing in this request that is known rather than supplied;
+    ``dependencies.py`` records what that key does and does not cover.
     """
     return translate.email_change_out(
         service.execute(body.email, body.password, datetime.now())

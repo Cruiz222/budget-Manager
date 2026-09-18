@@ -8,7 +8,9 @@ from app.domain.identity.user import User
 from app.presentation.api import schemas, translate
 from app.presentation.api.dependencies import (
     current_actor,
+    sign_up_rate_limit,
     sign_up_service,
+    sign_up_with_google_rate_limit,
     sign_up_with_google_service,
 )
 
@@ -18,6 +20,7 @@ router = APIRouter(tags=["identity"])
 @router.post("/users", response_model=schemas.UserOut, status_code=status.HTTP_201_CREATED)
 def sign_up(
     body: schemas.SignUpIn,
+    _: None = Depends(sign_up_rate_limit),
     service: SignUp = Depends(sign_up_service),
 ) -> schemas.UserOut:
     """Register an address, with a password to prove it later.
@@ -44,6 +47,15 @@ def sign_up(
     ``InvalidUserEmailError`` for one that is. The store's own backstop - the
     ``UNIQUE`` on ``users.email`` - is one layer further down and is not what
     answers a duplicate; see ``SignUp``.
+
+    **The first parameter is a rate limiter, and it comes first deliberately.**
+    FastAPI resolves dependencies in signature order, so declaring it above the
+    service is what makes a refused request cost nothing: a caller who has spent
+    their budget is turned away by ``sign_up_rate_limit`` before ``SignUp`` is
+    built, and building it is the cheap half - hashing the password is what
+    actually costs. ``rate_limits.py`` holds the numbers and the argument for
+    them, and ``dependencies.py`` holds the argument for this being a dependency
+    at all rather than a check inside the handler.
     """
     return translate.user_out(service.execute(body.email, body.password, datetime.now()))
 
@@ -55,6 +67,7 @@ def sign_up(
 )
 def sign_up_with_google(
     body: schemas.GoogleTokenIn,
+    _: None = Depends(sign_up_with_google_rate_limit),
     service: SignUpWithGoogle = Depends(sign_up_with_google_service),
 ) -> schemas.UserOut:
     """Register the identity a Google id_token describes, and set no password.
@@ -97,6 +110,13 @@ def sign_up_with_google(
     address Google has not proved is a 400 with ``UnverifiedGoogleEmailError``, and
     that refusal is load-bearing rather than tidy: an unproved address stored here
     would be an address this system mails password-reset codes to.
+
+    **The limiter above the service is the ceiling and nothing else**, because
+    there is nothing here to key a per-subject budget on - the Google ``sub`` is
+    not known until the token has been verified, and verifying it is the cost
+    being defended. ``rate_limits.py`` calls that a finding rather than an
+    omission; the short version is that a caller who has proved nothing can still
+    be bounded in aggregate, just not individually.
     """
     return translate.user_out(service.execute(body.id_token, datetime.now()))
 

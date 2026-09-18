@@ -27,6 +27,9 @@ reported as a bug, with none of the bug in the response.
 from fastapi.testclient import TestClient
 
 from app.presentation.api.app import create_app
+from app.presentation.api.rate_limits import POLICIES
+from tests.conftest import TEST_USER_PASSWORD
+from tests.presentation.api.conftest import ALICE
 
 
 class BrokenFactory:
@@ -238,6 +241,117 @@ class TestUnprocessable:
         )
 
         assert response.status_code == 422
+
+
+class TestTooManyRequests:
+    """429 - the same caller is asking too often, and the answer is *come back later*.
+
+    **The one grade in the table whose remedy is not a change to the request.** Every
+    other row here is a client doing something it can fix: present a token, correct an
+    id, send a field, fix the shape. This request is well formed, the caller may be
+    perfectly entitled to make it, and the only thing wrong with it is how recently
+    they made the last one - which is why it is the only response in this API that
+    carries ``Retry-After``, and why the test asserts the header rather than only the
+    status.
+
+    **Ruling out the two neighbours is most of what this test is for.** A 503 would
+    say this installation cannot serve the request whoever asks, and a client that
+    read a 429 as one would take the whole installation offline on the strength of a
+    single abusive caller. A 400 would say the request is unacceptable, which sends a
+    client to fix something that is not broken - and on ``POST /password-resets`` it
+    would be worse than unhelpful, since it would hand back a distinction that route
+    is built to withhold. So the grade is asserted against its neighbours as well as
+    against itself.
+
+    The route under it is ``POST /users``, and the budget is read from the policy
+    table rather than written here: the numbers are the part explicitly expected to
+    move, and a test of the grade should not break when one does.
+    """
+
+    def _spend_the_budget(self, client) -> None:
+        for _ in range(POLICIES["sign_up"].subject.calls):
+            client.post(
+                "/users", json={"email": ALICE, "password": TEST_USER_PASSWORD}
+            )
+
+    def test_it_is_a_429_and_not_either_of_its_neighbours(self, client):
+        self._spend_the_budget(client)
+
+        response = client.post(
+            "/users", json={"email": ALICE, "password": TEST_USER_PASSWORD}
+        )
+
+        assert response.status_code == 429
+        assert response.status_code not in (400, 503)
+
+    def test_the_body_is_the_one_shape_every_failure_uses(self, client):
+        """``error`` is the class name and ``detail`` is prose, as everywhere else.
+
+        The name is asserted rather than the prose, because the name is the field a
+        client branches on. The detail is deliberately uninformative about *which*
+        limit was reached - see ``RateLimitedError``, where that vagueness is argued
+        rather than accidental - so a test pinning it would be pinning the one part
+        of this response that is meant to be able to change.
+        """
+        self._spend_the_budget(client)
+
+        response = client.post(
+            "/users", json={"email": ALICE, "password": TEST_USER_PASSWORD}
+        )
+
+        assert response.json()["error"] == "RateLimitedError"
+        assert response.json()["detail"]
+
+    def test_carries_a_retry_after_that_is_the_callers_own_remaining_window(self, client):
+        """Seconds, and never zero.
+
+        ``Retry-After: 0`` would invite an immediate retry, which is the opposite of
+        what this response is for, and a value rounded down would tell a client that
+        obeys the header to come back a fraction early and be refused again. The
+        ceiling is the policy's own window, because the header describes the window
+        that refused and nothing longer.
+        """
+        self._spend_the_budget(client)
+
+        response = client.post(
+            "/users", json={"email": ALICE, "password": TEST_USER_PASSWORD}
+        )
+
+        retry_after = int(response.headers["Retry-After"])
+        assert 1 <= retry_after <= POLICIES["sign_up"].subject.window.total_seconds()
+
+    def test_the_header_is_absent_from_every_other_refusal(self, client):
+        """Only this grade carries one, which is a fact about the whole tree.
+
+        ``ApiError`` gained a ``headers`` mapping so that this one class could carry
+        ``Retry-After`` without the handler learning its name. The risk in that
+        arrangement is not that it fails to forward the header - that is asserted
+        above - but that it starts attaching headers to refusals that never had any.
+        So an ordinary refusal is checked for their absence: a 409 from the same route
+        and a 401 from a route that requires a token.
+
+        The first request is a control and it is load-bearing, for the reason
+        ``TestConflict.test_pausing_a_plan_that_is_already_paused`` gives about its
+        own first assertion: nothing on this fixture has registered an account, so the
+        request that makes the *second* one a duplicate is this test's own. Without
+        it the "409" would be the 201 of a first sign-up, and a test that asserted
+        only the header's absence would pass on a 201 - which is a refusal that does
+        not exist.
+        """
+        first = client.post(
+            "/users", json={"email": ALICE, "password": TEST_USER_PASSWORD}
+        )
+        assert first.status_code == 201, "the control: this address was not taken yet"
+
+        duplicate = client.post(
+            "/users", json={"email": ALICE, "password": TEST_USER_PASSWORD}
+        )
+        assert duplicate.status_code == 409
+        assert "Retry-After" not in duplicate.headers
+
+        unauthorized = client.get("/users/me")
+        assert unauthorized.status_code == 401
+        assert "Retry-After" not in unauthorized.headers
 
 
 class TestAServerFault:

@@ -1,0 +1,854 @@
+<title>Budget Manager MVP</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground: #F5F7F8;
+    --surface: #FFFFFF;
+    --surface-2: #EDF1F3;
+    --ink: #121A1F;
+    --ink-2: #47555F;
+    --ink-3: #6E7C86;
+    --rule: #DCE2E7;
+    --rule-strong: #C4CDD4;
+    --accent: #0B5F52;
+    --accent-soft: #E1EFEB;
+    --money: #A3322B;
+    --money-soft: #F6E7E5;
+    --safety: #8A5A00;
+    --safety-soft: #F7EEDC;
+    --rail: #2C4A6E;
+    --rail-soft: #E6EDF5;
+    --done: #0B5F52;
+
+    --step: 15px;
+    --maxw: 1040px;
+
+    --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #0E1418;
+      --surface: #151C21;
+      --surface-2: #1C252B;
+      --ink: #E4EAED;
+      --ink-2: #A5B1BA;
+      --ink-3: #7B8891;
+      --rule: #253138;
+      --rule-strong: #35434C;
+      --accent: #52B79C;
+      --accent-soft: #14312B;
+      --money: #E28A80;
+      --money-soft: #331D1B;
+      --safety: #DCA945;
+      --safety-soft: #322718;
+      --rail: #8FB2DA;
+      --rail-soft: #1B2733;
+      --done: #52B79C;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0E1418;
+    --surface: #151C21;
+    --surface-2: #1C252B;
+    --ink: #E4EAED;
+    --ink-2: #A5B1BA;
+    --ink-3: #7B8891;
+    --rule: #253138;
+    --rule-strong: #35434C;
+    --accent: #52B79C;
+    --accent-soft: #14312B;
+    --money: #E28A80;
+    --money-soft: #331D1B;
+    --safety: #DCA945;
+    --safety-soft: #322718;
+    --rail: #8FB2DA;
+    --rail-soft: #1B2733;
+    --done: #52B79C;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 15px;
+    line-height: 1.55;
+    padding-inline: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: var(--maxw);
+    margin-inline: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 34px;
+    padding-block: 0 72px;
+  }
+
+  /* ---------- sticky header ---------- */
+
+  header.bar {
+    position: sticky;
+    top: env(safe-area-inset-top, 0px);
+    z-index: 10;
+    background: var(--ground);
+    border-bottom: 1px solid var(--rule);
+    padding-block: 14px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .bar-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 14px;
+  }
+
+  h1 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 19px;
+    letter-spacing: -0.01em;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  .bar-meta {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-3);
+    margin-right: auto;
+  }
+
+  .bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  #count {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+
+  #reset {
+    font-family: var(--body);
+    font-size: 12px;
+    color: var(--ink-2);
+    background: transparent;
+    border: 1px solid var(--rule-strong);
+    border-radius: 3px;
+    padding: 3px 9px;
+    cursor: pointer;
+  }
+  #reset:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  .track {
+    height: 4px;
+    background: var(--surface-2);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  #bar {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 180ms ease;
+  }
+  @media (prefers-reduced-motion: reduce) { #bar { transition: none; } }
+
+  /* ---------- intro ---------- */
+
+  .intro {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding-top: 26px;
+  }
+
+  .quote {
+    border-left: 3px solid var(--rule-strong);
+    padding-left: 16px;
+    color: var(--ink-2);
+    font-size: 15px;
+    max-width: 62ch;
+  }
+  .quote cite {
+    display: block;
+    font-style: normal;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    margin-top: 7px;
+    letter-spacing: 0.01em;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+  }
+  .stat {
+    background: var(--surface);
+    padding: 13px 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .stat b {
+    font-family: var(--display);
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat span {
+    font-size: 12px;
+    color: var(--ink-3);
+    line-height: 1.35;
+  }
+
+  /* ---------- order strip ---------- */
+
+  .order {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 18px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 13px;
+  }
+  .order h2 {
+    font-family: var(--display);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+    margin: 0;
+  }
+  .order ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 14px 22px;
+    counter-reset: step;
+  }
+  .order li {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 13.5px;
+    color: var(--ink-2);
+    counter-increment: step;
+  }
+  .order li::before {
+    content: counter(step, decimal-leading-zero);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.02em;
+  }
+  .order li b { color: var(--ink); font-weight: 600; display: block; }
+
+  /* ---------- groups ---------- */
+
+  section.group { display: flex; flex-direction: column; gap: 4px; }
+
+  .group-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+    padding-bottom: 9px;
+    border-bottom: 1px solid var(--rule-strong);
+    margin-bottom: 3px;
+  }
+  .group-head h2 {
+    font-family: var(--display);
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+  }
+  .swatch {
+    width: 9px; height: 9px;
+    background: var(--stripe);
+    flex: none;
+    border-radius: 1px;
+  }
+  .group-note {
+    font-size: 13px;
+    color: var(--ink-3);
+    margin: 0;
+    flex: 1 1 240px;
+  }
+  .group-count {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
+  ul.items { list-style: none; margin: 0; padding: 0; }
+
+  li.item {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 13px;
+    padding: 15px 4px 15px 13px;
+    border-left: 3px solid var(--stripe);
+    border-bottom: 1px solid var(--rule);
+    align-items: start;
+  }
+  li.item:last-child { border-bottom: none; }
+
+  input.tick {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 17px; height: 17px;
+    margin: 2px 0 0;
+    border: 1.5px solid var(--rule-strong);
+    border-radius: 2px;
+    background: var(--surface);
+    cursor: pointer;
+    flex: none;
+    display: grid;
+    place-content: center;
+    transition: background 120ms ease, border-color 120ms ease;
+  }
+  input.tick:hover { border-color: var(--ink-3); }
+  input.tick:checked {
+    background: var(--done);
+    border-color: var(--done);
+  }
+  input.tick:checked::after {
+    content: "";
+    width: 9px; height: 5px;
+    border-left: 2px solid var(--surface);
+    border-bottom: 2px solid var(--surface);
+    transform: translateY(-1px) rotate(-45deg);
+  }
+  input.tick:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .item-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+
+  .item-title {
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 15px;
+    letter-spacing: -0.005em;
+    line-height: 1.35;
+    cursor: pointer;
+    text-wrap: balance;
+  }
+
+  .why {
+    margin: 0;
+    font-size: 13.5px;
+    color: var(--ink-2);
+    max-width: 74ch;
+  }
+
+  .evidence {
+    margin: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+  }
+  .evidence code {
+    font-family: inherit;
+    background: var(--surface-2);
+    border-radius: 2px;
+    padding: 2px 6px;
+    overflow-wrap: anywhere;
+  }
+
+  li.item.is-done .item-title {
+    color: var(--ink-3);
+    text-decoration: line-through;
+    text-decoration-thickness: 1px;
+  }
+  li.item.is-done .why { color: var(--ink-3); }
+  li.item.is-done { border-left-color: var(--rule-strong); }
+
+  /* ---------- tracked ---------- */
+
+  section.tracked {
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  section.tracked h2 {
+    font-family: var(--display);
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  .tracked-note { margin: 0; font-size: 13px; color: var(--ink-3); max-width: 66ch; }
+  .tracked ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .tracked li {
+    font-size: 13.5px;
+    color: var(--ink-2);
+    padding-left: 14px;
+    position: relative;
+    max-width: 80ch;
+  }
+  .tracked li::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0.62em;
+    width: 5px; height: 1px;
+    background: var(--ink-3);
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    padding-top: 6px;
+    border-top: 1px solid var(--rule);
+    margin-top: 2px;
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+  .legend span { display: flex; align-items: center; gap: 7px; }
+
+  footer.foot {
+    font-size: 12.5px;
+    color: var(--ink-3);
+    border-top: 1px solid var(--rule);
+    padding-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 74ch;
+  }
+  footer.foot p { margin: 0; }
+  footer.foot code {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    background: var(--surface-2);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }
+
+  footer.foot p { font-size: 12.5px; }
+
+  @media (max-width: 460px) {
+    h1 { font-size: 17px; }
+    .bar-meta { width: 100%; order: 3; }
+    li.item { padding-left: 10px; gap: 11px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="bar">
+    <div class="bar-top">
+      <h1>The road to MVP</h1>
+      <span class="bar-meta">Budget Manager &middot; main &middot; 6a7828e</span>
+      <div class="bar-actions">
+        <span id="count">1 of 19 done</span>
+        <button id="reset" type="button">Reset</button>
+      </div>
+    </div>
+    <div class="track" role="progressbar" aria-label="MVP items complete" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="bar"></div>
+    </div>
+  </header>
+
+  <div class="intro">
+    <p class="quote">
+      A person signs up with Google, gets a wallet, deposits real money through
+      Paystack, creates a savings plan, and receives an email receipt — over
+      HTTPS, on a VPS, with backups that have been restored once.
+      <cite>README.md:5356 · &ldquo;What &lsquo;MVP&rsquo; means here&rdquo;</cite>
+    </p>
+
+    <div class="stats">
+      <div class="stat"><b>3,188</b><span>tests passing, 346s</span></div>
+      <div class="stat"><b>52</b><span>commits on main</span></div>
+      <div class="stat"><b>Phases 1–3</b><span>built, except the items below</span></div>
+      <div class="stat"><b>Phase 4</b><span>not started</span></div>
+      <div class="stat"><b>18</b><span>items left to MVP</span></div>
+    </div>
+  </div>
+
+  <div class="order">
+    <h2>Order worth arguing about</h2>
+    <ol>
+      <li><b><s>Rate limiting</s> &middot; shipped</b>The reset route was the open door, and it
+        is a locked one now — three requests an hour per address, counted per address
+        rather than per route so one abusive caller cannot shut the door behind them.
+        What the work was never going to close is decision 189&rsquo;s latency oracle, which
+        is its own item and is not on this list.</li>
+      <li><b>The currency guard at the door</b>One check at wallet creation.</li>
+      <li><b>Per-plan isolation in the tick</b>One plan must not stop a pass.</li>
+      <li><b>CI, then TLS, backups, logging</b>Phase 4, in that order.</li>
+      <li><b>Google's browser flow, then a screen</b>Nothing can obtain a token today.</li>
+    </ol>
+  </div>
+
+  <section class="group" data-group style="--stripe: var(--money)">
+    <div class="group-head">
+      <h2><span class="swatch"></span>Money correctness</h2>
+      <p class="group-note">Each of these moves money wrongly, or stops money moving at all.</p>
+      <span class="group-count" data-group-count>0/4</span>
+    </div>
+    <ul class="items">
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i1" data-id="provider-currency">
+        <div class="item-body">
+          <label class="item-title" for="i1">The provider is told NGN, whatever the wallet holds</label>
+          <p class="why">A USD wallet depositing <code>Money(100, USD)</code> posts <code>{"amount": 10000, "currency": "NGN"}</code> — the payer is charged a hundredth of what the ledger credits, and neither end is told. The constant is a statement about what has been verified, not a check.</p>
+          <p class="evidence"><code>paystack_payment_provider.py:161,217</code><code>routes/wallets.py:15</code><code>decision 201</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i2" data-id="plan-currency-tick">
+        <div class="item-body">
+          <label class="item-title" for="i2">A plan edited into a foreign currency takes down the whole tick</label>
+          <p class="why"><code>edit_instructions</code> never re-applies the currency check <code>create_plan</code> makes, and <code>RunDuePlans</code> catches nothing per plan. The tick exits 1 and every plan after it in that pass does not run. Two candidate fixes — re-check on edit, or record a blocked run — and neither is done.</p>
+          <p class="evidence"><code>README.md:4487</code><code>app/application/plan_service.py</code><code>decisions 179, 200</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i3" data-id="withdraw-ref-retry">
+        <div class="item-body">
+          <label class="item-title" for="i3">A refused <code>withdraw --ref X</code> can be retried into a silent success</label>
+          <p class="why">Dedupe reads <code>get_by_internal_reference</code> — a global lookup that returns the row whatever its status, FAILED included — so the retry finds the old failed row, returns it as the outcome, and composes a receipt for a payment that did not happen. Unreachable without an explicit reference, which is why nothing has hit it.</p>
+          <p class="evidence"><code>app/application/wallet_operation.py:105</code><code>decision 116</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i4" data-id="balance-cap-after-payment">
+        <div class="item-body">
+          <label class="item-title" for="i4">A payment that breaches the balance cap after the payer has paid has no answer</label>
+          <p class="why">The cap is refused at initiate deposit — the last moment refusing costs nobody anything — but the balance read there is free to change before the payer pays, and <code>SettlePayment</code> credits the wallet directly and consults no ceiling. Hold it, reverse it, or accept it: each is a real answer with a different conversation, and the live run that would inform the choice has not been run.</p>
+          <p class="evidence"><code>app/application/payments/settle_payment.py</code><code>initiate_deposit.py:150</code></p>
+        </div>
+      </li>
+
+    </ul>
+  </section>
+
+  <section class="group" data-group style="--stripe: var(--safety)">
+    <div class="group-head">
+      <h2><span class="swatch"></span>Safety on the way in</h2>
+      <p class="group-note">The doors an unauthenticated caller can knock on.</p>
+      <span class="group-count" data-group-count>0/3</span>
+    </div>
+    <ul class="items">
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i5" data-id="rate-limiting" data-shipped>
+        <div class="item-body">
+          <label class="item-title" for="i5">Rate limiting on the doors that cost something</label>
+          <p class="why"><b>Built.</b> Nine routes take a write with no bearer token, and the seven that cost this server per call now refuse at a stated rate: <code>POST /users</code> and <code>POST /sessions</code> an argon2 hash each, <code>POST /phone-verifications</code> a real SMS charge, <code>POST /password-resets</code> and <code>POST /users/me/email-changes</code> an SMTP round trip, and the two Google routes an outbound JWKS fetch. The refusal is a 429 in the house error shape with a <code>Retry-After</code>. Counters are two layers — hot in memory, flushed in deltas to a <code>rate_limits</code> table — so a restart does not hand anybody a fresh budget. <b>That last claim was confirmed against a real <code>uvicorn</code> process, not only in tests</b>: twelve attempts at one address give ten <code>401</code>s and then a <code>429</code> carrying <code>retry-after</code>, a second address is untouched, the store ends up holding <b>14</b> for the address against <b>11</b> for the installation — the four refusals spent the first and not the second — and after killing the process and starting it again the next request was <em>still</em> a <code>429</code>. That is the lifespan, the flush and the warm start all proved against a socket rather than against a call to <code>flush()</code>. The three <code>*/confirm</code> routes stay unlimited on purpose: their tokens are 256 bits of CSPRNG rather than six digits, so there is nothing there to brute-force. Two things this did <em>not</em> close, both named in <code>README.md</code>: the reset route still leaks account existence by latency (decision 189 survives it intact), and the <b>velocity</b> control over money movement is a different question that counts ledger rows rather than requests.</p>
+          <p class="evidence"><code>app/presentation/api/rate_limits.py</code><code>app/infrastructure/rate_limiting/</code><code>README.md decisions 214–232</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i6" data-id="session-listing">
+        <div class="item-body">
+          <label class="item-title" for="i6">Session listing and per-device revocation</label>
+          <p class="why">The store already supports it — a session is a row and revocation is a deletion — so what is missing is the endpoints. Today <code>routes/sessions.py</code> has create, phone login and delete-current, which means a person cannot see where they are signed in or end one device without ending all of them.</p>
+          <p class="evidence"><code>app/presentation/api/routes/sessions.py</code><code>README.md Phase 2c</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i7" data-id="email-verification">
+        <div class="item-body">
+          <label class="item-title" for="i7">Proving an address an account already holds</label>
+          <p class="why">A change proves the <em>new</em> address; nothing has ever proved the one somebody registered with, so &ldquo;verified&rdquo; is a fact this system cannot state about any account. The reset flow makes it more visible rather than less — it proves the mailbox and then forgets. The shape is a <code>verified_at</code> on the account, written by whichever flow proves it, and a decision about what reads it.</p>
+          <p class="evidence"><code>README.md &ldquo;Still open&rdquo;</code><code>decisions 183–191</code></p>
+        </div>
+      </li>
+
+    </ul>
+  </section>
+
+  <section class="group" data-group style="--stripe: var(--rail)">
+    <div class="group-head">
+      <h2><span class="swatch"></span>The payment rail</h2>
+      <p class="group-note">Money in works. Money out, and the far end of both, do not.</p>
+      <span class="group-count" data-group-count>0/5</span>
+    </div>
+    <ul class="items">
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i8" data-id="no-rail-out">
+        <div class="item-body">
+          <label class="item-title" for="i8">There is no rail out</label>
+          <p class="why"><code>PaymentProvider</code> has three methods and <code>initiate_transfer</code> is deliberately not one of them — it would be a signature guessed rather than derived. So destinations are <em>recorded</em> and money is <em>held</em>, and no external transfer is ever initiated. A wallet can take a deposit and cannot send one to a bank.</p>
+          <p class="evidence"><code>app/domain/payments/paymentProvider.py</code><code>decision 124</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i9" data-id="chargebacks">
+        <div class="item-body">
+          <label class="item-title" for="i9">Chargebacks and deposit reversals</label>
+          <p class="why">Reversing a charge means <em>debiting</em> a wallet that may already have spent the money, and the ledger may not go negative. The recorded shape is refuse, record, and let a person settle the shortfall — because &ldquo;this account owes money&rdquo; is a real state, and a negative balance would be this system pretending it has a credit facility.</p>
+          <p class="evidence"><code>README.md &ldquo;Still open&rdquo;</code><code>decision 130</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i10" data-id="abandoned-charges">
+        <div class="item-body">
+          <label class="item-title" for="i10">Sweeping abandoned charges</label>
+          <p class="why">The reconciler reports an abandoned checkout and leaves it PENDING on purpose, so a wallet accumulates rows that will never settle and are asked about forever. The fix is a sweep, and it needs a fifth <code>ProviderEvent</code> — <code>CHARGE_EXPIRED</code> — plus evidence the provider has stopped offering the checkout. Fail a row a minute before its payment arrives and the money has nowhere to go.</p>
+          <p class="evidence"><code>decision 142</code><code>app/domain/payments/providerEvent.py</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i11" data-id="provider-events">
+        <div class="item-body">
+          <label class="item-title" for="i11">The <code>provider_events</code> audit table</label>
+          <p class="why">The ledger answers &ldquo;what happened to this money&rdquo; and is not the answer to &ldquo;did Paystack send us anything last Tuesday&rdquo;. Argued against as a need and never settled as a want. Build it the day somebody has to ask the second question.</p>
+          <p class="evidence"><code>decision 128</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i12" data-id="reference-alphabet">
+        <div class="item-body">
+          <label class="item-title" for="i12">A live check of Paystack's reference alphabet</label>
+          <p class="why">The accepted character set is written down from memory in three places, and no run anywhere asks Paystack what it currently accepts. The suite can prove the code and the double agree with the rule as it was written down — which is exactly the distinction that let the deposit route sit broken behind 2,042 green tests. Worth doing before this system takes a real payment.</p>
+          <p class="evidence"><code>app/domain/money/reference.py</code><code>decisions 151–155</code></p>
+        </div>
+      </li>
+
+    </ul>
+  </section>
+
+  <section class="group" data-group style="--stripe: var(--accent)">
+    <div class="group-head">
+      <h2><span class="swatch"></span>Production</h2>
+      <p class="group-note">All of Phase 4. None of it exists yet.</p>
+      <span class="group-count" data-group-count>0/5</span>
+    </div>
+    <ul class="items">
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i13" data-id="ci">
+        <div class="item-body">
+          <label class="item-title" for="i13">CI that runs the suite on every push</label>
+          <p class="why">3,136 tests currently run only when somebody types <code>pytest</code>, and there is no <code>.github/</code> directory. The README's own line: tests that nobody runs automatically are a liability that feels like an asset. It is also the cheapest item on this list.</p>
+          <p class="evidence"><code>.github/</code><code>README.md Phase 4</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i14" data-id="migrations">
+        <div class="item-body">
+          <label class="item-title" for="i14">Migrations through a tool</label>
+          <p class="why">Schema changes are still hand-rolled, PRAGMA-guarded <code>ALTER</code>s — the unit of work itself flags them as the manual version. Alembic is the named answer, and it has to arrive before the first real install rather than after.</p>
+          <p class="evidence"><code>app/infrastructure/persistence/sqlite_unit_of_work.py</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i15" data-id="tls-vps">
+        <div class="item-body">
+          <label class="item-title" for="i15">docker compose, a reverse proxy, and TLS on a VPS</label>
+          <p class="why">Non-negotiable, and it is also the honest defence for a Google <code>id_token</code> that can be replayed for about an hour — verification refuses everything it can refuse, and none of that helps once a valid token is in somebody else's hands, because a valid token <em>is</em> the credential.</p>
+          <p class="evidence"><code>README.md Phase 4</code><code>README.md &ldquo;Still open&rdquo;</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i16" data-id="backups">
+        <div class="item-body">
+          <label class="item-title" for="i16">Backups with a restore somebody has actually run</label>
+          <p class="why">A backup nobody has restored is a belief, not a backup — and this is the one item on the whole list whose absence is unrecoverable. It is also the prerequisite for the two table rebuilds that want foreign keys, because they run on tables holding real balances.</p>
+          <p class="evidence"><code>README.md Phase 4</code><code>decisions 59, 84</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i17" data-id="logging">
+        <div class="item-body">
+          <label class="item-title" for="i17">Structured logging and error tracking</label>
+          <p class="why"><code>app/</code> imports no <code>logging</code> at all, so an operator has a cron tick log and nothing else. The reconciler's whole job is to raise an alarm nobody is currently listening for in a place anyone looks.</p>
+          <p class="evidence"><code>app/</code> (no <code>logging</code> import)</p>
+        </div>
+      </li>
+
+    </ul>
+  </section>
+
+  <section class="group" data-group style="--stripe: var(--ink-3)">
+    <div class="group-head">
+      <h2><span class="swatch"></span>The client</h2>
+      <p class="group-note">The MVP sentence begins &ldquo;a person signs up&rdquo;, and a person needs a screen.</p>
+      <span class="group-count" data-group-count>0/2</span>
+    </div>
+    <ul class="items">
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i18" data-id="google-browser">
+        <div class="item-body">
+          <label class="item-title" for="i18">The browser half of Google sign-in</label>
+          <p class="why">What shipped is a verification core and two routes that accept a token. What did not ship is any way for a person to obtain one — the CLI says to use Google's OAuth 2.0 Playground or your own client. The code flow needs a <code>redirect_uri</code>: a public address for <em>this installation</em>, which is a setting that deliberately does not exist.</p>
+          <p class="evidence"><code>README.md &ldquo;Still open&rdquo;</code><code>decisions 204–213</code></p>
+        </div>
+      </li>
+
+      <li class="item">
+        <input class="tick" type="checkbox" id="i19" data-id="client">
+        <div class="item-body">
+          <label class="item-title" for="i19">A client at all</label>
+          <p class="why">There is no HTML, JavaScript, TypeScript or CSS anywhere in the repository. The product surface today is a CLI and a JSON API — complete and tested, and unusable by anybody who is not holding a terminal. This is the largest single piece of unlisted work between here and the MVP sentence.</p>
+          <p class="evidence"><code>repository root</code><code>app/presentation/</code></p>
+        </div>
+      </li>
+
+    </ul>
+  </section>
+
+  <section class="tracked">
+    <h2>Tracked, decided, not blocking</h2>
+    <p class="tracked-note">Each of these is a real gap with a written reason for leaving it. They are listed so the checklist above is honest about what it is <em>not</em> counting.</p>
+    <ul>
+      <li>Bounding how <em>often money may move</em> is a second control, counting ledger rows rather than requests. The daily value cap deliberately does not count reversals, so this one has to count what that one skips — and it needs a read of its own. Rate limiting the HTTP door does not close it. <code>transaction_repository.py:124</code></li>
+      <li>The limit-day is the server's day, so an allowance resets at the wrong midnight for anybody who is not where the server is. Africa/Lagos will usually be right, which is the worst way for a boundary bug to behave. <code>decision 202</code></li>
+      <li>A pot's name has no normalisation — <code>"Vacation"</code> and <code>"vacation"</code> are two pots, and a name of ten thousand characters is accepted. <code>fund.py:306</code></li>
+      <li>A session opened before an email change keeps working afterwards — decided, not overlooked. The threat that matters is an attacker holding both the password and a token, and they log in again the moment the change applies. <code>decision 175</code></li>
+      <li><code>wallets</code> and the identity tables still carry no foreign keys, so the pairing is guaranteed by writing both rows in one unit rather than by the schema. Both want the same table rebuild, and both want the backup story first. <code>decisions 59, 84</code></li>
+      <li>Nothing re-hashes a password whose argon2 parameters have fallen behind. The migration is re-hash-on-next-successful-login, which is the only moment the plaintext is in hand — a third method on a port, not a line in an adapter.</li>
+      <li>Settled <code>email_changes</code> and <code>sessions</code> rows are never purged. One design job covering two tables: what the retention rule is, and whether a person ever reads the record. <code>decision 168</code></li>
+      <li>Three receipt guards that mean the same thing are written three times, and none is derived from another. The third caller has now appeared, so the job is owed rather than pending.</li>
+      <li>No CLI <code>close</code> verb — <code>close</code> is reachable only over HTTP, so its confirmation prompt has never been seen by a terminal. It is a user-facing money transition with no way back and deserves its own decision first. <code>decision 113</code></li>
+    </ul>
+
+    <div class="legend">
+      <span><i class="swatch" style="--stripe: var(--money)"></i>Money correctness</span>
+      <span><i class="swatch" style="--stripe: var(--safety)"></i>Safety on the way in</span>
+      <span><i class="swatch" style="--stripe: var(--rail)"></i>Payment rail</span>
+      <span><i class="swatch" style="--stripe: var(--accent)"></i>Production</span>
+      <span><i class="swatch" style="--stripe: var(--ink-3)"></i>Client</span>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <p><strong>Ticks are saved in this browser only.</strong> They survive a reload of this page and do not travel to anybody you share the link with, or to any other device — so treat it as your own copy of the list. An item marked as already built starts ticked, so the list reads true the first time you open it; untick one if you disagree, and <b>Reset</b> puts it back.</p>
+    <p>Read from <code>README.md</code>, the roadmap and <code>### Still open</code>, the API route table, and a full run of the suite on main at <code>6a7828e</code>. Line and decision references point into that revision.</p>
+    <p><strong>Two corrections against that revision.</strong> The login timing oracle was listed here as open and is not — <code>LogIn._settle</code> already verifies against <code>DUMMY_HASH</code> when no credential is found, so both arms pay one argon2 verify. And the unauthenticated write count is nine, not the five <code>README.md</code> still says; <code>dependencies.py</code> and <code>test_boundary.py</code> both record nine.</p>
+    <p><strong>And how the green number above was arrived at.</strong> Rate limiting shipped after the revision this page was first read from, and its tests went in with it — <code>tests/infrastructure/rate_limiting/</code> and <code>tests/presentation/api/test_rate_limits.py</code>, about fifty of them. The first whole-suite run after that came back with <b>two failures</b>, and both were faults in the new tests rather than in the limiter: one read the counter table before any unit of work had opened the database, so SQLite answered <code>no such table</code> where it meant <code>no rows</code>; one asserted on a duplicate sign-up without registering the account first, so the &ldquo;refusal&rdquo; it checked was the 201 of a first sign-up. Both were fixed, and the re-run is the number above: <b>3188 passed</b>, nothing failed, in 346 seconds. The pre-existing suite was green on both runs, which is the part that matters most — nothing in this tree turned out to be relying on being able to knock on a door without limit.</p>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  var KEY = 'budget-manager-mvp-v1';
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('input.tick[data-id]'));
+  var total = boxes.length;
+  var bar = document.getElementById('bar');
+  var track = bar.parentElement;
+  var count = document.getElementById('count');
+  var reset = document.getElementById('reset');
+  var store = {};
+
+  try { store = JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { store = {}; }
+  if (!store || typeof store !== 'object') { store = {}; }
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(store)); } catch (e) {}
+  }
+
+  function render() {
+    var done = 0;
+    boxes.forEach(function (box) {
+      // An item marked ``data-shipped`` starts ticked, so the list reads true the
+      // first time somebody opens it rather than after they have re-ticked work
+      // that is already committed. A stored value always wins - including a stored
+      // ``false``, which is how somebody unticks something they disagree with.
+      var on = Object.prototype.hasOwnProperty.call(store, box.dataset.id)
+        ? store[box.dataset.id] === true
+        : box.hasAttribute('data-shipped');
+      box.checked = on;
+      if (on) { done++; }
+      var row = box.closest ? box.closest('.item') : null;
+      if (row) { row.classList.toggle('is-done', on); }
+    });
+
+    count.textContent = done + ' of ' + total + ' done';
+    var pct = total ? Math.round((done / total) * 100) : 0;
+    bar.style.width = pct + '%';
+    track.setAttribute('aria-valuenow', String(pct));
+
+    Array.prototype.forEach.call(document.querySelectorAll('[data-group]'), function (section) {
+      var inner = section.querySelectorAll('input.tick[data-id]');
+      var d = 0;
+      Array.prototype.forEach.call(inner, function (b) { if (b.checked) { d++; } });
+      var out = section.querySelector('[data-group-count]');
+      if (out) { out.textContent = d + '/' + inner.length; }
+    });
+  }
+
+  boxes.forEach(function (box) {
+    box.addEventListener('change', function () {
+      store[box.dataset.id] = box.checked;
+      save();
+      render();
+    });
+  });
+
+  reset.addEventListener('click', function () {
+    store = {};
+    save();
+    render();
+  });
+
+  render();
+})();
+</script>

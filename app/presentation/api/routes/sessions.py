@@ -32,7 +32,9 @@ from app.application.identity.log_out import LogOut
 from app.presentation.api import schemas, translate
 from app.presentation.api.dependencies import (
     bearer_token,
+    log_in_rate_limit,
     log_in_service,
+    log_in_with_google_rate_limit,
     log_in_with_google_service,
     log_out_service,
 )
@@ -46,7 +48,9 @@ router = APIRouter(tags=["identity"])
     status_code=status.HTTP_201_CREATED,
 )
 def log_in(
-    body: schemas.LogInIn, service: LogIn = Depends(log_in_service)
+    body: schemas.LogInIn,
+    _: None = Depends(log_in_rate_limit),
+    service: LogIn = Depends(log_in_service),
 ) -> schemas.SessionOut:
     """Exchange an address or a number, and a password, for a token.
 
@@ -70,8 +74,13 @@ def log_in(
     The same answer covers the third case that arrived with numbers: a phone
     presented for an account whose identifier is an address. See ``LogIn``, which
     also records what has changed about that protection since this step - the
-    *timing* difference between the branches is spent away now, and rate limiting
-    remains owed.
+    *timing* difference between the branches is spent away now, and the rate
+    limiter above is the second half of the same protection: a caller may no
+    longer distinguish the two cases by how long they take, and may no longer
+    distinguish them by how many they can afford to try. The budget is keyed on
+    whichever identifier the body named, so naming the number and naming the
+    address do not add up to two budgets for one account - ``rate_limits.py``
+    holds the numbers.
 
     **The two identifiers are two branches, not one lookup that sniffs its
     argument**, and ``LogInIn``'s validator is what makes this branch total: the
@@ -100,6 +109,7 @@ def log_in(
 )
 def log_in_with_google(
     body: schemas.GoogleTokenIn,
+    _: None = Depends(log_in_with_google_rate_limit),
     service: LogInWithGoogle = Depends(log_in_with_google_service),
 ) -> schemas.SessionOut:
     """Exchange a Google id_token for a token of ours, for an account that exists.
@@ -144,6 +154,12 @@ def log_in_with_google(
     different sentence from the caller being unproved. See
     ``routes/users.py`` for the fuller account of both, and ``GoogleTokenIn`` for
     why the body is one opaque string.
+
+    Its limiter is a ceiling and not a budget, for the reason given on
+    ``POST /users/google``: the subject the request could be keyed on arrives
+    inside the token, and checking the token is the cost being bounded. Note this
+    is a bucket of its own rather than one shared with the sign-up, so an attack
+    on one of these doors does not close the other.
     """
     return translate.session_out(service.execute(body.id_token, datetime.now()))
 

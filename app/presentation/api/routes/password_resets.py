@@ -34,6 +34,7 @@ from app.application.identity.request_password_reset import RequestPasswordReset
 from app.presentation.api import schemas, translate
 from app.presentation.api.dependencies import (
     confirm_password_reset_service,
+    request_password_reset_rate_limit,
     request_password_reset_service,
 )
 
@@ -47,6 +48,7 @@ router = APIRouter(tags=["identity"])
 )
 def request_password_reset(
     body: schemas.PasswordResetRequestIn,
+    _: None = Depends(request_password_reset_rate_limit),
     service: RequestPasswordReset = Depends(request_password_reset_service),
 ) -> schemas.PasswordResetAcceptedOut:
     """Ask for a reset code, and be told nothing about whether the address exists.
@@ -69,6 +71,17 @@ def request_password_reset(
     is not a branch here that could vary a word. The test that matters asserts the
     two raw response texts are equal, because the moment somebody adds a friendly
     "we have emailed ..." to one arm, that assertion is what fails.
+
+    **The limiter above counts both arms, and that is the one thing about it that
+    could reintroduce the leak this endpoint was built to close.** It runs as a
+    dependency, so it is asked before ``RequestPasswordReset`` is reached and
+    therefore before the use case can return early on the unknown-address arm -
+    which is what makes 429-versus-202 a statement about how often the *caller* has
+    asked rather than about whether the address exists. Had it been a check inside
+    the handler body, after the branch, the two arms would carry different budgets
+    and the status would be an enumeration oracle built out of the very control
+    meant to protect this route. The invariant is asserted directly in
+    ``tests/presentation/api/test_rate_limits.py``.
 
     **No ``Authorization`` header is accepted, and there is no ``current_actor``
     dependency to supply one.** This is the API's fifth unauthenticated write and
@@ -108,6 +121,16 @@ def request_password_reset(
     discovered is the point: this is where somebody building rate limiting will look
     first, and the honest statement is that the response is identical and the
     latency is not.
+
+    **The rate limiter above changes the price of that attack without closing it,
+    and the distinction is worth being exact about.** Three requests an hour per
+    address is a budget an attacker can still spend - a dozen addresses is
+    thirty-six measurements an hour, which is enough to distinguish a round trip
+    from no round trip if the timing difference is large enough to see at all.
+    What the limit does is make the attack slow and leave a trace rather than
+    make it impossible, so this paragraph is *not* obsolete and the follow-up it
+    describes is still owed. Nothing about the limiter should be read as having
+    answered it.
     """
     return translate.password_reset_accepted_out(
         service.execute(body.email, datetime.now())

@@ -1834,15 +1834,32 @@ what a client acts on:
     409  it is there, and its current state refuses this
     400  a value in the request is not acceptable
     422  the request did not have the shape the endpoint declares
+    429  the same caller is asking too often, and the answer is to come back later
     500  a bug
 
-Three of those five are defaults rather than lists. `NOT_FOUND` and `CONFLICT` are
+Four of those six are defaults rather than lists. `NOT_FOUND` and `CONFLICT` are
 the exceptions worth naming, and **everything else under `MoneyError` is a 400** -
 which is the safe direction to be wrong in, because a refusal this module has
 never heard of is far likelier to be about a value than about a resource's state.
 Nothing new has to be registered for a new domain exception to be graded sensibly;
 only a genuinely state-shaped refusal has to be added to `CONFLICT`, and forgetting
 to is a milder failure than the alternative.
+
+**The 429 is a default in the same sense and a new one in another: no `MoneyError`
+can ever reach it** (decisions 230-231). The domain has no opinion about how often
+somebody knocked, so it is raised by this layer and lives on `ApiError` beside the
+401 and the 503 - and it is worth reading beside 400 rather than beside 503. A 400
+sends a client to fix its request and a 503 sends it away from the installation,
+while a 429 says the request is fine and the answer is *not yet*.
+
+**The table has grown twice since this was written and the row count above was left
+alone**, because what it was counting is the defaults and not the table. **401**
+arrived with sessions and sits *above* 404, since a question about a resource cannot
+be asked until the caller is known and a 401 says it never got that far; **503**
+arrived with payments and is the installation speaking rather than the request. Both
+are named where they belong - `test_actor.py` and the payment routes - rather than
+back-filled here, so that the five rows above stay the record of what was decided at
+the time.
 
 Keeping domain rejections at 400 and schema validation at 422 is deliberate: they
 are different layers, and a client that gets one should not have to guess which.
@@ -4482,6 +4499,244 @@ urgent rather than less**: this slice adds two unauthenticated writes that call 
 to a third party, which makes them the second and third members of the list
 `POST /password-resets` already leads.
 
+### Refusing a caller who is asking too often
+
+The last control Phase 2c owed, and the one the `### Still open` entry below was
+written for. Seven routes now refuse a caller who has asked too often, the refusal
+is a 429 in the house shape, and the counters survive a restart.
+
+**The seven are the doors where one request makes this installation spend
+something**, and that - not "the unauthenticated writes" - is what decided the list.
+`POST /phone-verifications` mints a real SMS charge per call; `POST /password-resets`
+and `POST /users/me/email-changes` each put an SMTP round trip in flight;
+`POST /users` and `POST /sessions` each pay an argon2 hash at deliberately painful
+parameters; and `POST /users/google` and `POST /sessions/google` fetch a third
+party's signing keys. The three `*/confirm` routes are deliberately left alone -
+decision 231.
+
+**214. Two layers: a hot counter in this process, and a cold one in SQLite.** The
+hot layer is a dict behind a ``threading.Lock``; the cold layer is a `rate_limits`
+table written by a background flush. The lock is load-bearing rather than
+decorative, and it is the rule `claude.md` states directly - never assume a check
+followed by an update is atomic. **Every endpoint here is a plain `def`**, so
+FastAPI runs it in its threadpool and several requests are inside the counter at
+once; the read, the comparison and the increment are one critical section because
+that is the only way the limit means what the table says. Splitting the two layers
+this way is what makes the request path affordable: a write per request would make
+the limiter the most expensive thing on the route it was added to protect.
+
+**215. The hot layer answers alone, so the database is never on the request path.**
+Every limit decision is made from the dict, which means a store that is slow, locked
+or gone stops the counts *persisting* rather than stops the limiting. That is the
+point of the arrangement rather than a side effect: what is lost when the cold layer
+is unhealthy is durability across a restart, and what is not lost is the limit. The
+same property makes the failure degrade in the safe direction - a limiter that kept
+working from memory is a limiter, and one that refused everything because it could
+not reach SQLite would be an outage wearing a security control's clothes.
+
+**216. The key is the subject the request names, plus a per-route installation
+ceiling, and there is no source dimension yet.** The subject is the address in the
+sign-up body, the address or number a login named, the mailbox a reset asks about,
+the number a text is sent to, or the account a change belongs to. **Folding is part
+of the key rather than a step before it**: `fold_email` and `fold_phone` are applied
+first, so `Ada@example.com` and `ada@example.com` are one budget and `0801 234 5678`
+and `+2348012345678` are one handset - without that, a budget is escaped by typing
+it differently. The domain's `checked_phone` is deliberately *not* used: it raises,
+and a limiter that could raise would answer a request the domain answers with a
+sentence about credentials with a 500 instead.
+
+There is **no IP address and no `X-Forwarded-For`**, and that is a decision rather
+than a phase not reached yet. Until a reverse proxy this installation controls is in
+front of it, every such header is a string the attacker chooses, so a limit keyed on
+one is a limit the attacker sets. The per-subject half is meanwhile the half a CDN
+*cannot* do - Cloudflare sees an IP and cannot read an address inside a request body
+- so the two compose rather than replace, and the source dimension arrives later as
+a third column on the same table.
+
+**217. The Google pair is ceiling-only, and that is a finding rather than an
+omission.** Its subject would be the Google `sub`, which is not known until the
+token has been verified - and verifying it is the cost being defended. There is
+nothing to key on before the money is spent, so the ceiling is the only lever that
+exists, which is why those two routes have no per-subject budget and it is written
+down rather than left as a gap somebody would later read as an oversight.
+
+**218. Fixed windows, and the burst at a boundary is 2× the policy limit.** An entry
+carries the instant its window opened, and a check at or past the window's length
+later opens a new one. The known cost is that a caller can spend a full budget at
+the end of one window and another at the start of the next, so the true worst case
+across a boundary is twice what the table says. Accepted, and named here rather than
+hidden, for two reasons: the installation ceiling is enforced on a window of its
+own, and the upgrade is a known one - a sliding window counter that keeps the
+previous window's count and weights it by how far into the current one the caller is
+- rather than a redesign. It is written down so the number in the table means a
+*rate*, not a ceiling on a burst.
+
+**219. A refused request still costs.** The count is spent by the attempt, not by
+the success. This is the rule that decides whether the limiter bounds anything at
+all: a counter that rolled back its increment on refusal would let a caller try
+forever at exactly the limit's rate, so the budget would bound how many requests
+*succeeded* and nothing about how many were made - which on `POST /users`, where
+only the first can ever succeed, is a bound of one. It is the same position
+`wallet_operation` takes when it records a refused attempt as a `FAILED` row rather
+than discarding it, and `test_rate_limits.py` asserts it as a sequence rather than
+as a status: five attempts at one address spend the budget with four of them failing
+for a *different* reason, and the sixth is the first refused for asking too often.
+
+**220. The two dimensions count different things, and the asymmetry is chosen.** A
+subject's budget is spent by that subject's own requests and by nothing else; the
+ceiling is spent only by work the installation actually admitted. So **a subject
+that has exhausted its own budget does not spend the installation's, however hard it
+keeps trying** - which means one abusive caller cannot lock the feature for everybody
+by hammering, and that is the failure a naive shared counter produces. The price is
+on the other side and is harmless: a request refused by the ceiling has already
+spent a subject credit, and the caller could not have done the work either way. The
+ordering in `rate_limits.enforce` is what produces both halves, and the observable
+is one row apart in the store - six for the address that kept trying, five for the
+installation - which is what the test asserts.
+
+**221. The cold layer is written in deltas, never totals.** Each entry tracks how
+much of its count the store has already been told about, and a flush writes the
+difference. **This is the part that decides whether the limiter survives a second
+worker.** Two processes each writing their totals would overwrite each other and the
+stored number would be one worker's rather than both; summing totals would re-add
+everything on every flush. With deltas, summing across workers *and* across restarts
+gives the true count. What is *not* claimed is that several workers enforce one
+budget - each holds its own hot counter, so the effective installation limit is up to
+N times the policy limit and a refusal by one worker is not seen by another. A
+deployment needing the exact number has to route a subject to one worker or move the
+hot layer to something shared, which is what Phase 5 names Redis for.
+
+**222. Over-counting is the safe direction and under-counting is not, and the flush
+is ordered so that failures land on the safe side.** The deltas are marked as
+written only *after* the commit returns, so a write that fails leaves them unmarked
+and the next flush offers them again - the count is late rather than lost. The one
+window where accuracy can suffer is a crash between a successful commit and the mark,
+and it costs accuracy by counting those increments twice. That is the direction
+nothing here is allowed to fail in: a stored count that is too high refuses somebody
+who has done less than the policy says, which one window of waiting repairs, while a
+count that is too low is a limit that is not the limit.
+
+**223. The sweep and the writes share one transaction, and that is not tidiness.**
+A sweep that committed separately could delete a row between this process reading it
+and writing to it, and the write would then resurrect a count from a window that had
+just been swept - with the original increment gone, so the number would be this
+process's *delta* presented as a total. One unit of work makes the pair atomic. The
+sweep itself is not housekeeping: one row per subject ever seen is unbounded, and a
+limiter keyed on caller-supplied identifiers is therefore a table an attacker can
+grow, which makes it a disk that fills rather than a limit that holds. Retention is
+computed from the policy table rather than chosen - `rate_limits.longest_window` -
+because a row swept while its window was still live would hand its subject a fresh
+budget in the middle of their window, which is precisely what the cold layer exists
+to prevent.
+
+**224. The flush is a background thread on a lifespan, with a warm start at boot and
+a final flush at shutdown.** This is the first lifespan and the first thread in
+`app/`, which is why it is called out rather than folded in quietly. `RATE_LIMIT_FLUSH_SECONDS`
+defaults to **thirty** and `0` builds no flusher at all - and the default is
+positive rather than opt-in because one of production's two call sites is
+`uvicorn ...:create_app --factory`, which cannot pass a keyword, so an opt-in default
+would silently disable durability for the documented invocation. The HTTP test suite
+is the side that opts out, in `tests/conftest.py`, because a thread per test
+application would be hundreds of them and each performs a real write at shutdown.
+`stop` flushes once more **on the calling thread**, so a process that has returned
+from it knows the counts are stored rather than knowing a thread was asked nicely.
+
+**225. A warm start that fails does not stop the application.** `warm` reads the
+store once at boot and adopts what the last process flushed, so a restart is not a
+way to get a fresh budget. The read happens inside a unit of work like every other
+database access here, even though it only reads. If it raises, the application
+starts anyway and records the failure on `app.state.rate_limit_warm_error`: a
+database that cannot be read already serves `/health`, and refusing to boot over a
+counter table would take the money down to protect the rate limiter. What the
+failure costs is durability across *this* restart, which is the smaller of the two
+evils available. There is no logging in `app/` yet - the MVP list carries that as
+its own item - so the attribute is the only observable, and the flusher keeps
+`last_error` and `last_report` for the same reason.
+
+**226. The limiter is a dependency and not middleware, and the reason is the
+subject.** The subject is a field in a request body, which middleware would have to
+consume and re-inject; re-reading a body after it has been parsed is a known trap,
+and `dependencies.py` is already the one place a request's identity is read. The
+limiter declares the endpoint's own pydantic model as its own parameter, and FastAPI
+shares one parse of the body between the two.
+
+**227. A body that fails validation spends no credit, and that falls out of where
+the limiter sits rather than out of anything it does.** FastAPI validates a
+dependency's declared body while *solving* the dependency and skips the call
+entirely when that solve produced errors, so a request with no `password` field
+never reaches the limiter. The opposite arrangement is easy to write and hard to
+notice: a limiter that read the raw body would charge for a request the route never
+ran, and a client with a bug in its serializer would walk itself into a 429 while
+making no valid request at all. Pinned in `test_rate_limits.py`, because it is a
+property of a framework mechanism rather than of any line in this repository.
+
+**228. On the one limited route behind a session, the session is resolved first.**
+`POST /users/me/email-changes` takes the limiter as a dependency that itself depends
+on `current_actor`, so a bad token is a **401** and never a 429. Two things are ruled
+out and they are different in kind: a 429 to a caller who has not proved who they
+are would answer a question they have no standing to ask, and - because the subject
+this route counts is the *account* - it would show a stranger a status about
+somebody else's budget. Worse, a budget spent by unauthenticated requests would let
+anybody exhaust a named account's allowance without ever holding its token, which
+turns the limiter into the denial of service it exists to prevent. The test drives
+the route past its budget with a nonsense bearer token and asserts every answer is a
+401, because the ordering is the claim.
+
+**229. On `POST /password-resets` the unknown-address arm is counted too, and this
+is the invariant that makes the limiter safe to put on that route at all.** Decision
+184 answers identically for a known and an unknown address so the bytes are not an
+enumeration oracle; a limiter that counted only the arm which found an account would
+make 429-versus-202 a statement about whether the address exists - asked three times
+and then answered - and the leak would have been *introduced* by the control meant to
+protect the route. That it cannot happen is a property of the placement: the limiter
+is asked as a dependency, so it runs before `RequestPasswordReset` is reached and
+therefore before the use case can return early on the miss. Had it been a check
+inside the handler body, after the branch, the two arms would carry different budgets
+and the status would be the oracle. `test_rate_limits.py` asserts it directly, by
+driving both arms past the budget and requiring the two sequences to be *equal*
+rather than each to be correct - which is why that test runs on an installation with
+mail configured: on one without, both arms raise before the address is read and the
+distinction could not be observed at all.
+
+**230. 429 is a new grade, carries `Retry-After`, and says nothing about which limit
+was hit.** The header is the caller's own remaining window rather than a constant,
+rounded **up** so that a client which obeys it is not refused a second time for
+having obeyed; `Retry-After: 0` would invite an immediate retry, which is the
+opposite of what the response is for. The body is the house shape with a deliberately
+uninformative detail, and that vagueness is load-bearing: a body naming the policy
+would describe the shape of the defences to whoever is probing them, and on
+`POST /password-resets` it would hand back the known-versus-unknown distinction
+decision 229 exists to keep. `ApiError` gained an optional `headers` mapping so this
+one class could carry the header without the handler learning its name; the header's
+*absence* from every other refusal is asserted too, since that is the risk the seam
+introduces.
+
+**231. The three `*/confirm` routes are deliberately unlimited.** The mailed and
+texted codes are 256-bit CSPRNG values rather than six digits - decisions 167 and
+the phone flow's own - so there is nothing to guess and nothing to slow down; what a
+limiter there would bound is one indexed lookup. This is a decision rather than an
+omission, and `test_boundary.py` asserts that they carry no limiter, so overturning
+it means failing a test that says why it existed. **If a code ever becomes short
+enough for a person to read aloud, this is the first decision that has to be
+revisited** - and the failure would be silent, because the route would go on
+answering correctly.
+
+**232. This is not the velocity control over money movement, and that one is still
+owed.** `transaction_repository.py` already records a second, different control: a
+bound on how often money may *move*, which counts ledger rows rather than requests
+and needs a read of its own. Nothing here closes it, and the `### Still open` entry
+below says so rather than implying the item is finished. A limiter counts requests;
+a velocity control counts value, and the two would disagree about a caller making one
+enormous payout.
+
+**What is recorded rather than closed: the reset flow still leaks account existence
+by latency.** Decision 189 stands and the limiter does not answer it. Three requests
+an hour per address is a budget an attacker can still spend - a dozen addresses is
+thirty-six measurements an hour, enough to distinguish a round trip from no round
+trip if the difference is visible at all. What the limit does is make the attack
+slow and leave a trace rather than make it impossible, so the follow-up is owed and
+nothing about this slice should be read as having paid it.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**
@@ -4639,53 +4894,51 @@ to a third party, which makes them the second and third members of the list
   kept the one that looks like a real one. The single seam the entry predicted -
   "`ResolveUserByEmail` is the single thing both doors call, so that commit has one
   place to change and not two" - is exactly how it went. See decisions 80 and 89.
-- **Rate limiting on `POST /users` and `POST /sessions`** (decision 86). They were
-  the only unauthenticated writes in the API when this entry was written; there are
-  five now, and the pair here is still the pair that matters most - they are the way
-  in, and they are the two endpoints where an unauthenticated caller can make this
-  server do its most expensive work, an argon2 hash on one side and an argon2 verify
-  on the other. Two things ride on this: the argon2 work itself, and
-  **the timing gap decision 81 documents**, where an unknown address returns without
-  hashing anything and so answers measurably faster than a wrong password. The fix
-  for the second is four lines - verify against a dummy hash when no credential is
-  found - and it belongs here rather than on its own, because rate limiting
-  addresses the same threat directly *and* covers the sign-up path, which the dummy
-  hash cannot.
+- ~~**Rate limiting on `POST /users` and `POST /sessions`** (decision 86).~~ **Shipped,
+  across seven routes rather than the two this entry named** - see decisions 214-232.
+  The entry is kept rather than deleted because three of its claims needed updating
+  and one of them was already stale when the work was done, which is the kind of
+  thing that should be visible rather than quietly erased.
 
-  **A third endpoint joins this list, and it is the one that mails a credential.**
-  `POST /users/me/email-changes` is authenticated - it needs a session *and* the
-  current password - so it is not the same threat as an open door. But it is a
-  second place an unauthenticated-by-design credential is *posted*: it is the
-  endpoint whose reply is a 256-bit token at somebody's address, and each call
-  costs an SMTP round trip. That is the reason decision 167 chose a 256-bit token
-  over a six-digit code, and the reason this entry has moved up the list rather
-  than down: the brute-force defence is still "the token is too long to guess",
-  and a rate limiter is what would let it be something friendlier.
+  **The timing gap decision 81 documents is closed, and was closed before the
+  limiter existed.** The fix is the four lines this entry predicted - verify against
+  a dummy hash when no credential is found - and it is in `LogIn` now, so an unknown
+  address and a wrong password pay one argon2 verify each. The limiter is the second
+  half of the same protection rather than the first: a caller may no longer
+  distinguish the two cases by how long they take, and may no longer distinguish them
+  by how many they can afford to try.
 
-  **A fourth endpoint, and it is the strongest case on this list.**
-  `POST /password-resets` is the one route in this API that a stranger can point at
-  somebody else's account and make this server work for them. It takes an address and
-  nothing else - no session, no password, nothing to prove - it writes a row against
-  whatever account that address names, and it puts an SMTP round trip in flight. The
-  change request above is the same shape of cost and is *authenticated* twice over;
-  this one is the actorless version of it, and the only thing between a stranger and
-  a person's inbox is how many requests they can afford to make.
+  **`POST /users` and `POST /sessions` were never the whole list, and were not the
+  worst of it.** They were the only unauthenticated writes when this was written;
+  there are nine now, and what decided which of them got a limit was not
+  authentication but *cost* - so the two doors that mail or text a credential and the
+  one that hands a real charge to an SMS provider are on the list beside them, and at
+  tighter budgets than either. The list itself is in `rate_limits.py`, with the
+  argument for each number.
 
-  **And it leaks account existence by latency, which no status code can fix.**
-  Decision 184 answers identically for a known and an unknown address, so the *bytes*
-  are not an oracle. The clock still is: one arm does an SMTP round trip and the
-  other returns as soon as a `SELECT` misses, and that difference is not subtle - it
-  is milliseconds against microseconds, and measurable from outside without any
-  privileged position. Nothing available closes it. The mail cannot be queued behind
-  an outbox, because a code that expires in fifteen minutes cannot tolerate a queue
-  whose premise is that late is acceptable; a mail cannot be composed for an address
-  that names no account, because there is nothing to send to; and sending one anyway
-  to a fabricated address would be this system mailing strangers on a stranger's
-  word. A rate limiter does not make the two arms equal either - what it does is make
-  the number of probes small enough that the difference stops being a list, which is
-  the honest description of why this entry is the answer to that one. Named here
-  rather than only in the decision, because it is the argument for doing this work
-  next rather than after the next feature.
+  **And it leaks account existence by latency, which no status code can fix - and
+  which the limiter does not fix either.** Decision 184 answers identically for a
+  known and an unknown address, so the *bytes* are not an oracle. The clock still is:
+  one arm does an SMTP round trip and the other returns as soon as a `SELECT` misses,
+  and that difference is not subtle - it is milliseconds against microseconds, and
+  measurable from outside without any privileged position. Nothing available closes
+  it. The mail cannot be queued behind an outbox, because a code that expires in
+  fifteen minutes cannot tolerate a queue whose premise is that late is acceptable; a
+  mail cannot be composed for an address that names no account, because there is
+  nothing to send to; and sending one anyway to a fabricated address would be this
+  system mailing strangers on a stranger's word. **This half is still owed**, and the
+  limiter's contribution to it is smaller than the paragraph it sits in makes it
+  sound: three requests an hour per address is a budget an attacker can still spend -
+  a dozen addresses is thirty-six measurements an hour, enough to separate a round
+  trip from no round trip if the difference is visible at all. What the limit does is
+  make the attack slow and leave a trace. Nothing about decisions 214-232 should be
+  read as having paid this.
+
+  **The other thing this entry was never about is still owed too.** A rate limiter
+  counts *requests*; the control `transaction_repository.py` records is a bound on how
+  often money may *move*, which counts ledger rows and needs a read of its own. The
+  two disagree about a caller making one enormous payout, and the second one is not
+  built. Decision 232 says so where a reader looking for it would land.
 - **Purging settled `email_changes` rows, as with sessions.** Every confirmed
   change leaves a row behind on purpose - decision 168, because deleting it would
   collapse "already used" into "never existed" - and nothing ever removes one. The
@@ -5167,13 +5420,25 @@ is left with no exit (decision 106). Both were closed in 3a.
   groundwork did not anticipate is that the *proof* would arrive in a request body
   rather than through a redirect - which is a property of Phase 4 not existing yet
   rather than of this design.
-- Rate limiting on the auth endpoints first - login and signup are the ones worth
+- ~~Rate limiting on the auth endpoints first - login and signup are the ones worth
   brute-forcing - then on the API generally. It also carries the timing fix
-  decision 81 documents. **And it is now the next thing owed rather than the next
-  thing wanted**: `POST /password-resets` joined this list as the strongest case on
-  it, because it is the only route a stranger can point at somebody else's account
-  to make this server work for them, and it leaks account existence by latency in a
-  way no response shape can fix (decisions 184 and 189).
+  decision 81 documents.~~ It shipped as decisions 214-232, and both halves of the
+  sentence needed correcting. **The scope was wrong in the narrowing direction**: what
+  decided which routes got a limit was not authentication but *cost*, so the seven
+  routes are the two here plus the three that mail or text a credential and the two
+  that hand a real charge to an SMS provider or to Google. Anything unauthenticated
+  that costs a lookup rather than a round trip is still unlimited, deliberately.
+  **And the timing fix was already in before the work started** - `LogIn` has verified
+  against `DUMMY_HASH` when no credential is found for some time, so decision 81 was
+  closed by the login slice rather than by this one, and this file said otherwise
+  until this line was rewritten.
+
+  What the bullet got right is that `POST /password-resets` was the strongest case on
+  the list. What it did not anticipate is that the strongest case is not one a limiter
+  can answer: decision 189's latency oracle survives decisions 214-232 intact, and the
+  new section says so where a reader looking for the fix would land. The **velocity**
+  control over money movement that `transaction_repository.py` owes is the other half
+  and is untouched by this - it counts ledger rows, not requests, and it is still owed.
 - ~~Password reset and email verification.~~ The reset shipped as decisions 183-191.
   Email verification is a different question and is still open: it is about proving
   an address an account *already* holds, which no flow does today. See
@@ -5188,7 +5453,7 @@ rather than a new surface, and it was worth doing while that surface was still t
 thing being thought about. See decisions 113-123.
 
 **The password reset was built first of what remains here**, and it is the one item on
-this list that was waiting on nothing. Rate limiting and OIDC are each a decision
+this list that was waiting on nothing. Rate limiting and OIDC were each a decision
 about a technology, session listing is an endpoint over a store that already supports
 it, and TLS is a reverse proxy; the reset needed only the mailed-token machinery the
 address change had already built and proved in a live run, so the whole of its design
@@ -5198,6 +5463,18 @@ the strongest evidence this file has that the address-change slice was built at 
 right level of generality - and the reason it went first rather than after the
 limiter is that it is the flow whose open defect makes the limiter urgent. See "The
 password somebody has forgotten, and the way back in" (decisions 183-191).
+
+**Three of those four have since closed, and the order they closed in is the point of
+the paragraph above.** The reset went first because it was blocked on nothing; the
+limiter (decisions 214-232) went next because the reset had made it urgent; OIDC
+(decisions 204-213) went last of the three despite being listed before both, because it
+was the one that needed a decision rather than an implementation. What that order bought
+is worth recording: the limiter was built against a surface that already existed and
+already had tests, so the only new thing in it was the limiter, and the OIDC pair could
+then be given limiters on the day it shipped rather than being retrofitted. A list
+ordered by dependency rather than by importance looked wrong at every step and has
+needed nothing redone. What remains here is session listing and TLS, and neither is
+waiting on anything but the phase it sits in.
 
 ### Phase 3 - Paystack
 

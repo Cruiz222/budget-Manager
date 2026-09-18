@@ -14,15 +14,26 @@ as they come up:
     409  the resource is there, and its current state refuses this
     400  something in the request is not acceptable
     422  the request did not have the shape the endpoint declares (FastAPI's own)
+    429  the same caller is asking too often, and the answer is to come back later
     503  this installation cannot serve this request, whoever asks
     500  a bug
 
-Four of those seven are defaults rather than lists. ``UNAUTHORIZED``,
-``NOT_FOUND``, ``CONFLICT`` and ``UNAVAILABLE`` are the four exceptions worth
-naming, and everything else that is a ``MoneyError`` is a 400 - which is the safe
-direction to be wrong in. A refusal this module has never heard of is far more
+Five of those eight are defaults rather than lists. ``UNAUTHORIZED``,
+``NOT_FOUND``, ``CONFLICT`` and ``UNAVAILABLE`` are the four *domain* exceptions
+worth naming, and everything else that is a ``MoneyError`` is a 400 - which is the
+safe direction to be wrong in. A refusal this module has never heard of is far more
 likely to be about a value the caller sent than about a resource's state, and a
 400 tells the caller to look at their request rather than to retry.
+
+**429 is the fifth default and the first that no ``MoneyError`` can ever reach**,
+which is why it arrives as a class this layer made rather than as a grade in
+``_grade``. The domain has no opinion about how often a request arrives - the same
+line ``PaymentsUnconfiguredError`` sits on - so there is nothing for ``_grade`` to
+match and no tuple to add it to. It is a different kind of answer from the seven
+above it: those are all statements about *this request*, and this one is a statement
+about the requests before it. A client that receives it should wait rather than
+change anything, which is what ``Retry-After`` says and what no other grade here
+means.
 
 **``UNAVAILABLE`` was added late and is the only list that is not about the
 caller at all**, which is worth marking because it changes what this module is
@@ -338,9 +349,16 @@ class ApiError(Exception):
 
     status_code = 500
 
-    def __init__(self, detail: str = ""):
+    def __init__(self, detail: str = "", headers: dict[str, str] | None = None):
         super().__init__(detail)
         self.detail = detail
+        #: Response headers this refusal needs to carry. Empty for every subclass but
+        #: one, which is why it has a default rather than being threaded through each
+        #: ``__init__``: ``RateLimitedError`` needs ``Retry-After``, and nothing else
+        #: in this tree has ever needed a header at all. It is on the base class
+        #: rather than special-cased in the handler so that a future refusal which
+        #: needs one does not have to reach into this module to get it.
+        self.headers = dict(headers) if headers else {}
 
 
 class MissingCredentialsError(ApiError):
@@ -434,6 +452,47 @@ class PaymentsUnconfiguredError(ApiError):
     """
 
     status_code = 503
+
+
+class RateLimitedError(ApiError):
+    """This caller has asked this question too often, and should come back later.
+
+    A 429, and the first grade in this API whose remedy is *wait* rather than *change
+    something*. Every other refusal here can be fixed by the caller - present a token,
+    fix the address, choose another name - and this one cannot: the request is well
+    formed, the caller may be perfectly entitled to make it, and the only thing wrong
+    with it is how recently they made the last one. That is why this response carries
+    ``Retry-After``, and it is the only response in this API that does.
+
+    **What it deliberately does not say is which limit was hit, or how much of it is
+    left.** A body naming the policy would describe the shape of the defences to
+    whoever is probing them, and on ``POST /password-resets`` it would be an oracle in
+    its own right: that route answers identically whether or not the address exists,
+    and a body distinguishing "too many requests about this address" from "too many
+    requests from you" would hand back the distinction the endpoint was built to
+    withhold. So the detail is a sentence about waiting, and the numbers stay in the
+    server's records.
+
+    **It is not a 503, and the two are easy to confuse.** A 503 says this installation
+    cannot serve the request *whoever asks*; a 429 says it can, and will, and not yet
+    from this caller. That difference decides what a well-behaved client does with it,
+    and getting it backwards is not a cosmetic error: a client that treated a 429 as a
+    503 would take the whole installation offline on the strength of one abusive
+    caller, which is the failure the two grades exist to keep apart.
+
+    ``retry_after`` is seconds and is the caller's own remaining window rather than a
+    constant - see ``Verdict.retry_after_seconds``, which rounds up so that a client
+    which obeys the header is not refused a second time for having obeyed it.
+    """
+
+    status_code = 429
+
+    def __init__(self, retry_after: int, detail: str = ""):
+        super().__init__(
+            detail or "too many requests; try again shortly",
+            headers={"Retry-After": str(retry_after)},
+        )
+        self.retry_after = retry_after
 
 
 #: The installation cannot serve this request, whatever the caller does. These are
@@ -585,9 +644,17 @@ async def money_error_handler(request: Request, exc: MoneyError) -> JSONResponse
 
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+    """Render a refusal this layer made.
+
+    ``headers`` is forwarded rather than hard-coded, which is what lets
+    ``RateLimitedError`` carry its ``Retry-After`` without this handler knowing that
+    class exists. Every other ``ApiError`` has an empty mapping and takes the same
+    path it always did, so this is a seam rather than a special case.
+    """
     return JSONResponse(
         status_code=exc.status_code,
         content=_body(type(exc).__name__, _detail(exc)),
+        headers=exc.headers or None,
     )
 
 

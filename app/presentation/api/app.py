@@ -8,10 +8,17 @@ is always the one that is wrong.
 
 What ``create_app`` puts on ``app.state`` is the whole of the configuration: a
 unit of work factory, the mail settings, the payment settings and the provider
-built from them, and the SMS settings. All are resolved once, when the app is
-built, and never per request - which is what makes a running server act on one
-configuration rather than on whatever the environment happened to be when a
-request arrived.
+built from them, the SMS settings, the Google settings and verifier, and the rate
+limiter. All are resolved once, when the app is built, and never per request -
+which is what makes a running server act on one configuration rather than on
+whatever the environment happened to be when a request arrived.
+
+**The rate limiter is the one of those that is not inert**, and the difference is
+worth stating up front because it is the reason this module now has a lifespan and
+a thread where it had neither. Everything else on ``app.state`` is a value that is
+read; the limiter is an object that owns a background flusher, and something has
+to start it and something has to stop it. That is what ``lifespan`` below is, and
+it is the only lifecycle this application has.
 
 **Nothing here is async, and nothing is decorated to look it.** Every service
 below is synchronous and SQLite is synchronous, so FastAPI runs the ``def``
@@ -22,11 +29,18 @@ distinction is easy to get backwards, and getting it backwards is invisible unti
 there is load.
 """
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from app.composition_root import google_verifier_for, provider_for
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
+)
+from app.infrastructure.rate_limiting import (
+    BackgroundFlusher,
+    InMemoryRateCounter,
+    TwoLayerRateLimiter,
 )
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
 from app.infrastructure.settings import database_path as configured_database_path
@@ -34,9 +48,11 @@ from app.infrastructure.settings import (
     from_environment,
     google_from_environment,
     paystack_from_environment,
+    rate_limit_flush_seconds as configured_flush_interval,
     termii_from_environment,
 )
 from app.presentation.api import errors
+from app.presentation.api.rate_limits import longest_window
 from app.presentation.api.routes import (
     confirmations,
     email_changes,
@@ -63,6 +79,7 @@ def create_app(
     termii_settings=None,
     google_settings=None,
     google_verifier=None,
+    rate_limit_flush_seconds=None,
 ) -> FastAPI:
     """Build the application.
 
@@ -162,6 +179,23 @@ def create_app(
     resolved together rather than independently - settings without a verifier is an
     installation that *could* verify, a verifier without settings is a test. The
     same pair-wise reasoning ``paystack_settings``/``payment_provider`` gets above.
+
+    ``rate_limit_flush_seconds`` - how often the rate limiter writes its counters
+    down, and ``0`` for no flusher at all. ``None`` resolves through
+    ``app.infrastructure.settings``, which defaults to thirty seconds, so **an
+    application built with no arguments - which is how both production call sites
+    build one - persists its counters.** That default is deliberate and the
+    alternative was rejected: making the flusher opt-in would mean the documented
+    ``uvicorn app.presentation.api.app:create_app --factory`` invocation, which
+    cannot pass a keyword, silently ran the one configuration that loses a budget
+    on restart.
+
+    So the test suite is the side that opts *out*, in ``tests/conftest.py``, where
+    it sets the variable to zero for every test. A thread per test application
+    would be hundreds of threads, and each would perform a real write at shutdown -
+    a cost paid to demonstrate something the cold layer's own tests demonstrate
+    directly by calling ``flush``. This parameter is the way back in for the test
+    that wants the real lifecycle.
     """
     application = FastAPI(
         title="Budget Manager",
@@ -186,7 +220,96 @@ def create_app(
             database_path or configured_database_path()
         )
 
+    flush_seconds = (
+        configured_flush_interval()
+        if rate_limit_flush_seconds is None
+        else rate_limit_flush_seconds
+    )
+    rate_limiter = TwoLayerRateLimiter(
+        InMemoryRateCounter(),
+        unit_of_work_factory,
+        # The longest window any policy uses, read off the policy table rather
+        # than chosen - see ``rate_limits.longest_window``. A shorter retention
+        # would sweep a row whose window was still live, which would hand a
+        # caller a fresh budget in the middle of their window.
+        retention=longest_window(),
+    )
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        """Warm the limiter, run its flusher, and stop it cleanly.
+
+        **This is the first lifespan in this application and the first thread in
+        ``app/``**, so it is worth being explicit about what it does and does not
+        guarantee. It does three things in order: adopt the counts the last
+        process flushed, start a daemon thread that flushes every
+        ``flush_seconds``, and - on the way out - stop that thread and flush once
+        more so a clean shutdown loses nothing. ``BackgroundFlusher`` carries the
+        honest limits of the arrangement, including what a crash costs.
+
+        **Failing to warm does not stop the application.** A database that cannot
+        be read is a database whose wallets cannot be read either, and this
+        application's answer to that state is to serve and report it - ``/health``
+        is a route precisely because an installation with an unreachable store is
+        a supported state rather than a dead one. Refusing to boot over a counter
+        table would take the money down to protect the rate limiter, which is the
+        wrong way round. The failure is kept on
+        ``application.state.rate_limit_warm_error`` instead, because the honest
+        cost of carrying on is that a restart may hand back part of a budget - a
+        thing an operator should be able to find out, and the attribute is the
+        only place it is recorded. Like ``BackgroundFlusher.last_error``, this is
+        what the missing logging would otherwise report.
+
+        ``warm`` reads the database synchronously on the event loop. That is a
+        deliberate exception to the rule the module docstring gives about blocking
+        work, and it is safe for the one reason that makes any blocking call safe
+        in an async context: it happens once, before the server accepts anything,
+        so there is no other request for it to block. Moving it to the threadpool
+        would add machinery to make a single ``SELECT`` concurrent with nothing.
+        """
+        try:
+            # Read before the thread starts, so the ordering is unambiguous: the
+            # flusher cannot write this process's empty view of the world on top
+            # of what the last one stored.
+            rate_limiter.warm()
+            application.state.rate_limit_warm_error = None
+        except Exception as exc:  # see the docstring: boot must not depend on it
+            application.state.rate_limit_warm_error = exc
+
+        flusher = None
+        if flush_seconds > 0:
+            flusher = BackgroundFlusher(rate_limiter, flush_seconds)
+            flusher.start()
+        try:
+            yield
+        finally:
+            if flusher is not None:
+                flusher.stop()
+
+    application = FastAPI(
+        title="Budget Manager",
+        lifespan=lifespan,
+        description=(
+            "A personal savings wallet with named locked pots and scheduled "
+            "plans.\n\n"
+            "**Who is asking is carried in an `Authorization: Bearer <token>` "
+            "header**, and the token comes from `POST /sessions`. Register with "
+            "`POST /users`, exchange those credentials for a token, and send it "
+            "with every other request; `DELETE /sessions/current` ends it. "
+            "`GET /users/me` and `GET /health` are the two endpoints that answer "
+            "without any of that - the first only to tell you your token is no "
+            "longer good.\n\n"
+            "There is no way to act as somebody else. A wallet belonging to "
+            "another account is not refused, it is *not there* - the same 404 a "
+            "wallet that never existed gets, with the same body."
+        ),
+    )
+
     application.state.unit_of_work_factory = unit_of_work_factory
+    application.state.rate_limiter = rate_limiter
+    # Always set, so that "was the warm start clean?" is a question with an
+    # answer rather than one with a missing attribute. ``None`` means it was.
+    application.state.rate_limit_warm_error = None
     application.state.settings = (
         from_environment() if settings is None else settings
     )

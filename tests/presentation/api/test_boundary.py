@@ -38,6 +38,16 @@ wish.
 
 import pytest
 
+from app.presentation.api.dependencies import (
+    log_in_rate_limit,
+    log_in_with_google_rate_limit,
+    request_email_change_rate_limit,
+    request_password_reset_rate_limit,
+    request_phone_verification_rate_limit,
+    sign_up_rate_limit,
+    sign_up_with_google_rate_limit,
+)
+
 #: Every operation this phase exposes, as ``(method, path)``. Path parameters are
 #: spelled the way FastAPI spells them in ``openapi.json``.
 #:
@@ -432,6 +442,129 @@ class TestTheRouteTableIsExactlyThis:
 
         assert not added, f"exposed but not listed: {sorted(added)}"
         assert not removed, f"listed but not exposed: {sorted(removed)}"
+
+
+#: Which door each limiter stands in front of, as ``(method, path)`` mapped to the
+#: dependency function itself. A literal rather than something derived, for the reason
+#: ``EXPECTED_OPERATIONS`` is one: a set computed from the application would agree with
+#: the application whatever the application did.
+#:
+#: **The three ``*/confirm`` routes are deliberately absent**, and their absence is a
+#: claim rather than an omission. Each is answered by a 256-bit CSPRNG token, so there
+#: is nothing to guess and nothing to slow down; what a limiter there would bound is one
+#: indexed lookup. They are the entries this table would gain if that stopped being
+#: true, and listing them as unlimited is how the next reader finds out that it was
+#: decided rather than forgotten.
+RATE_LIMITED_OPERATIONS = {
+    ("post", "/users"): sign_up_rate_limit,
+    ("post", "/sessions"): log_in_rate_limit,
+    ("post", "/password-resets"): request_password_reset_rate_limit,
+    ("post", "/phone-verifications"): request_phone_verification_rate_limit,
+    ("post", "/users/me/email-changes"): request_email_change_rate_limit,
+    ("post", "/users/google"): sign_up_with_google_rate_limit,
+    ("post", "/sessions/google"): log_in_with_google_rate_limit,
+}
+
+#: The dependencies above, as a set, so a route's declared dependencies can be
+#: intersected with them without caring which limit is which.
+_LIMITERS = set(RATE_LIMITED_OPERATIONS.values())
+
+
+def _declared_limiters(app) -> dict[tuple[str, str], set]:
+    """Every routed operation that declares one of the limiters, and which.
+
+    **Walked from ``app.routes`` rather than from ``openapi.json``**, which is the
+    opposite of what the route table above does, and the difference is what each is
+    asking. ``openapi.json`` is the right document for "what does this API declare",
+    because a route missing from the schema is still a route. It is the wrong
+    document here, because a dependency is not part of the schema at all - the
+    limiters would be invisible in it and this test would pass having checked
+    nothing. The method is lowercased to match the table above, since the two are
+    read side by side and a reader should not have to check which casing this
+    particular comparison happens to want.
+    """
+    found: dict[tuple[str, str], set] = {}
+    for route in app.routes:
+        dependant = getattr(route, "dependant", None)
+        if dependant is None:
+            # Not an ``APIRoute`` - ``/docs`` and friends are plain starlette routes
+            # with no dependency tree, and they are not part of this claim.
+            continue
+        declared = {sub.call for sub in dependant.dependencies} & _LIMITERS
+        if declared:
+            for method in route.methods:
+                found[(method.lower(), route.path)] = declared
+    return found
+
+
+class TestTheLimitedOperationsAreExactlyThis:
+    """The same kind of claim as the route table above, made about a different set.
+
+    ``TestTheRouteTableIsExactlyThis`` pins *what is routable*; this pins *what is
+    rate limited*, and the two are worth keeping apart because they fail for
+    different reasons. A route that appears unlisted is a boundary decision nobody
+    made; a route that appears unlimited is a door nobody put a limit on, and the
+    commit that produces one will look like an ordinary feature.
+
+    **The limiter is asserted as a declared dependency rather than by driving traffic
+    at the route**, which is the difference between this and
+    ``test_rate_limits.py``. That file asks what the limits *do*; this asks whether
+    they are *there*, for every door, including the ones a test would find expensive
+    to reach - and it answers that question without a database, a clock or a request.
+    The two are not redundant: a route could carry a limiter that never refuses (only
+    the behavioural file would notice) and a limiter could be wired to the wrong
+    function (only this one would).
+
+    It is a property of a set, so it is asserted in both directions at once. A route
+    that lost its limiter fails, a route that gained one without being listed here
+    fails, and the report names the routes rather than printing two sets.
+    """
+
+    def test_every_listed_operation_declares_its_limiter(self, app):
+        declared = _declared_limiters(app)
+
+        missing = {
+            operation: limiter.__name__
+            for operation, limiter in RATE_LIMITED_OPERATIONS.items()
+            if limiter not in declared.get(operation, set())
+        }
+
+        assert not missing, f"listed as limited but not limited: {missing}"
+
+    def test_no_operation_is_limited_without_being_listed(self, app):
+        """The other direction, and the one that catches a new route.
+
+        A limiter added to a route that no limit was designed for is a refusal nobody
+        chose the number for - and the number is the part that takes an argument. This
+        fails until the route is listed above, which is where the argument goes.
+        """
+        unlisted = sorted(
+            set(_declared_limiters(app)) - set(RATE_LIMITED_OPERATIONS)
+        )
+
+        assert not unlisted, (
+            f"rate limited but not listed: {unlisted} - add it to "
+            "RATE_LIMITED_OPERATIONS with the reason for its numbers"
+        )
+
+    def test_the_confirm_routes_are_deliberately_unguarded(self, app):
+        """The three routes left out, asserted rather than left to be noticed.
+
+        Stated as its own test because the omission is a decision someone should have
+        to overturn on purpose. If a limiter is ever added to one of these, this fails
+        and the failure is the prompt to write down why - either the token stopped
+        being unguessable, which is a much larger problem than a missing limit, or the
+        limit is defending something other than brute force and the table should say
+        what.
+        """
+        guarded = set(_declared_limiters(app))
+
+        for path in (
+            "/password-resets/confirm",
+            "/email-changes/confirm",
+            "/phone-verifications/confirm",
+        ):
+            assert ("POST", path) not in guarded
 
 
 class TestTheAbsentOperationsAreStillAbsent:

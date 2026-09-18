@@ -354,6 +354,12 @@ SETTINGS_VARIABLES = (
     # tests would simply stop testing what they name, asserting about an identity
     # no fixture built. There is no observable symptom to notice.
     "GOOGLE_CLIENT_ID",
+    # ``RATE_LIMIT_FLUSH_SECONDS`` is the newest entry and the only one that is not
+    # a credential, which is why it is worth a line of its own rather than being
+    # assumed from the pattern above. It is here for the reason ``BUDGET_DB`` is -
+    # a developer with it exported would otherwise change what the suite does - and
+    # it is set rather than merely cleared, immediately below.
+    "RATE_LIMIT_FLUSH_SECONDS",
 )
 
 
@@ -361,6 +367,36 @@ SETTINGS_VARIABLES = (
 def no_settings_environment(monkeypatch):
     for name in SETTINGS_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_flush_thread(no_settings_environment, monkeypatch):
+    """Run every test application with the rate limiter's flusher switched off.
+
+    **This is the suite's opt-out, and it is here rather than in the fixtures that
+    build applications because of how many of them there are.** ``create_app``
+    starts a flusher whenever the interval is positive, and the interval defaults
+    to thirty seconds so that both of production's call sites - including
+    ``uvicorn ...:create_app --factory``, which cannot pass a keyword - persist
+    their counters. The consequence is that every test application would otherwise
+    own a thread, and each of those threads performs a real write on shutdown,
+    since ``BackgroundFlusher.stop`` flushes on the calling thread rather than
+    waiting for a timer that a short test never reaches.
+
+    Hundreds of threads and hundreds of shutdown writes is a cost paid to
+    demonstrate nothing: what the cold layer does is asserted directly, by calling
+    ``flush`` and reading the table back, in
+    ``tests/infrastructure/rate_limiting/test_two_layer_limiter.py``. A test that
+    wants the real lifecycle sets the variable back with ``monkeypatch.setenv`` and
+    builds its own application, which is what ``create_app``'s
+    ``rate_limit_flush_seconds`` parameter exists for.
+
+    It depends on ``no_settings_environment`` rather than standing beside it, so
+    that the clearing and the setting cannot run in the other order and leave the
+    suite with no flusher setting at all - which would look identical to working
+    code and would quietly re-enable the threads.
+    """
+    monkeypatch.setenv("RATE_LIMIT_FLUSH_SECONDS", "0")
 
 
 class FakeChannel(NotificationChannel):

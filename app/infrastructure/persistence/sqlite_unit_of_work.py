@@ -42,6 +42,9 @@ from app.infrastructure.repositories.sqlite_phone_verification_repository import
 from app.infrastructure.repositories.sqlite_profile_repository import (
     SqliteProfileRepository,
 )
+from app.infrastructure.repositories.sqlite_rate_limit_repository import (
+    SqliteRateLimitRepository,
+)
 from app.infrastructure.repositories.sqlite_outbound_message_repository import (
     SqliteOutboundMessageRepository,
 )
@@ -680,6 +683,67 @@ CREATE TABLE IF NOT EXISTS profiles (
 -- ``None`` for it, and ``tier_for(None)`` answers UNVERIFIED. There is nothing
 -- to backfill and no moment at which the answers could disagree - the absence of
 -- a row *is* the unverified state, so no write is needed to put anybody in it.
+
+-- How often each subject may knock on each limited door, as the cold layer holds
+-- it. The hot layer is a dict inside the process; this is what survives the process.
+--
+-- **The only table in this schema with no aggregate behind it and no port in
+-- ``app/domain/repositories``.** Every other table here is the durable form of
+-- something the domain has an opinion about - a wallet, a session, a request
+-- waiting to be proven. This one is the durable form of a *transport* fact, and
+-- the domain has no opinion about it: nothing under ``app/domain`` or
+-- ``app/application`` reads or writes this table, and no use case knows it exists.
+-- It is written by ``InMemoryRateCounter`` through ``SqliteRateLimitRepository``.
+--
+-- The row is keyed on what is being counted rather than on a request. A *bucket*
+-- names the policy being applied and a *subject* names who or what it is applied
+-- to - an address, a folded number, a Google subject, or the installation itself
+-- under ``INSTALLATION``, which is not a special mechanism but simply a subject
+-- that every caller shares. See ``app/presentation/api/rate_limits.py``.
+--
+-- **The window is part of the row rather than of the key**, and that is what makes
+-- a rollover an overwrite instead of an accumulating history: the only window worth
+-- storing is the live one, because a lapsed window can limit nobody again. So a
+-- key has at most one row here, whatever it has done in the past.
+--
+-- ``count`` is a *sum of deltas* rather than any one process's total. Two workers
+-- each flushing a total would overwrite one another, and the stored number would be
+-- one worker's calls rather than both workers'; each flushing the increments since
+-- its own last flush makes the stored number the sum of every process's calls. On a
+-- single-worker deployment the two readings agree - which is exactly why this is
+-- worth writing down, since it is invisible until the second worker arrives and by
+-- then the numbers have been wrong for a while. See ``InMemoryRateCounter.pending``.
+--
+-- Nothing here is a credential and nothing here is personal data in the sense
+-- ``profiles`` is: a row says that some subject made some calls, and the subject is
+-- an identifier the caller supplied about themselves. It is still not a table to
+-- serve to anybody - it is an operator's window onto the limiters, not a feature.
+--
+-- There is no migration function for this table, for the reason recorded against
+-- ``plan_notices``, ``outbound_messages``, ``users``, ``password_credentials``,
+-- ``sessions``, ``notifications``, ``confirmations``, ``email_changes``,
+-- ``password_resets``, ``phone_verifications`` and ``profiles`` above: CREATE TABLE
+-- IF NOT EXISTS creates a missing table on a database already in the wild for free.
+-- Adding a table is not a migration; changing a table that is already on disk is.
+CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket            TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    -- When the window this count belongs to opened. Compared against the wall clock
+    -- to decide liveness; a row past the longest policy window is swept rather than
+    -- read. ISO moment, like every other stored one.
+    window_started_at TEXT NOT NULL,
+    -- Calls spent in that window, **including the refused ones**. A refusal counts
+    -- because a limiter that handed its own count back would let a caller try
+    -- forever at exactly the limit's rate - see ``InMemoryRateCounter``.
+    count             INTEGER NOT NULL,
+    -- One row per key, for the reason above: the live window is the only one stored.
+    PRIMARY KEY (bucket, subject),
+    -- Only increments are ever written, so a row of zero is a row that should not
+    -- exist. ``mark_flushed`` advances by a delta and never rewinds, so nothing in
+    -- this system can produce one; the constraint is here so that a hand-written
+    -- row or a future bug is refused by the store rather than read as "no calls".
+    CHECK (count > 0)
+);
 """
 
 
@@ -1282,6 +1346,17 @@ class SqliteUnitOfWork(UnitOfWork):
         # attribute's declaration on ``UnitOfWork``.
         self.phone_verifications = SqlitePhoneVerificationRepository(connection)
         self.profiles = SqliteProfileRepository(connection)
+        # **The one repository here that no use case reads**, and it is declared on
+        # this object anyway - which is the decision worth a sentence rather than the
+        # exception worth hiding. What this class provides is not "the repositories
+        # the domain needs" but "one connection, one transaction, and everything that
+        # writes through them", and the rate limiter's flusher needs exactly that: a
+        # write and a sweep that must land together, or neither. Giving it its own
+        # connection instead would be a second way to reach the database, which is the
+        # thing ``app/presentation/api/__init__.py`` refuses to have two of. So the
+        # attribute lives here and nothing under ``app/domain`` or ``app/application``
+        # mentions it; see ``SqliteRateLimitRepository`` for the full argument.
+        self.rate_limits = SqliteRateLimitRepository(connection)
 
     def commit(self) -> None:
         self._connection.commit()

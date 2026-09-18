@@ -76,6 +76,18 @@ because the account is what presenting a valid token creates, while
 eight are one question asked five ways: *who is asking, and what proves it?* The
 answer for the newest pair is "somebody a third party vouches for, and a signature
 this installation can check".
+
+**The module ends with a section that answers a different question**, and it is
+worth naming on the way in because it does not fit the pattern above at all. Every
+dependency so far decides *who is asking*; the rate limiters decide *how often*,
+and they are the only functions here that refuse a request without the domain
+having been consulted about it. Freight and frequency are not the domain's
+business - they are properties of this installation's exposure, in the same way
+``PaymentsUnconfiguredError`` is a property of its configuration - so they live
+here rather than in a use case, and ``rate_limits.py`` holds the numbers and the
+argument for each. Two of them depend on ``current_actor`` and five cannot; the
+section comment says why, and why they are dependencies rather than calls at the
+top of each handler.
 """
 
 from datetime import datetime
@@ -120,8 +132,10 @@ from app.composition_root import (
     build_sign_up_with_google,
     build_wallet_service,
 )
-from app.domain.identity.user import User
+from app.domain.identity.phoneNumber import fold_phone
+from app.domain.identity.user import User, fold_email
 from app.domain.payments.paymentProvider import PaymentProvider
+from app.presentation.api import rate_limits, schemas
 from app.presentation.api.errors import (
     MissingCredentialsError,
     PaymentsUnconfiguredError,
@@ -269,10 +283,11 @@ def sign_up_service(request: Request) -> SignUp:
     endpoint reachable only by those who no longer need it. That leaves it as an
     unauthenticated write, which is inherent rather than a hole. It is the first
     of the nine, the same count ``tests/presentation/api/test_boundary.py``
-    keeps - and the reason rate limiting is a real item in 2c: this is the
-    endpoint that will spend tens of milliseconds of argon2 for anybody who asks,
-    and the Google pair at the bottom of this module is the only other pair that
-    spends anything at all.
+    keeps - and the reason rate limiting mattered here: this is the endpoint that
+    will spend tens of milliseconds of argon2 for anybody who asks, and the Google
+    pair at the bottom of this module is the only other pair that spends anything
+    at all. That control now exists and is the last section of this module, which
+    is where the argument for its shape lives.
 
     The hasher comes off ``app.state``, where ``create_app`` resolved it once.
     That is the same treatment the unit of work factory and the mail settings
@@ -643,3 +658,160 @@ def settler_service(request: Request) -> SettlePayment:
         unit_of_work_factory=request.app.state.unit_of_work_factory,
         settings=request.app.state.settings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Rate limits
+# ---------------------------------------------------------------------------
+#
+# **These are dependencies rather than calls at the top of each handler, and that
+# is load-bearing rather than stylistic.** A limit checked inside a handler body
+# runs once the handler has been reached, which is fine for a handler that does
+# one thing and wrong for one that branches - and one of these endpoints branches
+# in the way that matters most. ``RequestPasswordReset`` answers identically
+# whether or not the address exists, deliberately, and it reaches that answer by
+# returning early on the arm where no account was found. A limit placed after
+# that branch would count real accounts and not imaginary ones, so
+# 429-versus-200 would become the account-existence oracle the endpoint was built
+# to avoid, and the endpoint's own care would have been undone from a distance. A
+# dependency runs before the handler body on every path, so the count cannot
+# depend on which arm the use case took, and a later edit to the use case cannot
+# reintroduce the leak.
+#
+# The second reason is the body. Every function below declares the request model
+# its endpoint declares, and FastAPI reads the body once and hands the same parse
+# to both, so nothing is read or parsed twice. Declaring it also means the model
+# is validated while the dependency is being solved, and FastAPI does not call a
+# dependency whose solve produced errors - so a body that is going to be refused
+# with a 422 never reaches the limiter and never spends a credit. Naming the
+# model a second time is what buys that; a limiter that took only the ``Request``
+# would be charged for malformed traffic, which is the traffic least worth
+# charging and the cheapest for an attacker to generate.
+#
+# **Nothing here can raise anything but ``RateLimitedError``.** The subjects are
+# folded with ``fold_email`` and ``fold_phone``, and both are total: they map
+# anything to a string rather than refusing it. ``checked_phone`` is deliberately
+# not used, because it raises - a limiter that could refuse a strange number
+# would turn the 422 that number deserves into a 500, from a function whose whole
+# job is to be the cheap check in front of the expensive one.
+#
+# The policy each of these enforces - both numbers and the argument for them -
+# is in ``rate_limits.py``, and is deliberately not restated here.
+
+
+def sign_up_rate_limit(request: Request, body: schemas.SignUpIn) -> None:
+    """Bound how often one address may ask for an account.
+
+    The subject is the *folded* address, which is the whole point of folding it:
+    an unfolded key would make ``Ada@example.com`` and ``ada@example.com`` two
+    budgets, and a caller who can spend the allowance again under each spelling
+    they can invent has no allowance at all. ``fold_email`` is the same function
+    the repository looks accounts up with, so "the same address" means one thing
+    here and in the code that decides whether an account exists.
+    """
+    rate_limits.enforce(request, "sign_up", fold_email(body.email))
+
+
+def log_in_rate_limit(request: Request, body: schemas.LogInIn) -> None:
+    """Bound guessing at one account, by whichever identifier was named.
+
+    The branch mirrors the endpoint's own, deliberately and exactly: a request
+    naming a number is budgeted against that number and one naming an address
+    against that address, so the two ways into one account do not add up to two
+    budgets for it. Each is folded by the rule that belongs to it.
+
+    This is the door worth brute-forcing, which is why its window and its ceiling
+    are the two loosest numbers in the table - see ``rate_limits.py``.
+    """
+    if body.phone is not None:
+        subject = fold_phone(body.phone)
+    else:
+        subject = fold_email(body.email)
+    rate_limits.enforce(request, "sign_in", subject)
+
+
+def request_password_reset_rate_limit(
+    request: Request, body: schemas.PasswordResetRequestIn
+) -> None:
+    """Bound how often one address may make this installation send mail.
+
+    **This is the one where running before the handler is not a preference but
+    the correctness argument**, since the endpoint answers identically for an
+    address that exists and one that does not, and counts them the same only
+    because it is asked before the use case can tell them apart. See the section
+    comment above; the invariant is asserted in
+    ``tests/presentation/api/test_rate_limits.py``.
+    """
+    rate_limits.enforce(request, "request_password_reset", fold_email(body.email))
+
+
+def request_phone_verification_rate_limit(
+    request: Request, body: schemas.PhoneVerificationRequestIn
+) -> None:
+    """Bound how often one number may cost this installation a text message.
+
+    The only limit in the table defending money rather than CPU or reputation,
+    which is why its ceiling is the tightest one there. The subject is the
+    number in the request rather than the caller, because the caller is
+    frequently nobody - the number need not exist and need not be theirs.
+    """
+    rate_limits.enforce(
+        request, "request_phone_verification", fold_phone(body.phone)
+    )
+
+
+def request_email_change_rate_limit(
+    request: Request,
+    body: schemas.EmailChangeIn,
+    actor: User = Depends(current_actor),
+) -> None:
+    """Bound how often one account may make this installation send mail.
+
+    **``current_actor`` is a parameter rather than an assumption, and the
+    declaration is the ordering.** FastAPI resolves it as a dependency of this
+    function, so a request with a bad token fails here - as a 401, from
+    ``current_actor`` - before the limiter is consulted. Returning 429 to a
+    caller who has not proved who they are would be a behaviour change on this
+    route and would answer a question they have no standing to ask, which is the
+    same reasoning that puts 401 above 404 elsewhere in this package.
+
+    The subject is the account rather than the address being moved to, because
+    this is the one mailed route behind a session and the account is therefore
+    the only thing here that is *known* rather than supplied. The honest limit of
+    that choice: it bounds what one account may send and does not bound how many
+    accounts may be pointed at one mailbox, which the installation ceiling is
+    left to cover. Keying on the address instead would trade those two, and this
+    is the cheaper credential to obtain, so it is the one worth bounding.
+
+    ``body`` is declared and not read. That is the point of it - it is what makes
+    the model validate while this dependency is solved, so a body FastAPI is
+    going to refuse never spends a credit. The other five say the same thing by
+    using theirs.
+    """
+    rate_limits.enforce(request, "request_email_change", str(actor.user_id))
+
+
+def sign_up_with_google_rate_limit(
+    request: Request, body: schemas.GoogleTokenIn
+) -> None:
+    """Bound the outbound key fetch, with a ceiling and no subject.
+
+    There is no subject to key on and that is a finding rather than an omission:
+    the natural one is the Google ``sub``, which is not known until the token has
+    been verified, and verifying it is the cost being defended. Nothing can be
+    charged before the money is spent, so the ceiling is the only lever that
+    exists. ``rate_limits.py`` carries the fuller argument.
+    """
+    rate_limits.enforce(request, "sign_up_with_google", None)
+
+
+def log_in_with_google_rate_limit(
+    request: Request, body: schemas.GoogleTokenIn
+) -> None:
+    """The same ceiling for the same reason - see the function above.
+
+    A separate function rather than a shared one, because they are separate
+    buckets: an installation under attack through one door should not find the
+    other door shut, and a shared ceiling would be a shared failure.
+    """
+    rate_limits.enforce(request, "sign_in_with_google", None)
