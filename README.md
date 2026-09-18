@@ -5174,6 +5174,73 @@ that came back as anything but `NGN` would have failed this comparison and the r
 credited. So the currency guard's output side is confirmed too: what was sent is what came back, and
 the disagreement the guard exists to make unrepresentable did not occur.
 
+**A second deposit was then read back with a bare `curl`, and the payload it returned settles
+assumption 1 in the provider's own words rather than by arithmetic.** 50.00 NGN under
+`96f71fe1-12ad-4b60-a06f-75911614579a.run-2`, paid at the checkout, and
+`GET /transaction/verify/:reference` answering:
+
+```
+"status": "success",  "amount": 5000,  "requested_amount": 5000,  "fees": 75,
+"currency": "NGN",  "domain": "test",  "channel": "card"
+```
+
+**`amount` is the gross 5000 kobo and `fees` is a field beside it.** That is the whole of assumption 1
+stated as a fact about the payload: Paystack does not net the fee out of the amount it reports, it
+reports both, and `requested_amount` agreeing with `amount` is the same thing said twice - which is
+why both are quoted. The balance argument above and this are independent: one infers gross from our
+ledger not moving by a fee-sized amount, the other reads gross directly off the far end's response,
+and the second does not depend on our arithmetic being right.
+
+**`domain` is a second source for a fact this codebase derives.** Decision 244 reads a deployment's
+mode off the `sk_test_`/`sk_live_` prefix of its key, which is a property of the *installation*;
+`domain` is the same fact about a *transaction*, stated by the provider in its own response. Nothing
+consumes it and nothing should - reading the mode from a response would make "am I taking real money"
+answerable only after a call succeeds, which is the wrong way round for the one question 244 exists to
+answer at boot. It is recorded because it is the cheapest cross-check available the next time anyone
+wonders whether a deployment's key and its dashboard agree, and because a payload field that restates
+one of our settings is worth knowing exists before somebody assumes no such field does.
+
+**And `fees` is a number this system now knows it does not record.** The ledger credits
+`outcome.amount` - the gross - so a 50.00 NGN deposit makes the wallet 50.00 richer while Paystack
+will settle 0.75 less than that into the operator's bank account. Nothing here is wrong: a wallet is a
+record of what its owner is owed, and a processing fee is the operator's cost of accepting the money
+rather than the payer's, so crediting gross is the correct model and is what every wallet-shaped
+product does. What is new is that the cost is no longer hypothetical - it has a field name and a value
+on every transaction - and the day somebody asks "what did this month's deposits actually cost us",
+the answer is reconstructible from Paystack's dashboard and from nothing in this repository. That is a
+reporting gap rather than a defect, it is named here so it is not rediscovered as one, and it belongs
+with i4's balance-cap question rather than beside the rail.
+
+**`run-2` then settled the same way `run-1` had, and the gap between paying and crediting is the
+point of it.** The payer's checkout completed at 20:36; the balance stayed at 100.00 until
+`reconcile` was run by hand, at which point the row read
+`96f71fe1-12ad-4b60-a06f-75911614579a.run-2  settled  charge_succeeded applied to a deposit` and the
+wallet read `available: 150.00 NGN`. **Nothing was wrong, and that is exactly why it is written
+down.** No webhook URL had been registered for this installation - there was no public address for
+one to arrive at - so the payer's 50.00 NGN sat at Paystack with this ledger holding a PENDING row
+and no idea, and the only thing that closed the gap was somebody running a command. A deposit rail
+whose normal path is the webhook and whose safety net is the reconciler looks, from a laptop with
+neither, like a system that has quietly stopped crediting money. It has not; it is waiting to be
+told. The tunnel half of the run exists to make the *normal* path the one under test rather than
+leaving the net to stand in for the road.
+
+**A third deposit then confirmed that the net is not the road, by sitting unsettled.** `webhook-2`,
+25.00 NGN, was initiated and paid with no public address registered, and `history` read:
+
+```
+2026-09-18T14:27:03  deposit  100.00 NGN  successful
+2026-09-18T21:35:34  deposit   50.00 NGN  successful
+2026-09-18T22:47:21  deposit   25.00 NGN  pending
+```
+
+Three rows, and the third is the only one this system did not have to be told about by hand. **The
+`pending` is the correct state and is not a defect** - it is a paid collection whose event never
+arrived, which is exactly what the reconciler is for and exactly what it would fix on its next run.
+What the row records is the shape of the remaining gap: **every deposit this system has credited, it
+credited because something local asked.** The webhook is the path that must work in production, and
+it cannot be exercised without a public address - which is a deployment artifact, not a line of code,
+and the reason this last step cannot be finished on a laptop alone.
+
 **The reference survived the round trip, which is the other thing only a live run could settle.**
 `96f71fe1-12ad-4b60-a06f-75911614579a.run-1` is 42 characters and carries both hyphens and a dot;
 Paystack accepted it as the idempotency key and echoed it back as `data.reference`, which is the
