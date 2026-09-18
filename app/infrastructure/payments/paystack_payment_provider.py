@@ -14,10 +14,12 @@ could have been written without adding a package - and it is worth noticing that
 the *inbound* direction, the one that decides whether money is credited, is the
 one with no dependency at all.
 
-**Three methods, one transport.** The two that call out share ``_request``, so
+**Four methods, one transport.** The two that call out share ``_request``, so
 the failure handling, the bearer token and the timeout are written once - and
 each of them names the statuses it will interpret, which is the one thing about a
-call that only its caller knows. See ``_request``.
+call that only its caller knows. See ``_request``. The other two cost nothing:
+proving a webhook is standard-library HMAC over bytes, and answering what this
+account will collect is a field this class was constructed with.
 """
 
 import hashlib
@@ -149,16 +151,31 @@ NOT_SETTLED_CHARGE_STATUSES = frozenset(
     }
 )
 
-#: The one currency this integration is exercised against, and deliberately the
-#: only one it will send.
+#: The currencies this integration is exercised against, and deliberately the
+#: only ones it will send by default.
 #:
 #: Not a limitation of the code - ``Money`` carries its currency and the request
-#: below forwards whatever it is given. It is a statement about what has been
-#: verified: a provider account is enabled for particular currencies, and sending
-#: one the account is not enabled for fails at *their* end with a message that
-#: reads like ours is broken. Kept as a constant so that enabling a second one is
-#: a deliberate line rather than a value that happened to arrive.
-SUPPORTED_CURRENCY = "NGN"
+#: below sends the amount's own - but a statement about what has been verified: a
+#: provider account is enabled for particular currencies, and sending one the
+#: account is not enabled for fails at *their* end with a message that reads like
+#: ours is broken. So this is the default for the constructor's ``currencies``,
+#: where enabling a second one is a deliberate line at the composition root
+#: rather than a value that happened to arrive.
+#:
+#: **A ``Currency`` here rather than the three-letter string it used to be**, and
+#: the change is not cosmetic. The set is now what ``initialize_deposit`` checks
+#: against and what ``supported_currencies`` reports, so a caller can be refused
+#: *before* a payer is sent anywhere - and a comparison against an enum member is
+#: one the type checker can see, where a comparison against a loose string was
+#: not. The value sent on the wire is still the three-letter code, read off the
+#: ``Money`` being collected rather than off this set.
+#:
+#: **The set stopped being decorative the day it was read.** This constant used to
+#: describe a payload it did not control: ``_subunit(amount)`` derived the number
+#: from the amount's currency while the label beside it came from here, so a
+#: wallet holding USD posted the *number* one hundred and the *label* NGN. See
+#: the port's ``supported_currencies`` and the decision recorded for it.
+SUPPORTED_CURRENCIES: frozenset[Currency] = frozenset({Currency.NGN})
 
 
 class PaystackPaymentProvider(PaymentProvider):
@@ -178,9 +195,33 @@ class PaystackPaymentProvider(PaymentProvider):
     per call, and this endpoint is human-paced.
     """
 
-    def __init__(self, secret_key: str, timeout: int = DEFAULT_TIMEOUT):
+    def __init__(
+        self,
+        secret_key: str,
+        timeout: int = DEFAULT_TIMEOUT,
+        *,
+        currencies: frozenset[Currency] = SUPPORTED_CURRENCIES,
+    ):
         self._secret_key = secret_key
         self._timeout = timeout
+        # The currencies this *account* is enabled for, which is why it is a
+        # parameter and not just the constant above. ``timeout`` is the precedent:
+        # a per-deployment fact that has a sane default and that a test needs to
+        # vary. Varying this one is how a test proves the label follows the amount
+        # rather than a constant - which is the bug this file used to have, and it
+        # is not provable against a provider that only ever collects one currency.
+        self._currencies = currencies
+
+    def supported_currencies(self) -> frozenset[Currency]:
+        """What this account will collect in. See the port for the contract.
+
+        Returns the set as given rather than a copy, which is safe for exactly one
+        reason: a ``frozenset`` cannot be mutated in place, so a caller holding it
+        can add nothing to it. That is the whole of why the port's signature says
+        ``frozenset`` instead of ``set``, and it means this method needs no
+        defensive line.
+        """
+        return self._currencies
 
     def initialize_deposit(
         self, *, reference: str, amount: Money, email: str
@@ -196,7 +237,7 @@ class PaystackPaymentProvider(PaymentProvider):
         ``int`` cannot round - there is no float anywhere on this path, which is
         the same reason ``Money`` refuses them.
 
-        **Two refusals are interpreted here rather than reported**, and both are
+        **Both refusals are interpreted here rather than reported**, and both are
         cases where the status alone is not the answer. A ``401``/``403`` means the
         key is wrong, which only this frame can say because only this frame knows a
         collection was being opened; a ``400`` carrying
@@ -206,7 +247,31 @@ class PaystackPaymentProvider(PaymentProvider):
         words attached. That a 400 is *allowed* to reach this method at all is the
         ``answers`` argument in one line: a refusal is the whole of what is
         knowable to the transport, and not the whole of what is knowable here.
+
+        **The currency sent is the amount's own, and that is a repair rather than a
+        detail.** This method used to send ``_subunit(amount)`` beside a constant
+        ``"currency"``, which is two decisions about one payload: the number came
+        from the ``Money`` and the label came from a module constant, and nothing
+        connected them. For a wallet holding USD the result was a collection for
+        one hundred *naira* filed against a ledger row of one hundred *dollars* -
+        and because ``SettlePayment`` compares the two, the row could never
+        settle: the payer's money was taken and nothing was ever credited. Sending
+        ``amount.currency.value`` makes the disagreement unrepresentable, because
+        there is now one object deciding both.
+
+        **The check above the request is a backstop, not the door.** The door is
+        ``InitiateDeposit``, which asks ``supported_currencies`` and refuses before
+        a payer is sent anywhere - and that is the refusal a client sees. This one
+        is unreachable from that path, and it exists so that a caller which skips
+        the door cannot relabel a collection silently, which is precisely how the
+        bug above survived: no single frame was wrong, and the two halves were.
         """
+        if amount.currency not in self._currencies:
+            raise PaymentProviderError(
+                f"this account is not enabled to collect {amount.currency.value}; "
+                f"it collects {_currency_names(self._currencies)}"
+            )
+
         status, response = self._request(
             "POST",
             "/transaction/initialize",
@@ -214,7 +279,7 @@ class PaystackPaymentProvider(PaymentProvider):
                 "email": email,
                 "amount": _subunit(amount),
                 "reference": reference,
-                "currency": SUPPORTED_CURRENCY,
+                "currency": amount.currency.value,
             },
             answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
         )
@@ -324,6 +389,13 @@ class PaystackPaymentProvider(PaymentProvider):
         would mean a provider could re-point a settlement at a ledger row other
         than the one the question was about. The lookup key is the fact this side
         holds; the response is what it answers *with*.
+
+        **The currency comes back off the response too**, which is the half of the
+        repair ``initialize_deposit`` carries the note for. Settlement compares
+        the amount this returns against the ledger row, so a currency taken from a
+        constant here would refuse every recovered deposit in any currency but
+        that one - reading its own assumption back as the provider's answer. See
+        ``_currency_of``.
         """
         status, body = self._request(
             "GET",
@@ -353,7 +425,7 @@ class PaystackPaymentProvider(PaymentProvider):
                 ProviderOutcome(
                     event=ProviderEvent.CHARGE_SUCCEEDED,
                     reference=reference,
-                    amount=_from_subunit(data["amount"]),
+                    amount=_from_subunit(data["amount"], _currency_of(data)),
                 ),
             )
 
@@ -547,8 +619,8 @@ def _subunit(amount: Money) -> int:
     return int(amount.amount * 100)
 
 
-def _from_subunit(subunits: int) -> Money:
-    """The inverse of ``_subunit``: kobo back to naira, as ``Money``.
+def _from_subunit(subunits: int, currency: Currency) -> Money:
+    """The inverse of ``_subunit``: subunits back to whole units, as ``Money``.
 
     The direction a lookup needs and the direction that did not exist until
     reconciliation did. A verify response carries the amount in kobo like every
@@ -565,8 +637,76 @@ def _from_subunit(subunits: int) -> Money:
     with more than two decimal places, so a provider that sent a fractional kobo
     would raise here rather than round.
 
-    The currency is ``SUPPORTED_CURRENCY`` looked up rather than a second literal
-    ``Currency.NGN``, so that a deployment enabled for a second currency changes
-    one constant and reads its own answers back in the currency it asked in.
+    **The currency is a parameter, and it used to be a constant.** It was read
+    from ``SUPPORTED_CURRENCY`` on the argument that a deployment enabled for a
+    second currency would then read its answers back in the currency it asked in
+    - and that argument was wrong in the one way that matters, because the
+    *asking* was done with a hard-coded label too. The two constants agreed with
+    each other and neither agreed with the amount, which is the shape of the bug
+    ``initialize_deposit`` now carries the note about: a value that is read from
+    the same place it is written is a value that cannot notice it is wrong. The
+    caller reads this off the response, so the answer comes back in the currency
+    the *provider* says the charge was in, which is the only figure settlement
+    can honestly compare against a row.
+
+    The subunit factor is not a parameter and must not become one. Kobo-per-naira
+    is 100 because Paystack says so for every currency it settles in; a currency
+    with a different minor-unit exponent would need this whole pair revisited
+    rather than a second argument, and silently passing a different factor here
+    would be the same class of mistake in a new place.
     """
-    return Money(Decimal(subunits) / 100, Currency(SUPPORTED_CURRENCY))
+    return Money(Decimal(subunits) / 100, currency)
+
+
+def _currency_of(data: dict) -> Currency:
+    """The currency a settled charge was taken in, off the provider's own answer.
+
+    **Read rather than assumed, and the assumption was the bug.** This used to be
+    the constant ``SUPPORTED_CURRENCY``, which meant the two halves of a
+    settlement were decided in different places: the number came out of the
+    response and the label came out of this file. For a charge this installation
+    opened in NGN the two agreed by luck; for any other they could not, and the
+    disagreement would arrive as ``SettlementOutcome.AMOUNT_DISAGREES`` against a
+    row that was in fact perfectly correct. A recovered deposit would have been
+    reported as a mismatch for ever by a reconciler that was reading its own
+    constant rather than the provider's answer.
+
+    Translated into ``InvalidProviderAnswerError`` rather than left as the
+    ``ValueError`` ``Currency`` raises, and the reason is the one this file
+    already gives for its other translations: an exception type is part of a
+    vocabulary, and a bare ``ValueError`` escaping an adapter would report as an
+    unknown server fault. What it means is narrower and more useful - the provider
+    answered with something this adapter cannot read.
+
+    The missing case is deliberately not distinguished from an unknown one. A
+    settled charge with no currency at all and one quoting a currency this system
+    has never heard of are the same fact to a caller: the answer cannot be read,
+    and settlement must not guess what it meant.
+    """
+    currency = data.get("currency")
+    if not isinstance(currency, str):
+        raise InvalidProviderAnswerError(
+            "the provider reported a settled charge with no currency"
+        )
+
+    try:
+        return Currency(currency)
+    except ValueError:
+        raise InvalidProviderAnswerError(
+            f"the provider reported a charge in {currency!r}, which this system "
+            f"does not know"
+        ) from None
+
+
+def _currency_names(currencies: frozenset[Currency]) -> str:
+    """A set of currencies as a readable list, for a sentence a person reads.
+
+    Sorted, and that is the whole of why it is a function rather than an f-string
+    at the raise site. A ``frozenset`` has no order, so a message built by
+    iterating one names the same currencies in a different order on different
+    runs - and a sentence that changes while nothing has changed is one a reader
+    learns to distrust, which is the last thing a refusal wants. Sorted by the
+    currency's own code rather than by insertion, so it does not depend on how
+    the set was built either.
+    """
+    return ", ".join(sorted(currency.value for currency in currencies))

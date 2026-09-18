@@ -120,7 +120,10 @@ from app.domain.planning.exception import (
     PlanNotPausedError,
     SavingsPlanNotFoundError,
 )
-from app.domain.payments.exception import DepositAlreadyInitiatedError
+from app.domain.payments.exception import (
+    CurrencyNotCollectableError,
+    DepositAlreadyInitiatedError,
+)
 
 #: We do not know who is asking, or the proof offered did not hold.
 #:
@@ -325,6 +328,7 @@ CONFLICT = (
     CommittedPayoutRemovalError,
     ConfirmationExpiredError,
     ConfirmationAlreadyUsedError,
+    CurrencyNotCollectableError,
     DepositAlreadyInitiatedError,
     EmailUnchangedError,
     EmailChangeExpiredError,

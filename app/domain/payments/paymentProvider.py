@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.payments.paymentIntent import PaymentIntent
 from app.domain.payments.providerAnswer import ProviderAnswer
@@ -16,7 +17,7 @@ class PaymentProvider(ABC):
     request out. Both are abstract for the same reason - so the inside never
     names a technology - and both are why no test in this suite opens a socket.
 
-    **Three methods, and the port grew one at a time rather than starting
+    **Four methods, and the port grew one at a time rather than starting
     there.** The obvious shape is a symmetric pair - collect money, send money -
     and only the first half of that pair has a caller: payouts reach a provider
     through a path that does not exist yet, so an ``initiate_transfer`` now would
@@ -32,9 +33,22 @@ class PaymentProvider(ABC):
     for the discipline's own reason rather than by accident: reconciliation is
     the caller, and before reconciliation existed a signature here would have
     been guessed - which is exactly the mistake that keeps ``initiate_transfer``
-    off this port. It sits next to ``initialize_deposit`` because those two share
-    a failure mode and a return direction, while ``verify_signature`` below is
-    the one method that answers instead of acting.
+    off this port. It sits in the outbound half, because it shares a failure mode
+    and a return direction with ``initialize_deposit`` - the fourth method reads
+    between the two, for its own reason below - while ``verify_signature`` at the
+    end is a method that answers instead of acting.
+
+    **The fourth is the one that says what cannot be asked for, and it earns its
+    place by the same test the third did.** ``supported_currencies`` has a caller
+    that exists today - the deposit use case, which has to refuse a wallet the
+    rail cannot collect *before* it sends a payer to a payment page - and a
+    signature derived from that caller rather than guessed at, which is what
+    separates it from ``initiate_transfer``. It is also the reason the port has
+    to carry it at all: the fact belongs to the adapter, and an application layer
+    that learned it any other way would have to hold a second copy of a fact that
+    the adapter is the only thing able to honour. **A copy is a thing that
+    drifts**, and the direction it drifts in is the one where the door admits a
+    currency the transport will silently relabel.
 
     **The inbound half of settlement is deliberately not on the webhook path.**
     There, deciding what a ``charge.success`` *means* needs no call outward: the
@@ -97,6 +111,34 @@ class PaymentProvider(ABC):
         Raising means no collection was opened and the caller must not record
         one. Returning means the provider has taken responsibility for it, and
         the reference in the answer is the name it will report it under.
+        """
+        pass
+
+    @abstractmethod
+    def supported_currencies(self) -> frozenset[Currency]:
+        """The currencies this provider will actually collect in.
+
+        **Asked before ``initialize_deposit``, never after.** A collection is
+        opened by sending a payer somewhere, and the one thing this call exists
+        to prevent is sending them somewhere for money this rail cannot take in
+        the currency the wallet holds. A caller that asked afterwards would have
+        the answer at the only moment it is no longer any use.
+
+        **A fact about the deployment, not about the port.** A provider account
+        is enabled for particular currencies by whoever opened it, so what this
+        returns is a statement about an account rather than about Paystack - and
+        it is deliberately allowed to differ between two providers of the same
+        kind. Implementations return a ``frozenset`` so that the answer cannot be
+        edited in place by a caller that was only asking.
+
+        **Implementations must derive it from whatever they send.** The
+        requirement this signature cannot enforce, and therefore has to write
+        down, is the one a real incident produced: an adapter that reported one
+        set of currencies here and put a *constant* currency in the payload built
+        collections whose number and label disagreed, and the payer's money was
+        taken against a ledger row that could never settle. An implementation
+        that sends ``amount.currency`` and answers this from the same place
+        cannot have that bug. See ``initiate_deposit``, which is the caller.
         """
         pass
 

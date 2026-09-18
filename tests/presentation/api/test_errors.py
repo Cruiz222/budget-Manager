@@ -123,6 +123,35 @@ class TestConflict:
         assert response.status_code == 409
         assert response.json()["error"] == "PlanNotPausedError"
 
+    def test_a_wallet_in_a_currency_this_rail_cannot_collect(
+        self, client, as_user, open_wallet
+    ):
+        """The newest row, and the grade that is least obvious of the three here.
+
+        A 400 is ruled out because the request is well formed and there is nothing
+        in it for the caller to fix; a 503 is ruled out because this installation
+        serves deposits perfectly well against a wallet in the currency it
+        collects. What refuses *this* request is the wallet's own state - it is
+        held in a currency the rail cannot collect - which is the shape the module
+        docstring describes for 409 and the row ``WalletClosedError`` already sits
+        on.
+
+        ``open_wallet`` is asked for dollars rather than a wallet being written
+        into the store, and that is worth noting: creating one is still allowed,
+        deliberately. What is refused is the collection, not the container.
+        """
+        headers = as_user()
+        wallet_id = open_wallet(headers, currency="USD")
+
+        response = client.post(
+            f"/wallets/{wallet_id}/deposits",
+            json={"amount": "5000.00"},
+            headers=headers,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"] == "CurrencyNotCollectableError"
+
 
 class TestBadRequest:
     """400 - a value in the request is not acceptable.

@@ -247,6 +247,63 @@ class TestTheRefusals:
         assert response.json()["error"] == "WalletClosedError"
         assert balance_of(wallet_id, headers) == "0.00"
 
+    def test_a_wallet_the_rail_cannot_collect_is_a_409_and_nothing_is_sent(
+        self, client, a_wallet, balance_of, payment_provider
+    ):
+        """**The refusal that stands between a payer and money nobody can credit.**
+
+        A wallet can be opened in any of five currencies and the rail is enabled
+        for particular ones, so a collection opened for the others would go out
+        carrying a naira label against a ledger row that says dollars. The far end
+        takes the payer's money in naira, the webhook says naira, the row says
+        dollars, and ``SettlePayment`` - which compares what arrived against what
+        was asked for - refuses for ever. Nothing is credited and the money has
+        already left the payer.
+
+        So the assertions are three, and the middle one is the point: a 409 rather
+        than a 400 because the request is well formed and there is nothing in it
+        to fix, and an empty ``requests`` list because the payer was never sent to
+        a payment page to find out.
+
+        **The currency is named, and so is what can be collected.** "This wallet
+        holds USD" tells a caller what they already know; naming the currencies
+        this installation *does* collect is what turns the sentence into one
+        somebody can act on.
+        """
+        headers, wallet_id = a_wallet(currency="USD")
+
+        response = client.post(
+            deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers
+        )
+
+        assert response.status_code == 409, response.text
+        assert response.json()["error"] == "CurrencyNotCollectableError"
+        assert "USD" in response.json()["detail"]
+        assert "NGN" in response.json()["detail"]
+        assert "authorization_url" not in response.json()
+        assert payment_provider.requests == []
+        assert balance_of(wallet_id, headers) == "0.00"
+
+    def test_a_wallet_the_rail_can_collect_still_gets_its_collection(
+        self, client, a_wallet, payment_provider
+    ):
+        """The control, and it is the one that would catch an over-eager guard.
+
+        The change this guards *adds* a refusal to a route that mostly works, and
+        the way to get it wrong is not a missed refusal - it is a deposit route
+        that stops opening collections at all. The same request against a naira
+        wallet, through the same fixtures, has to come back a 201 with a URL.
+        """
+        headers, wallet_id = a_wallet()
+
+        response = client.post(
+            deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["authorization_url"].startswith("https://")
+        assert len(payment_provider.requests) == 1
+
     def test_the_same_key_twice_is_a_409(self, client, a_wallet):
         """**The refusal that is deliberately not a friendly replay.**
 

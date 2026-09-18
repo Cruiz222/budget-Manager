@@ -47,7 +47,7 @@ from app.infrastructure.payments import paystack_payment_provider
 from app.infrastructure.payments.paystack_payment_provider import (
     BASE_URL,
     DEFAULT_TIMEOUT,
-    SUPPORTED_CURRENCY,
+    SUPPORTED_CURRENCIES,
     PaystackPaymentProvider,
     _from_subunit,
     _subunit,
@@ -55,6 +55,7 @@ from app.infrastructure.payments.paystack_payment_provider import (
 from tests.conftest import TEST_PAYSTACK_SECRET
 
 NGN = Currency.NGN
+USD = Currency.USD
 
 #: A key nothing signs with, for the tests about the wrong one. Shaped like
 #: ``TEST_PAYSTACK_SECRET`` so the two are recognisable as a pair.
@@ -75,7 +76,7 @@ A_TRANSACTION = {
 }
 
 
-def a_charge(status: str, amount: int = 500000) -> dict:
+def a_charge(status: str, amount: int = 500000, currency: Currency = NGN) -> dict:
     """What ``/transaction/verify/:reference`` answers, in Paystack's own words.
 
     A builder rather than a constant because these tests are about *statuses* -
@@ -87,6 +88,11 @@ def a_charge(status: str, amount: int = 500000) -> dict:
     ``amount`` is kobo, as it is on every Paystack payload, and it is here in
     kobo deliberately: a fixture holding naira would hide exactly the factor of a
     hundred that ``_from_subunit`` exists to undo.
+
+    ``currency`` is a parameter for the same reason ``amount`` is: a response
+    that always said NGN could not tell an adapter that reads the currency apart
+    from one that assumes it, which is the difference between the lookup
+    answering a question and answering its own.
     """
     return {
         "status": True,
@@ -95,7 +101,7 @@ def a_charge(status: str, amount: int = 500000) -> dict:
             "status": status,
             "reference": "ps_ref_1",
             "amount": amount,
-            "currency": SUPPORTED_CURRENCY,
+            "currency": currency.value,
         },
     }
 
@@ -256,8 +262,72 @@ class TestOpeningACollection:
             "email": "payer@localhost",
             "amount": 500000,
             "reference": "ps_ref_1",
-            "currency": SUPPORTED_CURRENCY,
+            "currency": "NGN",
         }
+
+    def test_the_currency_sent_is_the_amounts_own(self, provider, requesting):
+        """**The assertion that would have caught the bug this file used to have.**
+
+        The label and the number used to be decided in two different places: the
+        number came from ``_subunit(amount)`` and the label came from a module
+        constant. Nothing connected them, so a wallet holding USD posted a payload
+        whose ``amount`` was the dollar figure and whose ``currency`` was naira -
+        and because settlement compares what arrives against what the ledger row
+        asked for, the payer's money was taken against a row that could never
+        settle.
+
+        A provider is constructed here as enabled for two currencies, and that
+        construction is the test rather than scaffolding: against a provider that
+        only ever collects one, "it reads the currency off the amount" and "it
+        sends a constant" are the same behaviour and no assertion can separate
+        them. The pair below separates them - the same object, two amounts, two
+        labels.
+
+        The control is the second call. It is what stops this passing on an
+        adapter that simply forwards ``amount.currency`` without ever checking
+        what the account is enabled for, which is a different bug with the same
+        happy path.
+        """
+        provider = PaystackPaymentProvider(
+            TEST_PAYSTACK_SECRET, currencies=frozenset({NGN, USD})
+        )
+        provider.initialize_deposit(
+            reference="ps_ref_1",
+            amount=Money(Decimal("100.00"), USD),
+            email="payer@localhost",
+        )
+        provider.initialize_deposit(
+            reference="ps_ref_2",
+            amount=Money(Decimal("5000.00"), NGN),
+            email="payer@localhost",
+        )
+
+        assert requesting.calls[0]["json"]["currency"] == "USD"
+        assert requesting.calls[0]["json"]["amount"] == 10000
+        assert requesting.calls[1]["json"]["currency"] == "NGN"
+        assert requesting.calls[1]["json"]["amount"] == 500000
+
+    def test_a_currency_the_account_is_not_enabled_for_is_refused(
+        self, provider, requesting
+    ):
+        """The backstop, and it is deliberately not the door a client meets.
+
+        ``InitiateDeposit`` asks ``supported_currencies`` and refuses before this
+        method is ever reached, so nothing here is reachable from the API. What
+        this covers is the caller that skips that door - a script, a future use
+        case, a second adapter's worth of refactoring - and the failure it exists
+        to prevent is the silent one: relabelling a collection rather than
+        refusing it.
+        """
+        with pytest.raises(PaymentProviderError) as raised:
+            provider.initialize_deposit(
+                reference="ps_ref_1",
+                amount=Money(Decimal("100.00"), USD),
+                email="payer@localhost",
+            )
+
+        assert "USD" in str(raised.value)
+        assert requesting.calls == [], "the request left the process anyway"
 
     def test_it_sets_a_timeout(self, provider, requesting):
         """Without one, a provider that accepts the connection and says nothing
@@ -633,6 +703,63 @@ class TestLookingUpACollection:
 
         assert answer.outcome.amount == an_amount("10000.55")
 
+    def test_the_currency_comes_back_off_the_response(self, provider, requesting):
+        """**Read, not assumed, and the assumption was the other half of a bug.**
+
+        ``_from_subunit`` used to take its currency from a module constant, which
+        meant the number came out of the provider's answer and the label came out
+        of this repository. Against a charge this installation had opened in
+        naira the two agreed; against any other they could not, and the
+        disagreement would arrive as ``AMOUNT_DISAGREES`` on a row that was
+        perfectly correct - a reconciler reading its own assumption back as the
+        provider's answer, for ever.
+
+        The response is varied rather than the provider, because the claim is
+        that the *response* is what decides. A doubled amount would not
+        distinguish the two.
+        """
+        requesting.response = httpx.Response(200, json=a_charge("success", currency=USD))
+
+        answer = provider.outcome_for("ps_ref_1")
+
+        assert answer.outcome.amount == Money(Decimal("5000"), USD)
+
+    def test_a_currency_this_system_does_not_know_is_refused(
+        self, provider, requesting
+    ):
+        """An unreadable answer, not an unknown server fault.
+
+        ``Currency(…)`` raises a plain ``ValueError``, which is not in any
+        vocabulary this codebase catches - so left alone it would report as a 500
+        on the reconciler's path and say nothing about where it came from. The
+        translation is the same one the webhook route makes for the same field,
+        which is the point: the two readers of a provider's currency agree about
+        what an unreadable one means.
+        """
+        body = a_charge("success")
+        body["data"]["currency"] = "XYZ"
+        requesting.response = httpx.Response(200, json=body)
+
+        with pytest.raises(InvalidProviderAnswerError) as raised:
+            provider.outcome_for("ps_ref_1")
+
+        assert "XYZ" in str(raised.value)
+
+    def test_a_settled_charge_with_no_currency_is_refused(self, provider, requesting):
+        """The absent case and the unknown one are one answer, deliberately.
+
+        Both mean the same thing to a caller - the provider's answer cannot be
+        read - and settlement must not guess what it meant by falling back to a
+        default. A default would be the old bug with better manners: a currency
+        this side chose, compared against a row, reported as a disagreement.
+        """
+        body = a_charge("success")
+        del body["data"]["currency"]
+        requesting.response = httpx.Response(200, json=body)
+
+        with pytest.raises(InvalidProviderAnswerError):
+            provider.outcome_for("ps_ref_1")
+
     def test_the_reference_reported_is_the_one_asked_about(
         self, provider, requesting
     ):
@@ -875,6 +1002,73 @@ class TestProvingAWebhook:
         assert provider.verify_signature(b"", sign_webhook(b""))
 
 
+class TestWhatTheAccountCollects:
+    """``supported_currencies``, which is what the deposit door refuses against.
+
+    Its own class because it is the one method on this adapter that neither opens
+    a collection nor reads one - it answers a question about the *deployment*, and
+    the fact that it is answerable without a network call is exactly what lets
+    ``InitiateDeposit`` refuse before a payer is sent anywhere.
+    """
+
+    def test_the_default_is_the_one_verified_currency(self):
+        """A deployment that has configured nothing collects in naira.
+
+        Pinned against the module constant rather than a literal, so that
+        enabling a second currency in the one place that decides it does not
+        require a test to be edited in a second place - which is the arrangement
+        the constant's own docstring promises.
+        """
+        provider = PaystackPaymentProvider(secret_key=TEST_PAYSTACK_SECRET)
+
+        assert provider.supported_currencies() == SUPPORTED_CURRENCIES
+        assert provider.supported_currencies() == frozenset({NGN})
+
+    def test_it_is_a_frozenset_so_a_caller_cannot_edit_the_answer(self):
+        """The port asks for ``frozenset`` rather than ``set``, and this is why.
+
+        A caller that could mutate what it was handed could widen an account's
+        enabled currencies from outside the adapter - which is a strange thing
+        for a use case to be able to do, and precisely the kind of accident that
+        only shows up as a payload nobody can explain. The adapter returns the
+        set it holds rather than a copy for the same reason: it cannot be
+        mutated, so there is nothing to defend against.
+        """
+        provider = PaystackPaymentProvider(secret_key=TEST_PAYSTACK_SECRET)
+
+        with pytest.raises(AttributeError):
+            provider.supported_currencies().add(USD)
+
+    def test_what_it_reports_and_what_it_sends_come_from_the_same_set(
+        self, requesting
+    ):
+        """**The pairing, which is the property the door depends on.**
+
+        The deposit use case refuses against ``supported_currencies`` and then
+        hands the amount to ``initialize_deposit``. Those two have to be reading
+        the same fact: a version where the constructor field was consulted by the
+        send but not by the report would be a door that admits a currency the
+        rail then refuses, and one where the report knew more than the send would
+        be the original bug wearing a set instead of a string. A provider built
+        for two currencies must therefore both report two and send for two, and
+        this asserts the two halves against each other rather than each against
+        the constructor argument.
+        """
+        provider = PaystackPaymentProvider(
+            TEST_PAYSTACK_SECRET, currencies=frozenset({NGN, USD})
+        )
+
+        assert provider.supported_currencies() == frozenset({NGN, USD})
+
+        provider.initialize_deposit(
+            reference="ps_ref_1",
+            amount=Money(Decimal("100.00"), USD),
+            email="payer@localhost",
+        )
+
+        assert requesting.call["json"]["currency"] == "USD"
+
+
 class TestTheSubunit:
     """The conversion, in both directions, on its own, so a failure names itself.
 
@@ -935,13 +1129,21 @@ class TestTheSubunit:
         problem rather than an arithmetic one, which is why the awkward amounts
         are here rather than round ones.
         """
-        assert _from_subunit(subunits) == an_amount(amount)
+        assert _from_subunit(subunits, NGN) == an_amount(amount)
 
-    def test_the_currency_is_the_one_it_asked_in(self):
-        """Looked up from ``SUPPORTED_CURRENCY`` rather than written as a second
-        literal, so a deployment enabled for a second currency changes one
-        constant and reads its answers back in the currency it asked in."""
-        assert _from_subunit(500000).currency is Currency(SUPPORTED_CURRENCY)
+    def test_the_currency_is_the_one_it_was_told(self):
+        """A parameter, and it used to be read from ``SUPPORTED_CURRENCY``.
+
+        That version argued a deployment enabled for a second currency would read
+        its answers back in the currency it asked in - and it was wrong in the
+        one way that matters, because the *asking* was done with the same
+        hard-coded label. Two constants agreeing with each other is not the same
+        as either agreeing with the amount, and the failure was a recovered
+        deposit reported as a mismatch for ever by a reconciler reading its own
+        assumption back as the provider's answer.
+        """
+        assert _from_subunit(500000, NGN).currency is NGN
+        assert _from_subunit(500000, USD).currency is USD
 
     @pytest.mark.parametrize("amount", ["1", "5000", "5000.55", "1000000"])
     def test_a_round_trip_is_the_identity(self, amount):
@@ -953,4 +1155,4 @@ class TestTheSubunit:
         that would show up is a deposit the provider settled and this system
         refused, on a difference nobody could see by reading either function.
         """
-        assert _from_subunit(_subunit(an_amount(amount))) == an_amount(amount)
+        assert _from_subunit(_subunit(an_amount(amount)), NGN) == an_amount(amount)

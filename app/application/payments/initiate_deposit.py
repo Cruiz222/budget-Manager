@@ -3,6 +3,7 @@ from uuid import UUID
 
 from app.application.unit_of_work import UnitOfWorkFactory
 from app.domain.identity.tier import check_credit, tier_for
+from app.domain.money.currency import Currency
 from app.domain.money.exception import (
     CurrencyMismatchError,
     InvalidAmountError,
@@ -15,6 +16,7 @@ from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.payments.exception import (
+    CurrencyNotCollectableError,
     DepositAlreadyInitiatedError,
     PayerEmailMissingError,
 )
@@ -74,6 +76,20 @@ class InitiateDeposit:
     could ever credit. Refusing at the door means the payer is never sent
     anywhere. A *frozen* wallet is allowed, deliberately: freezing stops value
     leaving, and this is value arriving.
+
+    **A wallet in a currency this installation cannot collect is refused at the
+    same door, for the same reason, and it is the newer of the two.** The rail is
+    enabled for particular currencies and ``Currency`` has five members, so a
+    collection opened for any of the other four would be taken at the far end in
+    the wrong one - and because ``SettlePayment`` compares what arrived against
+    what the row asked for, the disagreement would surface as a row that can
+    never settle, *after* the payer had paid. The check is
+    ``PaymentProvider.supported_currencies`` asked of the provider rather than a
+    constant held here, so the set has one home: the adapter that has to honour
+    it. **This is not a restriction on opening a wallet** - a wallet is a
+    container, and one holding US dollars holds pots and plans and can be
+    credited directly - it is a restriction on one door, and it is recorded in
+    the README as a departure from where the checklist first put it.
 
     **The balance ceiling is refused here too, and for the same reason as the
     closed wallet rather than a different one.** A deposit that would leave the
@@ -163,6 +179,16 @@ class InitiateDeposit:
         written, so there is nothing to make durable; but the transaction is
         open, and leaving it open holds a read lock the next writer waits on.
 
+        **Every refusal here costs nobody anything, and that is the thread
+        through all of them.** The payer has not been sent anywhere yet - the
+        provider is called by ``execute`` after this returns - so a wallet that
+        is closed, a currency this installation cannot collect, a balance that
+        would breach the account's cap and an address the provider will not bill
+        are all answered while the money is still entirely on the payer's side of
+        the page. That is what makes this method the right place for checks that
+        look like they belong further in: the aggregate would refuse them too,
+        but by then a collection exists.
+
         **The ceiling check is a courtesy, and it is not the control.** What it
         buys is that a payer is not sent to a payment page for money this wallet
         could not legally accept; what it does not buy is a guarantee, because the
@@ -200,6 +226,47 @@ class InitiateDeposit:
             # not a Money at all would otherwise be told its currency was wrong.
             if wallet.status is WalletStatus.CLOSED:
                 raise WalletClosedError("this wallet is closed")
+
+            # **The currency guard, and the reason it is here rather than at
+            # wallet creation.** What refuses this request is the meeting of a
+            # wallet's currency and a *rail*: this installation collects in one
+            # currency, a wallet may be opened in any of five, and a collection
+            # opened for the other four would be a collection the far end takes
+            # in naira against a ledger row that says dollars. Both halves of
+            # that are already here - the wallet by ``get_owned`` above and the
+            # rail by ``self._provider`` - so the check costs a set member and
+            # no read at all.
+            #
+            # It sits after the wallet's own status and after the amount's
+            # currency, and each edge is load-bearing. After ``CLOSED`` because
+            # a closed wallet is the refusal with a remedy - give up on this one
+            # - while this one has none, and answering the actionable fact first
+            # is the same ordering ``errors`` uses to put 401 above 404. After
+            # ``amount.currency != wallet.currency`` because that check has its
+            # own sentence: a US dollar amount sent to a naira wallet is a
+            # *mismatch*, which is the caller's typo, and would be told the
+            # wrong thing if this caught it first.
+            #
+            # **It is not a rule about ``Wallet``, which is why it is not in
+            # ``Wallet``.** A wallet holding USD is a perfectly good wallet: it
+            # is a container, it holds pots and plans, and ``WalletService`` can
+            # credit it directly without any rail being involved. What is
+            # impossible is a *collection* for it, and that is a fact about this
+            # door. Putting the rule in the aggregate would say the domain knew
+            # what a payment provider can do, and it does not.
+            #
+            # Asked of the provider rather than of a constant here, so that
+            # "which currencies can this account collect" has one home - the
+            # adapter that has to honour it. See
+            # ``PaymentProvider.supported_currencies``.
+            collectable = self._provider.supported_currencies()
+            if wallet.currency not in collectable:
+                raise CurrencyNotCollectableError(
+                    f"this wallet holds {wallet.currency.value}, and this "
+                    f"installation can only collect deposits in "
+                    f"{_sorted_names(collectable)}; the wallet is still usable "
+                    f"for everything on this side of the rail"
+                )
 
             # Read through the actor rather than through the wallet, and the
             # distinction is the same one ``get_owned`` above makes: the wallet
@@ -259,3 +326,22 @@ class InitiateDeposit:
             uow.rollback()
 
         return reference, user.email
+
+
+def _sorted_names(currencies: frozenset[Currency]) -> str:
+    """A set of currencies as a readable list, for the sentence a caller reads.
+
+    Sorted, and that is the whole of why it is a function rather than an f-string
+    at the raise site. A ``frozenset`` has no order, so a message built by
+    iterating one names the same currencies in a different order on different
+    runs - and a sentence that changes while nothing has changed is one a reader
+    learns to distrust, which is the last thing a refusal wants. Sorted by the
+    currency's own code rather than by insertion, so it does not depend on how
+    the set was built either.
+
+    Local rather than shared with the adapter's own version of this line, and the
+    duplication is deliberate: this layer may not import from
+    ``app.infrastructure``, and the alternative - a domain helper that exists to
+    format a message - would put prose in the one layer that has none.
+    """
+    return ", ".join(sorted(currency.value for currency in currencies))

@@ -15,10 +15,17 @@ take a real person's money and have nowhere to put it. The test for that asserts
 the provider's ``requests`` list is empty, because "it raised" and "it never
 called out" are different claims and only the second one is the point.
 
-**One refusal is about the characters in the key itself**, and it is the newest
-one in this file - a real provider is what taught it. The reference built here is
-also the idempotency key Paystack is handed, and their alphabet is narrower than
-a Python string's; see ``TestAKeyTheProviderWouldRefuse`` for the bug that cost.
+**One refusal is about the characters in the key itself**, and a real provider is
+what taught it. The reference built here is also the idempotency key Paystack is
+handed, and their alphabet is narrower than a Python string's; see
+``TestAKeyTheProviderWouldRefuse`` for the bug that cost.
+
+**The newest refusal is about the rail rather than about the request**, and it is
+the one this file's ``CurrencyMismatchError`` test sits next to rather than
+duplicates. A wallet may be opened in any of five currencies; the rail collects
+in particular ones; ``TestACurrencyTheRailCannotCollect`` is the meeting of the
+two, and it is deliberately the newer of a pair of refusals that read alike -
+which is why the ordering between them is pinned rather than assumed.
 
 **Every test here seeds a user row**, and that is a consequence of a design
 decision rather than an inconvenience. The email the provider requires is read
@@ -58,6 +65,7 @@ from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.payments.exception import (
+    CurrencyNotCollectableError,
     DepositAlreadyInitiatedError,
     PayerEmailMissingError,
     PayerEmailRefusedError,
@@ -514,6 +522,164 @@ class TestTheRefusals:
             service.execute(wallet.wallet_id, Money(5000, USD), "invoice-7")
 
         assert provider.requests == []
+
+
+class TestACurrencyTheRailCannotCollect:
+    """The guard, and the two orderings that decide what a caller is told.
+
+    **This is the refusal that stops a payer's money being taken against a row
+    that can never settle.** A wallet may be opened in any of five currencies and
+    the rail is enabled for particular ones; without this check the collection
+    goes out carrying the amount's number and NGN, the payer pays in naira, and
+    ``SettlePayment`` - which compares what arrived against what the row asked
+    for - refuses for ever. Nothing is credited and the reconciler reports the
+    same disagreement on every run.
+
+    It is refused here rather than at wallet creation, and the reason is that a
+    wallet is a container rather than a collection: one holding dollars still
+    holds pots, still runs plans, and can still be credited directly by
+    ``WalletService`` without any rail being involved. What is impossible is a
+    *collection* for it, and that is a fact about this door. Those three
+    properties are asserted elsewhere in the suite - the USD wallets opened in
+    ``test_plans.py`` and ``test_cli_plans.py`` - and their staying green is the
+    assertion that creation was not restricted along with the rail.
+    """
+
+    def test_a_wallet_the_rail_cannot_collect_is_refused_before_calling_out(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """**The empty ``requests`` list is the whole point, again.**
+
+        The amount matches its wallet, so nothing above this check objects. What
+        refuses it is the meeting of the wallet's currency and the rail's - and
+        the payer is never sent to a payment page to find out.
+        """
+        wallet = build_wallet(currency=USD)
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(CurrencyNotCollectableError):
+            service.execute(wallet.wallet_id, Money(5000, USD), "invoice-7")
+
+        assert provider.requests == []
+        assert rows(factory, wallet) == []
+
+    def test_the_rail_is_asked_rather_than_assumed(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """**The test that separates asking the rail from hard-coding NGN.**
+
+        Against a provider that only ever collects naira, "the door asked" and
+        "the door assumed" are the same behaviour and no assertion can tell them
+        apart - so the provider is built enabled for dollars, and the same wallet
+        that was refused a moment ago now gets through. That is the difference
+        the whole port method exists for: the set has one home, and this is what
+        proves the door is reading it.
+
+        **The amount and the opening balance are both read off the limits table,
+        and that is not fussiness.** A dollar wallet's ceiling is a tenth of a
+        naira one - 3,000 against 50,000 for an unverified account - so the 5,000
+        the test above deposits would be refused one check *later* by the ceiling,
+        and this test would fail for a reason that has nothing to do with the
+        rail. The wallet below is what a passing guard looks like: small enough
+        to be within its limits, and admitted only because the provider was asked.
+        """
+        amount = limits_for(Tier.UNVERIFIED, USD).max_balance.amount / 2
+        wallet = build_wallet(currency=USD, available="0")
+        provider = build_payment_provider(currencies=frozenset({USD}))
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        service.execute(wallet.wallet_id, Money(amount, USD), "invoice-7")
+
+        assert [r["amount"] for r in provider.requests] == [Money(amount, USD)]
+        assert len(rows(factory, wallet)) == 1
+
+    def test_the_amount_is_weighed_against_the_wallet_before_the_rail(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The ordering, and the wrong sentence it prevents.
+
+        A naira wallet sent a dollar amount is a *mismatch* - the caller's typo,
+        and something they can correct. The rail can collect naira perfectly
+        well, so the currency guard has nothing to say about this request; if it
+        were asked first it would answer with a sentence about what this
+        installation supports, which is true and beside the point. Two refusals
+        that read alike are the reason ``errors`` keeps a separate name for each,
+        and this is where the order that keeps them apart is pinned.
+        """
+        wallet = build_wallet(currency=NGN)
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(CurrencyMismatchError):
+            service.execute(wallet.wallet_id, Money(5000, USD), "invoice-7")
+
+    def test_a_closed_wallet_answers_with_its_closure_and_not_its_currency(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The other edge of the same ordering, and the more actionable refusal.
+
+        A wallet can be both closed and in a currency the rail cannot collect. A
+        closed wallet is the one with a remedy - give up on it and open another -
+        while a currency the rail cannot collect has none at all, so the caller
+        is told the fact they can act on. This is the same reasoning that puts
+        401 above 404 in ``errors``: identity first, because everything after it
+        is answered about somebody who has been established.
+        """
+        wallet = build_wallet(currency=USD, status=WalletStatus.CLOSED)
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(WalletClosedError):
+            service.execute(wallet.wallet_id, Money(5000, USD), "invoice-7")
+
+    def test_the_refusal_names_the_currency_and_what_can_be_collected(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """A remedy, not just a refusal.
+
+        "This wallet holds USD" tells a caller what they already know. Naming the
+        currencies the installation *does* collect is what turns the sentence
+        into one somebody can act on - open a wallet in one of those - and it is
+        built from the set the refusal was decided against, so the two cannot
+        disagree. Sorted, because the set it comes from has no order and a
+        message that reorders itself between runs is one a reader stops trusting.
+        """
+        wallet = build_wallet(currency=USD)
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(CurrencyNotCollectableError) as raised:
+            service.execute(wallet.wallet_id, Money(5000, USD), "invoice-7")
+
+        assert "USD" in str(raised.value)
+        assert "NGN" in str(raised.value)
+
+    def test_a_naira_wallet_is_unaffected(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The control, without which every test above passes on a door that
+        refuses everything.
+
+        Worth its four lines: the change this guards is one that adds a refusal
+        to a path that mostly works, and the failure mode of getting it wrong is
+        not a missed refusal but a deposit route that no longer opens a
+        collection at all.
+        """
+        wallet = build_wallet(currency=NGN)
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")
+
+        assert len(provider.requests) == 1
+        assert len(rows(factory, wallet)) == 1
 
 
 class TestTheSameKeyTwice:

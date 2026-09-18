@@ -12,8 +12,9 @@ webhook that names a reference nobody has heard of, an event that arrives twice,
 an amount that disagrees with the row - none of those is an error, because none
 of them is a failure of anything. They are *reports* that the system handles and
 answers with a 200, and they are modelled as values (``SettlePayment``'s result)
-rather than as exceptions. What is left for this module is the one thing that
-genuinely cannot proceed: the provider itself refusing a call.
+rather than as exceptions. What is left for this module is the two things that
+genuinely cannot proceed: the provider refusing a call, and this side refusing to
+make one.
 """
 
 from app.domain.money.exception import MoneyError
@@ -115,6 +116,44 @@ class PayerEmailMissingError(PaymentError):
     A 400 by falling through ``errors._grade``, like every other refusal this
     domain makes: what is wrong is the account the caller is asking on behalf of,
     and it is theirs to change.
+    """
+
+
+class CurrencyNotCollectableError(PaymentError):
+    """This wallet holds a currency the payment rail cannot collect in.
+
+    **The first refusal here that is ours rather than the provider's, and the
+    distinction is the whole of why it is a name instead of a
+    ``PaymentProviderError``.** That one reports something the far end did; the
+    other names in this module are facts about the account this side holds. This
+    one is this side reading a fact the *rail* supplied - ``supported_currencies``
+    - and refusing on it, so nothing has been sent and no payer has been anywhere.
+    The remedy belongs to whoever holds the wallet rather than to whoever answers
+    the phone at Paystack.
+
+    **It belongs to the payments tree rather than beside ``WalletClosedError``**,
+    which is the other refusal shaped like it. A closed wallet is the money
+    domain's own statement about a wallet; this is a statement about the meeting
+    of a wallet and a *rail*, and the money domain has no opinion about what a
+    rail can collect - it holds five currencies happily and is right to. Filing
+    this beside ``CurrencyMismatchError`` would say the domain knew, and it does
+    not. See ``PaymentProvider.supported_currencies``.
+
+    **A 409, and the two neighbours it is worth ruling out.** Not a 400: the
+    request is well formed, the wallet is the caller's, and there is nothing in
+    it to correct - telling a client to fix a good request is the mistake
+    ``errors`` already argues against for a wallet that does not exist. Not a
+    503: this installation serves deposits perfectly well, and a client that read
+    one here would take the whole installation offline over a single wallet. 409
+    because the wallet exists and *its own state* refuses this, which is exactly
+    the row ``WalletClosedError`` sits on.
+
+    **And it is deliberately not a refusal at wallet creation.** A wallet in a
+    currency this rail cannot collect is still a wallet - it can be funded
+    directly, it can hold pots and plans, and a second rail or an account enabled
+    for a second currency changes nothing about it. What cannot happen is a
+    *collection* for it, which is a fact about one door rather than about the
+    wallet, so it is refused at that door.
     """
 
 

@@ -4737,6 +4737,162 @@ trip if the difference is visible at all. What the limit does is make the attack
 slow and leave a trace rather than make it impossible, so the follow-up is owed and
 nothing about this slice should be read as having paid it.
 
+### Collecting in the currency the wallet holds
+
+Second on the MVP list, and the first finding of the entry-point audit to be closed.
+`PaystackPaymentProvider` sent `_subunit(amount)` - a *number* derived from the `Money` -
+beside `"currency": SUPPORTED_CURRENCY`, a hard-coded `"NGN"`. One payload, two
+decisions, and nothing connecting them.
+
+**233. The correction to the record comes first, because it changes what the fix is
+for.** The audit entry struck through below says a USD wallet depositing
+`Money(100, USD)` posts `{"amount": 10000, "currency": "NGN"}` and that "the ledger row
+credits the wallet with the amount it *intended*". The first half is right and the second
+is not, and the difference is the whole shape of the bug. What actually happens:
+
+- `settle_payment.py:97` is `if row.amount != outcome.amount`, and it refuses to move
+  anything.
+- `routes/webhooks.py` reads the outcome's currency off `data["currency"]` - the field
+  the *provider* reports, which says `"NGN"` because that is what was sent.
+
+So the row asks for `Money(100, USD)`, the webhook reports `Money(100, NGN)`, the two
+disagree, and `SettlementOutcome.AMOUNT_DISAGREES` comes back with the row left PENDING.
+**The payer is charged ₦100 and nothing is ever credited** - not the intended amount, not
+the wrong one. And because the row stays PENDING, the reconciler re-reports the same
+disagreement on every run, which the entry below already describes as reporting "for ever
+rather than resolving it". Both halves of the audit's sentence were wrong in the same
+direction: "a hundredth" read the kobo factor as a hundredth of *value*, and "credits the
+wallet" credited a ledger that in fact refuses. It is struck through rather than edited,
+per this file's habit, because the correction is the interesting part of it.
+
+**234. The guard goes at the deposit door, and that is a deliberate departure from where
+the checklist put it.** The order entry said "one check at wallet creation". Creation is
+the wrong door, for three reasons, and the first is decisive:
+
+- **A USD wallet is fundable today, by a path that works.** `WalletService.deposit` (into
+  `DepositMoney`) credits a wallet directly with no provider in the room, and the CLI's
+  root `deposit` verb is exactly that door. Restricting creation would close a working
+  door in order to close a broken one.
+- **"We cannot *hold* USD" and "we cannot *collect* USD" are different claims.** `Money`
+  accepts five currencies, `tier.py` carries a limits row for each, and pots and plans
+  work in each. Only the rail is naira-only.
+- **It would make a live property untestable.** `test_plans.py:327` and
+  `test_cli_plans.py:364,1492` each open a USD wallet to prove that amounts are read in
+  the *wallet's* currency rather than the request's, which is the only end-to-end way to
+  have a second currency at all. Those three tests are unchanged, and **their staying
+  green is the assertion that creation was not restricted** - a claim no test written for
+  this slice could make as directly.
+
+So the refusal lives in `InitiateDeposit._prepare`, the last moment at which refusing
+costs nobody anything, in the same door the closed-wallet and balance-cap checks already
+stand in.
+
+**235. The port gained a fourth method, and it is not the `initiate_transfer` mistake.**
+`PaymentProvider.supported_currencies() -> frozenset[Currency]`, abstract. The port's own
+docstring argues that `initiate_transfer` is deliberately absent because its signature
+"would have been guessed", so a fourth method is the kind of thing that needs a reason
+rather than an assertion. The reason is the test the third method already passes: **it
+has a caller that exists today** - the deposit door, which must refuse *before* it sends
+a payer to a payment page - and a signature *derived* from that caller rather than
+imagined. The alternative was a copy of the fact in the application layer, and **a copy
+is a thing that drifts**, in the one direction that matters: the door would admit a
+currency the transport silently relabels.
+
+**236. `_from_subunit` had to move with `_subunit`, and that is forced rather than scope
+creep.** Once a collection can legitimately be opened in USD, the verify response comes
+back saying `"currency": "USD"` - and a `_from_subunit` that parsed every answer as NGN
+would make reconciliation refuse a perfectly good row, which is this same bug with the
+sign flipped. The two directions of one conversion are one decision, so the currency
+became a parameter of both; `outcome_for` reads `data["currency"]` - the same field
+`routes/webhooks.py` already reads - and a value `Currency(...)` does not know is
+translated into `InvalidProviderAnswerError` rather than escaping as a bare `ValueError`
+and reporting as a 500.
+
+**What the suite found, and it is the argument for that paragraph rather than a footnote
+to it.** The first full run after the change was 3,202 passed and **3 failed**, all three
+in `test_cli_reconcile.py` and all three with the same stdout line: *"could not ask: the
+provider reported a settled charge with no currency"*. The cause was not the adapter but
+the double - `AnsweringPaystack` answers a verify lookup with the fields the adapter
+*reads*, and its docstring said so in as many words ("the two fields the adapter reads"),
+which is why it went red the moment a third one was added. That is a double behaving
+exactly as a double should: it fails here rather than silently disagreeing with the far
+end. **The tempting fix is the wrong one** - defaulting a missing currency to NGN would
+have restored the original bug in a quieter form, and the refusal is the whole point. So
+the double gained a `currency` field and a paragraph recording why. Worth writing down
+because the three failures were the *precise* mirror of decision 236's prediction, found
+by a run rather than by the reading that produced the prediction - and because a
+reconciler refusing good rows for ever is the same failure this slice exists to close,
+one door over.
+
+**237. The supported set is a constructor argument rather than a settings value, and the
+reason is that the alternative is untestable.** `PaystackPaymentProvider(secret_key,
+timeout, *, currencies=SUPPORTED_CURRENCIES)` - a per-deployment fact of the same kind as
+the key itself, and a `frozenset`, so it is not a shared-mutable hazard. Against a
+provider that only ever collects naira, "the door asks the rail" and "the door hard-codes
+NGN" are the *same behaviour*, and no assertion can tell them apart; building one that
+collects two is what makes the question askable at all, and that is what
+`test_the_rail_is_asked_rather_than_assumed` does. A settings value was the other
+candidate and is rejected for the reason this file keeps giving: it would state the same
+fact twice - once in configuration, once in the adapter that has to honour it - and the
+two would disagree the first time somebody enabled a currency at the provider and forgot
+the setting.
+
+**238. 409, and the two grades it is not.** Not 400: the request is well formed and there
+is nothing in it for the caller to fix. Not 503: this installation serves deposits
+perfectly well against a wallet in the currency it collects. What refuses *this* request
+is the wallet's own state, which is the shape the error table describes for 409 and the
+row `WalletClosedError` already sits on. `CurrencyNotCollectableError` is filed in the
+payments tree rather than beside `WalletClosedError`, because the money domain has no
+opinion about what a rail can collect and filing it there would say it did.
+
+**239. The currency guard sits between two refusals that were already there, and each
+edge is load-bearing.** It sits after the wallet's own `CLOSED` check and after
+`amount.currency != wallet.currency`, and both edges were chosen:
+
+- After `CLOSED` because a closed wallet is the refusal with a *remedy* - give up on it
+  and open another - while a currency the rail cannot collect has none, and answering the
+  actionable fact first is the ordering `errors` already uses to put 401 above 404.
+- After the mismatch check because that one has its own sentence: a dollar amount sent to
+  a naira wallet is the caller's typo and is correctable, and it would be told the wrong
+  thing if the rail's answer arrived first.
+
+`test_the_amount_is_weighed_against_the_wallet_before_the_rail` and
+`test_a_closed_wallet_answers_with_its_closure_and_not_its_currency` pin the two edges,
+because a test that asserted only "it refuses" would pass with the branches reordered.
+The refusal names both the wallet's currency and the ones this installation *does*
+collect, because the first half tells a caller what they already know and the second is
+the half they can act on.
+
+**Verified against a socket, and the two answers are the pair that makes it a
+verification.** One `uvicorn` process, one throwaway key, a wallet in each currency: the
+USD deposit answered **409 `CurrencyNotCollectableError`** with the sentence naming both
+the wallet's currency and the ones this installation collects, and with **no
+`authorization_url`** in the body; the NGN deposit on the same server at the same moment
+answered **400 `InvalidPaymentIntentError`** - the key being a throwaway, so Paystack
+refused it at the far end. Same process, same configuration, same instant: one path
+contacted the rail and the other did not. That is the guard proved to run *before* the
+call rather than after it, which is the one thing a test asserting `requests == []`
+against an in-process double cannot say on its own. The second call is also the control
+the first needs - a guard that refused everything would produce the 409 and nothing else,
+and the 400 is what says the door still opens for a currency the rail collects.
+
+**What this does not close.** Four things, named rather than left to be inferred:
+
+- **Rows already stuck PENDING from this bug are not migrated.** After this change no new
+  one can be created; the old ones go on being reported by the reconciler. What to do with
+  money that was collected against a row that can never settle - refund it, credit it at
+  the rate it arrived at, or write it off - is a policy question with a refund policy
+  attached, and it belongs to the item that builds the reconciler's first remedy rather
+  than to a currency guard.
+- **The reconciler still re-asks for ever about a row that can never agree.** Adjacent,
+  separate, and already recorded in `### Still open`.
+- **Wallet creation stays unrestricted**, deliberately, for the three reasons in 234. A
+  wallet this rail cannot collect is still creatable and can still be funded by
+  `WalletService.deposit` and by any future rail.
+- **Payouts are untouched.** `initiate_transfer` is deliberately not on the port, so there
+  is no outbound rail for a destination or a payout currency to be checked against. When
+  one exists, this is the decision it will have to answer to.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**
@@ -4772,7 +4928,7 @@ nothing about this slice should be read as having paid it.
   the door accept, and what refuses it later* - with no code changed. The six
   findings, and the honest state of each:
 
-  - **A wallet's currency is never checked against the provider's.** `Currency`
+  - ~~**A wallet's currency is never checked against the provider's.** `Currency`
     has five members (`NGN`, `USD`, `GHS`, `KES`, `EUR`) and `Currency(x)` is the
     whole of the check at `Money.__post_init__`; `PaystackPaymentProvider`
     forwards `"currency": SUPPORTED_CURRENCY` at
@@ -4782,13 +4938,28 @@ nothing about this slice should be read as having paid it.
     and depositing `Money(100, USD)` posts `{"amount": 10000, "currency": "NGN"}`,
     which Paystack reads as one hundred naira. The payer is charged a hundredth of
     what the wallet believes it holds, and the ledger row credits the wallet with
-    the amount it *intended*: the two ends disagree and neither is told. The one
-    place the wallet's currency meets anything is `initiate_deposit.py:164`, and
-    that compares the amount to the *wallet*, not to the provider. The constant's
-    own comment says it is "deliberately the only one it will send" and predicts
-    this: it is a statement about what has been verified, not a check. A wallet in
-    any of the other four currencies is creatable today, and its deposits are wrong
-    at the far end in a way nobody is told about.
+    the amount it *intended*: the two ends disagree and neither is told.~~ **Closed
+    - and the sentence above was wrong about what it cost, which is corrected here
+    rather than quietly dropped.** The posting is described correctly; the
+    consequence is not. `settle_payment.py:97` is `if row.amount != outcome.amount`
+    and it refuses to move anything, and `routes/webhooks.py` reads the outcome's
+    currency off `data["currency"]` - the provider's own field, which says `"NGN"`
+    because that is what was sent. So the row asks for `Money(100, USD)`, the
+    webhook reports `Money(100, NGN)`, `SettlementOutcome.AMOUNT_DISAGREES` is
+    returned and the row stays PENDING: **the payer is charged ₦100 and nothing is
+    ever credited**, neither the intended amount nor the wrong one. Both halves of
+    the struck sentence were wrong in the same direction - "a hundredth" read the
+    kobo factor as a hundredth of *value*, and "credits the wallet" credited a
+    ledger that in fact refuses. The guard is at the deposit door rather than at
+    wallet creation, for the reasons in decision 234. See decisions 233-239.
+
+    The audit's own closing claim stands and is worth keeping: "A wallet in any of
+    the other four currencies is creatable today, and its deposits are wrong at the
+    far end in a way nobody is told about." The first half is still true, and
+    deliberately so - what changed is that the deposits are now refused rather than
+    wrong. The one place the wallet's currency met anything was
+    `initiate_deposit.py:164`, and that compared the amount to the *wallet*; the
+    second place is the line added beside it.
   - **The payout rail has no later refusal because it has no earlier or later
     anything.** `Destination` requires `bank_code` for a `BANK_ACCOUNT`
     (`destination.py:18`), which is a floor and not a ceiling, and the identifier

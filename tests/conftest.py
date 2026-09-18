@@ -31,6 +31,7 @@ from app.domain.identity.password import PlainPassword
 from app.domain.identity.password_hasher import PasswordHasher
 from app.domain.identity.user import User
 from app.infrastructure.payments.paystack_payment_provider import (
+    SUPPORTED_CURRENCIES,
     PaystackPaymentProvider,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
@@ -1158,9 +1159,10 @@ class FakePaymentProvider(PaystackPaymentProvider):
     Those two reimplement their ports from scratch because the real
     implementations cost something a test cannot pay - argon2 is slow by design,
     and SMTP needs a server - so there is nothing to inherit. Here the real
-    adapter has three halves and only one of them can hurt: the two that make a
-    request open a socket, and ``verify_signature`` is pure HMAC over bytes with
-    no I/O anywhere in it.
+    adapter has four methods and only two of them can hurt: those two make a
+    request and therefore open a socket, while ``verify_signature`` is pure HMAC
+    over bytes and ``supported_currencies`` returns a field the adapter was
+    constructed with. Neither has any I/O in it anywhere.
 
     So the choice is between a fake that reimplements HMAC-SHA512 and one that
     *is* the adapter's verification with the network calls stubbed out. The first
@@ -1175,7 +1177,7 @@ class FakePaymentProvider(PaystackPaymentProvider):
     would have sent the whole API suite to the network the day it was written.
     The rule that keeps this honest is the one this class has always followed -
     **every method that leaves the process is replaced here, and every method
-    that is pure is inherited** - which is now two and one rather than one and
+    that is pure is inherited** - which is now two and two rather than one and
     one.
 
     What the replacement keeps is the contract: a reference in, a ``PaymentIntent``
@@ -1220,6 +1222,16 @@ class FakePaymentProvider(PaystackPaymentProvider):
         A queue consumed per call would work too, but it would say "the second
         lookup fails" when the test means "dep-2 fails", and those stop being the
         same sentence the moment the ordering changes.
+
+    ``currencies`` is forwarded to the adapter rather than reimplemented, and it
+    is a constructor argument rather than a method overridden here - which is the
+    distinction the rule above turns on. ``supported_currencies`` **leaves the
+    process in no sense at all**: it returns a field the adapter was built with,
+    so it is inherited here exactly as the real one is, and a test that wants a
+    double enabled for dollars builds one rather than overriding anything. That
+    matters because the alternative is untestable: against a provider that only
+    ever collects naira, "the door asks the rail" and "the door hard-codes NGN"
+    are the same behaviour, and no assertion can tell them apart.
     """
 
     def __init__(
@@ -1228,8 +1240,9 @@ class FakePaymentProvider(PaystackPaymentProvider):
         failures=(),
         provider_reference: str | None = None,
         answers=None,
+        currencies: frozenset[Currency] = SUPPORTED_CURRENCIES,
     ):
-        super().__init__(secret_key=secret_key)
+        super().__init__(secret_key=secret_key, currencies=currencies)
         self.requests: list = []
         self.lookups: list = []
         self._failures = list(failures)
@@ -1288,6 +1301,7 @@ def build_payment_provider():
         build_payment_provider(failures=[PaymentProviderError("down")])
         build_payment_provider(secret_key="sk_test_other")     # a key nothing signs with
         build_payment_provider(answers={"dep-1": an_answer})   # what a lookup says
+        build_payment_provider(currencies=frozenset({USD}))    # enabled for dollars
     """
 
     def _build(**kwargs) -> FakePaymentProvider:

@@ -55,21 +55,37 @@ AS_OF = "2026-01-02T12:00"
 class AnsweringPaystack:
     """Stands in for ``httpx.request``, so this file never opens a socket.
 
-    Answers one charge, described by the two fields the adapter reads: its status
-    and its amount in kobo. Everything else about the response is trimmed away on
-    purpose - a double carrying fields nothing reads would let a test believe it
-    had covered something it had not.
+    Answers one charge, described by the three fields the adapter reads: its
+    status, its amount in kobo, and the currency the charge was taken in.
+    Everything else about the response is trimmed away on purpose - a double
+    carrying fields nothing reads would let a test believe it had covered
+    something it had not.
+
+    **That description is why the currency is here, and it was not always.** The
+    double used to answer with two fields, because the adapter used to read two:
+    it took the amount off the response and the currency from a constant of its
+    own. The constant was the bug - a settled charge was read back in a currency
+    nobody had said it was in - so the adapter reads the response's own now, and
+    this file went red the moment it did. Which is the shape a double is supposed
+    to have: it carries what the thing it stands in for actually reads, so a
+    reader that starts reading something new fails here rather than silently
+    disagreeing with the far end.
 
     Records the method and the URL, because "this command asked about the right
     reference" is a claim worth being able to make from a test that is otherwise
     about the command existing.
     """
 
-    def __init__(self, charge="success", amount=500000):
+    def __init__(self, charge="success", amount=500000, currency="NGN"):
         self.calls: list[dict] = []
         self.body = {
             "status": True,
-            "data": {"status": charge, "amount": amount, "reference": "dep-1"},
+            "data": {
+                "status": charge,
+                "amount": amount,
+                "currency": currency,
+                "reference": "dep-1",
+            },
         }
 
     def __call__(self, method, url, **kwargs):
