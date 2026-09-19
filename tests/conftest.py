@@ -1118,6 +1118,14 @@ class RecordingTransactionRepository(TransactionRepository):
         # through a real unit of work, where the row is one row.
         raise NotImplementedError
 
+    def pending_credit_total(self, wallet_id, currency):
+        # The port's second aggregate, and the reason above applies to it
+        # unchanged: the snapshots would count one deposit twice. It is declared
+        # for the blunter reason too - an abstract method with no implementation
+        # here makes this class un-instantiable, which is how every test that
+        # uses the fixture would fail rather than the tests that need the read.
+        raise NotImplementedError
+
 
 @pytest.fixture
 def recording_transactions():

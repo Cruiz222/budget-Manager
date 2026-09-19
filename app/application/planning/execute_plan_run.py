@@ -169,6 +169,14 @@ class ExecutePlanRun:
         door a balance check cannot see. So a frozen wallet blocks any run that
         sends value out, and permits one that only reshuffles.
 
+        **The currency is checked before either of the money questions**, and
+        that is a third instance of the same rule rather than a new one. A plan
+        whose money is in a currency its wallet does not hold cannot be reasoned
+        about at all: the two methods below would each raise trying to compare
+        amounts that ``Money`` refuses to compare. So the question that *can* be
+        answered is asked first, and the ones that cannot are never reached. See
+        ``_currency_block``.
+
         **The tier ceilings are checked before the balance**, and the order is
         the advice - the argument ``_money_block`` already makes for putting
         maturity ahead of money. A run that breaches a ceiling cannot be helped
@@ -183,11 +191,52 @@ class ExecutePlanRun:
         if wallet.status is WalletStatus.FROZEN and self._sends_value_out(plan):
             return RunBlockReason.WALLET_FROZEN
 
+        blocked_for_a_currency = self._currency_block(plan, wallet)
+        if blocked_for_a_currency is not None:
+            return blocked_for_a_currency
+
         blocked_for_a_limit = self._limit_block(uow, plan, wallet, as_of)
         if blocked_for_a_limit is not None:
             return blocked_for_a_limit
 
         return self._money_block(plan, wallet, as_of)
+
+    @staticmethod
+    def _currency_block(
+        plan: SavingsPlan, wallet: Wallet
+    ) -> RunBlockReason | None:
+        """Whether this plan's money is in a currency its wallet cannot hold.
+
+        **This asks the question rather than letting arithmetic raise it, and
+        that is the whole change.** The mismatch was always *detected* - both
+        methods below compare a plan's money against the wallet's, and ``Money``
+        refuses arithmetic across two currencies - but it was detected as an
+        exception, which propagated out of ``ExecutePlanRun``, out of the loop
+        in ``RunDuePlans``, and killed the tick. Every plan after the bad one in
+        that pass did not run, so a single bad edit was a denial of service on
+        every other user's savings.
+
+        **So it is a block, and it is checked first.** First because it is the
+        cheapest question here - two attribute reads and no query - and because
+        the check has to precede the two methods that would otherwise raise on
+        their way to answering something else. ``_limit_block`` cannot answer
+        anything about a mismatched plan: its first arithmetic is
+        ``running + instruction.amount`` across two currencies, which raises.
+        The same is true of ``_money_block``'s balance comparison. Neither is
+        wrong; both simply cannot be the thing that decides a plan they cannot
+        do arithmetic on.
+
+        **A static method because it needs no unit of work**, and that is worth
+        noticing rather than being a style choice: the rule is about two loaded
+        aggregates and nothing else, which is why ``PlanService`` can hold the
+        same rule one door over with no query either. The two are deliberately
+        not shared code - the application service raises and this blocks, which
+        is the correct difference between an edit that has not happened yet and
+        a run that is being judged.
+        """
+        if plan.total_to_move.currency is not wallet.currency:
+            return RunBlockReason.CURRENCY_MISMATCH
+        return None
 
     @staticmethod
     def _sends_value_out(plan: SavingsPlan) -> bool:
@@ -238,13 +287,17 @@ class ExecutePlanRun:
         not at all - so a release-only plan is judged by nothing here, exactly as
         it faces no ceiling when a person types it.
 
-        **This method cannot be the first thing to fail on a plan whose amounts
-        are in another currency.** ``Money`` refuses arithmetic across two
-        currencies, so ``_money_block`` below raises on such a plan too - the
-        pre-existing loud failure the README records. Running the limit check
-        first does not create it: it is the same plan, refused by the next method
-        instead of this one. What this method cannot do is swallow it, which is
-        why the ``except`` below names one class and not ``MoneyError``.
+        **A plan whose money is in another currency never reaches this method.**
+        ``_currency_block`` runs before it and returns a block, so the arithmetic
+        below is always between two amounts of one currency. That ordering is
+        load-bearing rather than tidy: ``Money`` refuses arithmetic across two
+        currencies, so before ``_currency_block`` existed, this method's first
+        ``running + instruction.amount`` raised on a mismatched plan - and an
+        exception here is not a block, it is the end of the whole tick. The
+        ``except`` below still names one class rather than ``MoneyError``, and
+        that is now doubly right: it is a net for the tier refusal, and it is
+        deliberately not a net for the currency one, which is why the currency
+        check was given its own answer above instead of being caught here.
         """
         if not self._sends_value_out(plan):
             return None

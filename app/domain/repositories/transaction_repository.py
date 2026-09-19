@@ -92,8 +92,10 @@ class TransactionRepository(ABC):
     ) -> Money:
         """How much value has left this wallet in ``[start, end)``, in ``currency``.
 
-        The read behind the daily outflow cap, and the only method on this port
-        that *aggregates* rather than returning rows. It returns a ``Money``
+        The read behind the daily outflow cap, and one of the two methods on this
+        port that *aggregate* rather than returning rows - ``pending_credit_total``
+        below is the other, and it is this method's mirror for the incoming
+        direction. It returns a ``Money``
         because that is what the rule compares - ``check_outflow`` adds the
         movement being attempted to this total and refuses if the sum is over the
         tier's ceiling - and a count of rows or a bare ``Decimal`` would leave the
@@ -149,5 +151,52 @@ class TransactionRepository(ABC):
         A wallet with nothing to count gets ``Money("0.00", currency)`` rather
         than ``None``: no outflow is a total of zero, not an absent answer, and
         the one caller adds a movement to it on every path.
+        """
+        pass
+
+    @abstractmethod
+    def pending_credit_total(self, wallet_id, currency: Currency) -> Money:
+        """How much is in flight *into* this wallet, in ``currency``.
+
+        The mirror of ``outflow_total_between``, and it exists for the same
+        reason that method counts ``PENDING`` rows - stated there as *"a cap that
+        ignored held money would let a burst of in-flight payouts each pass on
+        its own."* The balance cap had no equivalent for credits, so a burst of
+        in-flight **deposits** each passed on its own: every one of them read the
+        same untouched balance, every one fit under the ceiling, and all of them
+        settled. That is the same bypass, on the other side of the ledger, and it
+        is the side where the money has already left the payer.
+
+        **The filter is one rule: a row counts when its money is coming and has
+        neither arrived nor been given up on.** Concretely, ``DEPOSIT`` rows -
+        the only type that brings value in - whose status is ``PENDING``:
+
+        - ``PENDING`` counts, because a collection has been opened and the payer
+          may already be looking at a payment page. This is the whole point of
+          the read.
+        - ``SUCCESSFUL`` does not, because the money has arrived and is in the
+          wallet's balances, which the caller adds separately. Counting it here
+          would double it.
+        - ``FAILED`` does not, because the attempt is over and no money is
+          coming.
+        - ``REVERSED`` does not, for ``outflow_total_between``'s reason read the
+          other way: what is in flight is money that has not landed yet, and a
+          reversal is a finished fact about money that did.
+
+        ``LOCK_FUNDS`` and ``UNLOCK_FUNDS`` are excluded along with the rest
+        because they move value between the wallet's own two balances - the
+        balance cap counts what the wallet *holds*, and a pot is already held.
+
+        **No time window, unlike ``outflow_total_between``.** An outflow is
+        bounded by a day because its ceiling is a daily allowance; a pending
+        collection has no day - it is in flight until it settles or is
+        abandoned, whenever that is. Bounding it by a day would drop a payment
+        that has been waiting across midnight, which is exactly the row that
+        most needs counting.
+
+        The currency is a parameter for the reason the other method gives, and a
+        wallet with nothing in flight gets ``Money("0.00", currency)`` rather
+        than ``None``: nothing pending is a total of zero, and the caller adds it
+        to a movement on every path.
         """
         pass

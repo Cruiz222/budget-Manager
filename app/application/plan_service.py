@@ -157,11 +157,7 @@ class PlanService:
             # The aggregate has already guaranteed the instructions share one
             # currency, so asking the plan as a whole is enough - there is no
             # "which instruction" question left to ask.
-            if plan.total_to_move.currency is not wallet.currency:
-                raise CurrencyMismatchError(
-                    f"a plan in {plan.total_to_move.currency.name} cannot be "
-                    f"funded by a {wallet.currency.name} wallet"
-                )
+            self._refuse_foreign_currency(plan, wallet)
 
             uow.plans.save(plan)
             uow.commit()
@@ -244,11 +240,58 @@ class PlanService:
         construction, so this method adds nothing but the transaction. That is
         the point: the rule about what a plan's instructions may be lives in one
         method, and both doors call it.
-        """
-        def edit(plan: SavingsPlan) -> None:
-            plan.edit_instructions(instructions)
 
-        return self._apply(plan_id, edit)
+        **And the rule the aggregate cannot hold is re-applied here**, which is
+        the half this method used to be missing. The aggregate's rules span one
+        aggregate; "this plan's money is in the currency this wallet holds"
+        spans two, and ``create_plan`` was the only door that ever checked it.
+        So an edit was the way to turn a payable plan into an unpayable one -
+        and the damage was not confined to the plan that was edited. Nothing
+        refused the edit, and nothing then refused the *run*: the tick raised
+        out of ``ExecutePlanRun`` rather than blocking the one plan, so a single
+        bad edit stopped every plan after it in that pass. The door is what this
+        closes; ``RunBlockReason.CURRENCY_MISMATCH`` is the other half, for the
+        plans an edit already put in that state.
+
+        The wallet is loaded *after* the edit rather than before, because the
+        check asks what the plan is about to become and not what it was. Both
+        writes stay in one unit, so a refusal leaves the plan exactly as it was
+        found: nothing is saved until the rule has passed, and the rollback
+        discards the in-memory edit along with everything else.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            plan = self._plan(uow, plan_id)
+            plan.edit_instructions(instructions)
+            self._refuse_foreign_currency(plan, self._wallet(uow, plan.wallet_id))
+            uow.plans.save(plan)
+            uow.commit()
+            return plan
+        except BaseException:
+            uow.rollback()
+            raise
+
+    @staticmethod
+    def _refuse_foreign_currency(plan: SavingsPlan, wallet: Wallet) -> None:
+        """Refuse a plan whose money is in a currency its wallet does not hold.
+
+        One method for two doors, because it is one rule spanning two aggregates
+        and a rule with two copies is a rule with two chances to be half-applied
+        - which is precisely how this was wrong. It lived inline in
+        ``create_plan`` and nowhere else, so the second door onto the same
+        invariant silently skipped it.
+
+        It takes a whole plan rather than a tuple of instructions because
+        ``SavingsPlan`` has already guaranteed every line shares one currency,
+        so asking the plan as a whole is enough: there is no "which instruction"
+        question left to ask, and a signature taking instructions would invite a
+        caller to re-derive a total this method already has.
+        """
+        if plan.total_to_move.currency is not wallet.currency:
+            raise CurrencyMismatchError(
+                f"a plan in {plan.total_to_move.currency.name} cannot be "
+                f"funded by a {wallet.currency.name} wallet"
+            )
 
     def _wallet(self, uow: UnitOfWork, wallet_id: uuid.UUID) -> Wallet:
         """The wallet this service's actor owns, or ``WalletNotFoundError``.

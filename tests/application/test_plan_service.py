@@ -215,6 +215,36 @@ class TestTheCurrencyRule:
         with pytest.raises(CurrencyMismatchError):
             create(service, factory, wallet.wallet_id, instructions=(payout("2000", NGN),))
 
+    def test_editing_onto_another_currency_is_refused(self, tmp_path, build_wallet):
+        """The door ``create_plan`` had and ``edit_instructions`` did not.
+
+        The rule spans two aggregates - a plan cannot see its wallet, and a wallet
+        has never heard of a plan - so it can only be checked by the layer that
+        loads both. ``create_plan`` did that; ``edit_instructions`` applied the
+        edit and saved, and the resulting plan could never run: ``Money`` refuses
+        arithmetic between two currencies, so the tick raised and took every plan
+        behind it down. Two fixes were needed and this is the first - see
+        ``TestAMismatchedPlanDoesNotStopTheTick`` for the second, which is what
+        happens to a mismatch already on disk.
+
+        ``PlanSource.AVAILABLE`` deliberately: a locked plan with a pot has the
+        committed-payout rule to satisfy, and this test is about the currency
+        rather than about the lines.
+        """
+        service, factory = build_service(tmp_path)
+        wallet = save_wallet(factory, build_wallet())
+        plan = create(service, factory, wallet.wallet_id, source=PlanSource.AVAILABLE)
+
+        with pytest.raises(CurrencyMismatchError):
+            service.edit_instructions(plan.plan_id, (payout("2000", USD),))
+
+        # Unchanged in the store, not merely unchanged in the object the caller
+        # was handed - which is the difference between "the edit was refused" and
+        # "the edit was saved and the caller was then told no".
+        assert service.get_plan(plan.plan_id).total_to_move == Money(
+            Decimal("2000"), NGN
+        )
+
     def test_a_refused_plan_leaves_nothing_behind(self, tmp_path, build_wallet):
         """The check runs *before* the save, so a refusal writes nothing.
 

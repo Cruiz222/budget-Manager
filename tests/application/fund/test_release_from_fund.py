@@ -241,10 +241,15 @@ def test_a_failed_release_can_be_retried_and_the_retry_succeeds(build_wallet):
 
     ``WalletOperation`` records the failure before re-raising and leaves the
     wallet exactly as it found it - so a caller who fixes whatever was wrong
-    (here, waiting) can simply call again with a *fresh* internal reference. The
-    new reference matters and is the point of the test: replaying the same one
-    would return the FAILED row instead of running, because the base class treats
-    a seen reference as already processed.
+    (here, waiting) can simply call again with a *fresh* internal reference.
+
+    **The fresh reference is not a style choice, it is the only door.**
+    Replaying ``attempt-1`` now raises ``ReferenceAlreadyRefusedError`` rather
+    than returning the FAILED row: the row is a refusal, not an outcome, and
+    handing it back would report a movement that never happened as one that did.
+    See ``test_a_refused_reference_cannot_be_replayed`` in
+    ``tests/application/test_refused_reference.py`` for that half, which is
+    asserted over all four operations that can reach it.
     """
     wallet = a_wallet_with_a_pot(build_wallet, balance="5000", maturity_date=DUE)
     repository = InMemoryTransactionRepository()

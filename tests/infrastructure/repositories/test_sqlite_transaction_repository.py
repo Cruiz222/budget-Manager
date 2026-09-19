@@ -582,3 +582,196 @@ def test_the_total_is_exact_over_many_small_movements(build_wallet):
 
     assert total == Money(Decimal("10.00"), NGN)
     assert total.amount == Decimal("10.00")
+
+
+# --- what is on its way in --------------------------------------------------
+#
+# The mirror of the section above, and the read the balance cap was missing. The
+# outflow total counted money already in flight while this one did not exist, so
+# a burst of deposits each read the same untouched balance, each fit under the
+# ceiling, and all of them settled. What follows is the filter that closes it.
+
+#: The same number of addends as the outflow exactness test, and the same
+#: reason: this is the test that fails if the sum is ever rewritten as
+#: ``SELECT SUM(amount)``.
+SMALL_CREDIT = Decimal("0.10")
+
+
+def credits(repository, wallet, **overrides):
+    """This wallet's money in flight, with the currency filled in."""
+    kwargs = dict(currency=wallet.currency)
+    kwargs.update(overrides)
+    return repository.pending_credit_total(wallet.wallet_id, **kwargs)
+
+
+def build_credit(wallet, **overrides):
+    """A deposit into ``wallet``, left PENDING as ``InitiateDeposit`` leaves it."""
+    kwargs = dict(
+        type=TransactionType.DEPOSIT,
+        amount=Money(Decimal("5000.00"), NGN),
+        created_at=MIDDAY,
+    )
+    kwargs.update(overrides)
+    return build_transaction(wallet, **kwargs)
+
+
+def test_a_wallet_with_nothing_in_flight_totals_zero(build_wallet):
+    """Zero rather than ``None``, and that is not a formality here.
+
+    The one caller adds this to a wallet's balances before comparing against the
+    cap, so an absent answer would make the cap's arithmetic conditional on a
+    deposit being open - and the ordinary case is that none is.
+    """
+    wallet = build_wallet()
+
+    total = credits(build_repository(wallet), wallet)
+
+    assert total == Money(Decimal("0.00"), NGN)
+    assert total.currency is NGN
+
+
+def test_a_pending_deposit_counts(build_wallet):
+    """The whole point of the read: the collection is open and the payer may be
+    looking at a payment page, so the money is coming even though it has not
+    arrived. This is the row a burst of deposits used to each read as absent."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    repository.save(build_credit(wallet))
+
+    assert credits(repository, wallet) == Money(Decimal("5000.00"), NGN)
+
+
+def test_a_settled_deposit_does_not_count(build_wallet):
+    """**The exclusions matter more than the inclusion**, and this is the first.
+
+    A settled deposit's money is *in* the wallet's balances, and the caller adds
+    those separately - so counting this row would count the same naira twice and
+    refuse a deposit that fits. The two halves are the same number read from two
+    places, and only one of them may be added.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    settled = build_credit(wallet)
+    settled.mark_successful()
+    repository.save(settled)
+
+    assert settled.status is TransactionStatus.SUCCESSFUL
+    assert credits(repository, wallet) == Money(Decimal("0.00"), NGN)
+
+
+@pytest.mark.parametrize("fate", ["failed", "reversed"])
+def test_a_deposit_that_is_not_coming_does_not_count(build_wallet, fate):
+    """Two ways for an attempt to be over, and neither is money still in flight.
+
+    A failure is a collection abandoned; a reversal is a deposit that landed and
+    was taken back, which is a finished fact about money the wallet no longer
+    holds. Neither is *coming*, which is the only thing this read is about.
+
+    The two are reached by different transitions - a failure from PENDING, a
+    reversal from SUCCESSFUL - because that is what the two facts are, and the
+    aggregate would refuse the other order for either.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    transaction = build_credit(wallet, amount=Money(Decimal("5000.00"), NGN))
+    if fate == "failed":
+        transaction.mark_failed()
+    else:
+        transaction.mark_successful()
+        transaction.reverse()
+    repository.save(transaction)
+
+    assert credits(repository, wallet) == Money(Decimal("0.00"), NGN)
+
+
+@pytest.mark.parametrize(
+    "transaction_type",
+    [TransactionType.WITHDRAWAL, TransactionType.LOCK_FUNDS, TransactionType.UNLOCK_FUNDS],
+)
+def test_money_leaving_or_moving_within_does_not_count(build_wallet, transaction_type):
+    """Only a deposit brings value in.
+
+    A withdrawal is value leaving - the balance cap faces inbound value and the
+    daily allowance faces this one - and a lock or a release moves money between
+    the wallet's own two balances, which changes what the wallet *holds* not at
+    all.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    transaction = build_transaction(
+        wallet,
+        type=transaction_type,
+        amount=Money(Decimal("4000.00"), NGN),
+        created_at=MIDDAY,
+    )
+    repository.save(transaction)
+
+    assert credits(repository, wallet) == Money(Decimal("0.00"), NGN)
+
+
+def test_a_deposit_waiting_across_midnight_still_counts(build_wallet):
+    """**There is no window here, unlike the outflow total, and the difference is
+    the ceiling.**
+
+    A daily allowance bounds one day, so its total is read between two bounds. A
+    balance cap has no day in it - and a collection that has been waiting since
+    last week is precisely the row that most needs to be counted, because its
+    money is the most likely to arrive next.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    repository.save(build_credit(wallet, created_at=datetime(2025, 6, 1)))
+    repository.save(build_credit(wallet, created_at=datetime(2027, 6, 1)))
+
+    assert credits(repository, wallet) == Money(Decimal("10000.00"), NGN)
+
+
+def test_another_wallets_in_flight_money_is_not_this_wallets(build_wallet):
+    wallet = build_wallet()
+    other = build_wallet(user_id=OTHER_USER_ID)
+    repository = build_repository(wallet)
+    SqliteWalletRepository(repository._connection).save(other)
+    mine = build_credit(wallet, amount=Money(Decimal("300.00"), NGN))
+    theirs = build_credit(other, amount=Money(Decimal("9000.00"), NGN))
+    for transaction in (mine, theirs):
+        repository.save(transaction)
+
+    assert credits(repository, wallet) == Money(Decimal("300.00"), NGN)
+    assert credits(repository, other) == Money(Decimal("9000.00"), NGN)
+
+
+def test_a_pending_deposit_in_another_currency_is_not_summed_in(build_wallet):
+    """The filter that makes a mixed total unrepresentable rather than wrong."""
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    repository.save(build_credit(wallet, amount=Money(Decimal("300.00"), NGN)))
+    repository.save(build_credit(wallet, amount=Money(Decimal("300.00"), Currency.USD)))
+
+    assert credits(repository, wallet) == Money(Decimal("300.00"), NGN)
+    assert credits(repository, wallet, currency=Currency.USD) == Money(
+        Decimal("300.00"), Currency.USD
+    )
+
+
+def test_the_in_flight_total_is_exact_over_many_small_deposits(build_wallet):
+    """The test that fails if this is ever rewritten as ``SELECT SUM(amount)``.
+
+    Amounts are stored as TEXT and SQLite's ``SUM`` coerces a text operand to
+    REAL, so a hundred addends of ``0.10`` come back as ``9.999999999999998``.
+    That is the same hazard the outflow method documents, and it lands here in
+    the same place: this total is added to a wallet's balances and compared
+    against the cap with ``>``, so a hair under the ceiling admits a deposit a
+    hair over it - on the one ceiling whose argument is anti-mule rather than
+    convenience.
+    """
+    wallet = build_wallet()
+    repository = build_repository(wallet)
+    for _ in range(100):
+        repository.save(
+            build_credit(wallet, amount=Money(SMALL_CREDIT, NGN))
+        )
+
+    total = credits(repository, wallet)
+
+    assert total == Money(Decimal("10.00"), NGN)
+    assert total.amount == Decimal("10.00")

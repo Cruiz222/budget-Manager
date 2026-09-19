@@ -71,6 +71,15 @@ class RecordingTransactionRepository(TransactionRepository):
         # about which rows count.
         raise NotImplementedError
 
+    def pending_credit_total(self, wallet_id, currency):
+        # The fourth time, and this one is closer to home than the third: it is
+        # the *inbound* aggregate, and it is what ``InitiateDeposit._prepare``
+        # adds to a projected balance before it opens a collection. Still not
+        # implemented, because ``DepositMoney`` is the direct-credit door and
+        # never asks - no provider sits in front of it, so there is no in-flight
+        # money to count. See the port for that argument.
+        raise NotImplementedError
+
 
 # --- Successful deposit ---
 

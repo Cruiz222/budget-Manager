@@ -189,23 +189,41 @@ class InitiateDeposit:
         look like they belong further in: the aggregate would refuse them too,
         but by then a collection exists.
 
-        **The ceiling check is a courtesy, and it is not the control.** What it
-        buys is that a payer is not sent to a payment page for money this wallet
-        could not legally accept; what it does not buy is a guarantee, because the
-        balance it reads is a balance that is free to change before the payer
-        pays. Two collections opened on the same day, each of which fits under the
-        cap at the moment it is asked for, can both be paid and both settle - and
-        nothing refuses the second one, because ``SettlePayment`` credits the
-        wallet directly and does not go through the ceiling at all.
+        **The ceiling check is a courtesy, and it is no longer nothing but a
+        courtesy.** What it buys is that a payer is not sent to a payment page
+        for money this wallet could not legally accept. It used to buy only that,
+        and the gap behind it was the one this paragraph then described: two
+        collections opened in the same moment, each of which fit under the cap as
+        it was read, both being paid and both settling, with nothing refusing the
+        second because ``SettlePayment`` credits the wallet directly and consults
+        no ceiling. The cap was therefore bounded by *when* a client asked rather
+        than by what the account may hold, on the one ceiling whose argument is
+        anti-mule rather than convenience.
 
-        **That gap is open on purpose and not by oversight.** Closing it means
-        deciding what happens to a payment the payer has *already made* and the
-        wallet may not accept: hold it, reverse it, or exceed the cap for it. Each
-        of those is a real answer with a different conversation attached, and
-        guessing one here would be inventing a refund policy in a docstring. It is
-        recorded in the README's ``### Still open`` for the slice that builds it,
-        and until then the cap is enforced at this door, on the deposit command,
-        and on every movement out.
+        **Counting the money in flight is what closed it**, and it closed it on
+        this side of the payment page rather than the other - which is the whole
+        of why the fix is here. ``pending_credit_total`` answers what this wallet
+        is already expecting, and adding it to the projected balance means the
+        second of two collections is refused while the first is still open, so no
+        payer is ever taken to a page for money that would breach the ceiling.
+        That is this method's own thread being extended rather than a new policy:
+        *every refusal here costs nobody anything*, and refusing here is the only
+        place where that is true of this particular breach.
+
+        **What is still open, and stated rather than left to be discovered.**
+        Two requests that read *simultaneously* can still both pass, because the
+        ``PENDING`` row is written after ``initialize_deposit`` returns and not
+        before - deliberately, since holding a write transaction across a third
+        party's response time is an outage proportional to theirs, and a row
+        written optimistically is a row no webhook may ever settle. Closing that
+        window means reserving at intent time, which reverses a decision this
+        slice is not the place to reverse. So the residual is real, and the
+        honest handling of it is on the settlement side rather than here: a
+        credit that breaches the ceiling *is* applied - the payer's money is real
+        and there is no rail to send it back, ``PaymentProvider`` having no
+        refund method - and ``SettlePayment`` records it loudly so an operator
+        can see the control was crossed. Accepting silently was the one answer
+        that was not available.
         """
         uow = self._unit_of_work_factory.start()
         try:
@@ -268,6 +286,34 @@ class InitiateDeposit:
                     f"for everything on this side of the rail"
                 )
 
+            # **The dedupe check comes before the ceiling, and the order is the
+            # fix rather than a detail.** A retry under a key that already names
+            # a collection is not a new request: it is the same request arriving
+            # twice, and the answer it is owed is "you already asked for this" -
+            # ``DepositAlreadyInitiatedError``, which names the one thing the
+            # caller can do about it. The ceiling below cannot answer that. It
+            # reads every PENDING row as money on its way in, so a retry of a
+            # collection that is still open counts *its own* amount a second
+            # time, and a request whose first call fit can be refused on the
+            # retry for a breach that exists only because the retry was counted.
+            # "This account may not hold that much" would send a client who asked
+            # once off to fix the wrong thing - and a client retrying after a
+            # lost response is the ordinary case this door is designed for, not a
+            # misuse. So the question about the request is asked before the
+            # question about the account, which is the same order ``errors`` uses
+            # to put 401 above 404.
+            #
+            # Which is ``app.domain.money.reference``'s rule rather than this
+            # method's, and it moved there after the copy that used to stand here
+            # turned out to be the one that reached the wire - carrying a
+            # separator Paystack refuses. What this method owes the rule is the
+            # wallet it has already proved the actor owns, and nothing else.
+            reference = scoped_reference(wallet.wallet_id, internal_reference)
+            if uow.transactions.get_by_internal_reference(reference) is not None:
+                raise DepositAlreadyInitiatedError(
+                    "a deposit is already open under this key"
+                )
+
             # Read through the actor rather than through the wallet, and the
             # distinction is the same one ``get_owned`` above makes: the wallet
             # has just been proved to belong to ``self._actor``, so the profile
@@ -280,9 +326,30 @@ class InitiateDeposit:
             # money this account still holds, so a deposit into a wallet whose
             # locked balance already reaches the cap is refused here as surely as
             # it would be refused later.
+            #
+            # **And what is already in flight counts, which is the half this
+            # check used to be missing.** Every collection opened but not yet
+            # settled is money this wallet is about to hold, and the read below
+            # is the incoming mirror of the one behind the daily outflow cap -
+            # which counts ``PENDING`` rows for exactly this reason, in the port's
+            # own words: "a cap that ignored held money would let a burst of
+            # in-flight payouts each pass on its own." Without it, the same
+            # sentence was true of deposits: N collections opened a moment apart
+            # each read the same untouched balance, each fit under the ceiling,
+            # and all of them settled - so the balance cap was bounded by nothing
+            # an attacker could not exceed by asking twice. The cap is the
+            # AML-shaped ceiling ("value accumulating in an account nobody has
+            # identified"), so passing it by concurrency is passing the control
+            # that matters most.
+            open_deposits = uow.transactions.pending_credit_total(
+                wallet.wallet_id, wallet.currency
+            )
             check_credit(
                 tier_for(uow.profiles.find_for_user(self._actor)),
-                wallet.available_balance + wallet.locked_balance + amount,
+                wallet.available_balance
+                + wallet.locked_balance
+                + open_deposits
+                + amount,
             )
 
             # The payer address, refused here when it plainly cannot work.
@@ -311,17 +378,6 @@ class InitiateDeposit:
                 )
 
             refuse_unusable_payer_email(user.email)
-
-            # Which is ``app.domain.money.reference``'s rule rather than this
-            # method's, and it moved there after the copy that used to stand here
-            # turned out to be the one that reached the wire - carrying a
-            # separator Paystack refuses. What this method owes the rule is the
-            # wallet it has already proved the actor owns, and nothing else.
-            reference = scoped_reference(wallet.wallet_id, internal_reference)
-            if uow.transactions.get_by_internal_reference(reference) is not None:
-                raise DepositAlreadyInitiatedError(
-                    "a deposit is already open under this key"
-                )
         finally:
             uow.rollback()
 

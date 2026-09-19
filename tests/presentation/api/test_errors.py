@@ -90,6 +90,36 @@ class TestConflict:
         assert response.status_code == 409
         assert response.json()["error"] == "DuplicateFundNameError"
 
+    def test_replaying_a_refused_reference(self, client, as_user, open_wallet, open_pot):
+        """The second 409 on a money route, and the one that is not the wallet's.
+
+        ``lock`` is one of the four operations with no confirmation in front of
+        it, so the reference is the only thing that can refuse a replay - and this
+        asserts that it does, in two steps that are different claims. The first
+        call is refused for the wallet's own reason (there is nothing available to
+        lock) and writes a FAILED row; the second finds that row and refuses
+        rather than handing it back as though the lock had happened. Grading the
+        first 409 alone would pass on a route that refused every repeat forever,
+        which is why the error *names* are asserted rather than the codes.
+
+        A 409 rather than a 400 or a 404, and the module docstring's rule decides
+        it: the row exists and its state refuses this. See
+        ``ReferenceAlreadyRefusedError``.
+        """
+        headers = as_user()
+        wallet_id = open_wallet(headers)
+        name = open_pot(wallet_id, headers, name="Vacation")
+        url = f"/wallets/{wallet_id}/funds/{name}/lock"
+        body = {"amount": "1000.00", "ref": "lock-2026-09-19"}
+
+        first = client.post(url, json=body, headers=headers)
+        second = client.post(url, json=body, headers=headers)
+
+        assert first.status_code == 409
+        assert first.json()["error"] == "InsufficientFundsError"
+        assert second.status_code == 409
+        assert second.json()["error"] == "ReferenceAlreadyRefusedError"
+
     def test_pausing_a_plan_that_is_already_paused(self, client, as_user, open_wallet, create_plan):
         """The second ``pause`` is the interesting one, and the first is the control.
 

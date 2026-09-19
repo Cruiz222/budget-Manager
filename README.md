@@ -5295,6 +5295,165 @@ configuration fact about this installation either; the honest fix is to split th
 logging repair. It is named here so the next reader does not have to rediscover that the grade is
 load-bearing and wrong in one direction.
 
+### The deployment
+
+Phase 4's second bullet, and the one that turns this from a project that runs on
+a laptop into one that answers on a hostname. Three files - `Dockerfile`,
+`compose.yaml`, `Caddyfile` - plus `.env.example`, which is the list of every
+setting the software reads with none of the values in it.
+
+```
+cp .env.example .env          # fill in APP_DOMAIN and PAYSTACK_SECRET_KEY
+install -d -o 10001 -g 10001 data
+docker compose up -d --build
+```
+
+The tick, and what it costs to run it:
+
+```
+*/5 * * * * cd /srv/budget && docker compose run --rm tick >> tick.log 2>&1
+```
+
+**249. Caddy, and the whole of the TLS configuration is one line.** Decision 52
+committed to "a reverse proxy with TLS" and deliberately did not name one, so
+this is the decision that spends that. The argument is entirely about what has
+to be remembered: Caddy obtains a certificate for `$APP_DOMAIN` from an ACME
+issuer on the first request, stores it in its own volume, renews it about thirty
+days before expiry, keeps an OCSP staple current and redirects HTTP to HTTPS,
+and none of that is configured in `Caddyfile` because none of it is a decision
+this deployment is making differently from the default. The alternative -
+`nginx` plus a `certbot` container, a webroot, a renewal cron and a reload hook
+- is two more moving parts whose failure mode is a certificate that expires on a
+weekend, and it is close to the operational surface decision 52 was arguing
+against.
+
+**The cost, stated rather than implied:** a reverse proxy whose behaviour is
+mostly hidden, so an operator debugging a certificate has less to read than they
+would with nginx; one more party in the trust path, since an ACME issuer has to
+be reachable from this host; and a tool that is less transferable knowledge than
+nginx. What is bought is that the number of ways this can be wrong is small
+enough that the configuration fits in a comment. `Caddyfile` keeps the access log
+directive written out and commented, so the place it goes is not a discovery.
+
+**250. One image, two services, because `BUDGET_DB` is the setting that decides
+which file is the money.** `api` and `tick` are the same build with different
+commands, and the point is not the saving. Decision 246 recorded a live bug
+where the CLI and the API resolved to *different files* on any machine where
+`BUDGET_DB` was set - the CLI opened a wallet, the API answered 404 about that
+wallet, and both were right about the database they were looking at. The
+`compose.yaml` answer is a single `x-money-environment` anchor setting
+`BUDGET_DB=/data/budget.db` for both, and an `environment:` block that wins over
+anything in `.env` - so the two presentations cannot be split by editing the
+wrong file.
+
+**The tick stays a one-shot, and that is the shape being preserved rather than a
+container being added.** The README's scheduler section argues three things
+about the cron line - five minutes rather than an hour, an absolute `cd`, and the
+environment set inline rather than in a shell profile - and every one of them
+survives here unchanged. What changes is only what the host needs: `docker`, and
+no Python, no venv and no install. The service carries `profiles: ["tools"]` so
+that `up -d` does not start it: a tick that ran once at boot and then sat exited
+would be a tick whose log a reader would mistake for a working schedule.
+
+**251. The image binds `0.0.0.0` and `__main__.py` still binds `127.0.0.1`, and
+the disagreement is the design.** Both defaults are right for their own caller.
+The module entry point is for running this on the machine you are sitting at,
+where the objection to listening widely is the one it has always been - real
+credentials over plain HTTP. The image exists to be reached by a proxy on a
+private compose network, where the only thing that can open the port is Caddy,
+and Caddy is what terminates TLS. So the deployment passes `--host 0.0.0.0` in
+the `CMD`, which is what `__main__.py`'s own docstring says a deployment does
+when it says binding wider is "a decision a deployment makes explicitly - by
+passing its own `--host`, which is what the `--factory` form above exists to
+allow."
+
+**That docstring had to change and the change is worth recording.** Its third
+paragraph justified loopback with "this API speaks plain HTTP", and after this
+phase that sentence is true of a bare local run and false of the deployment. The
+file rewrites the paragraph, keeps the default, and says which of the two
+situations it now describes - because a rationale that outlives its reason reads
+as a constraint that has lifted, and that is this file's own standard rather than
+a new one. This is the second time that paragraph has been rewritten; the first
+is in its own history.
+
+**One worker, and the number is load-bearing rather than a default left alone.**
+`SqliteUnitOfWorkFactory.start` takes `BEGIN IMMEDIATE` on *every* unit
+deliberately, so that two writers cannot disagree about a value one of them is
+about to write. That is a property worth more than throughput, and it also means
+extra workers would buy contention rather than concurrency: the second worker's
+first write waits for the first worker's unit to commit either way. A future
+reader who reaches for `--workers` to fix a slow endpoint will find the argument
+here rather than a config value.
+
+**252. The database is a bind mount, and the price is one `install -d`.** The
+choice is made by the item *after* this one on the checklist: backups with a
+restore somebody has actually run. `sqlite3 .backup` against `./data/budget.db`
+from the host is a one-liner, and the same operation against a named volume is an
+exercise in docker plumbing - and the difference between those two is exactly the
+friction that decides whether the backup gets written at all. So `./data` is a
+directory on the host rather than a volume, and the next item inherits it.
+
+**Three consequences, all of them deliberate.** The mount is read-write and has
+to be: every connection runs `executescript` with the schema and the
+PRAGMA-guarded migrations in `open_sqlite_connection`, so a `:ro` mount fails on
+open rather than merely failing to write. The *directory* is mounted rather than
+the file, because SQLite writes its rollback journal beside the database. And the
+directory has to exist, owned by the container user, before the first `up` -
+Docker creates a missing bind-mount source as root while the container runs as
+uid 10001, so the failure is not a mount error but SQLite reporting an
+unwritable directory from inside `/health`, which reads as a broken database
+rather than a broken permission. That is why the recipe above has an `install -d`
+in it, and why it is written down rather than being left to the first person to
+hit it.
+
+**253. `X-Forwarded-For` is still read by nothing, and that is now a choice
+rather than a constraint.** Decision 53 wrote that "until a reverse proxy this
+installation controls is in front of it, every such header is a string the
+attacker chooses, so a limit keyed on one is a limit the attacker sets." A proxy
+this installation controls is now in front of it, so that precondition has been
+met - and the answer is still to read nothing, for a reason that outlived it: the
+rate limiter keys on *subject* (the address in the body, the account a change
+belongs to, the phone number folded), which is the half a CDN cannot do, and the
+source dimension is tracked on its own as "a third column on the same table."
+Building it here would be moving that item's decision into a deployment change.
+
+So uvicorn's `--forwarded-allow-ips` is left at its default, which is
+`127.0.0.1` - and the proxy's container address is not `127.0.0.1`, so the
+headers are ignored rather than trusted. `request.client` is the proxy.
+**Whoever builds the source dimension should read this paragraph first**, because
+the setting that will matter is that one, and the mistake available is passing
+`*`.
+
+**254. The proxy's access log is one line and is deliberately under a comment.**
+`Caddyfile` keeps `log` written out and disabled. It would put every request at
+the proxy into Caddy's JSON log, which is most of what the checklist's logging
+item asks for and none of what it decides: the format, where the lines are
+shipped, how long they are kept, and what a request is correlated by are all
+still open, and turning the directive on would make one of those decisions in a
+proxy config where nobody would look for it. The line is in the file so the place
+it goes is not a discovery.
+
+**What this does not do, said plainly.** There is no VPS provisioning here - no
+DNS, no firewall, no user, no unattended-upgrades - because none of that is code
+that can live in this repository.
+
+And **none of the three files has been run.** They were written in an
+environment where the command classifier was unavailable, so `docker compose
+config`, a build and a `docker compose up` could not be executed at all - which
+is stated here rather than left to be inferred, because the rest of this file is
+written by someone who ran the thing first and the difference matters. What is
+verified is that `__main__.py` still imports and that the files' own syntax is
+what it claims to be; what is *not* verified is every runtime property they
+assert, including that the compose file parses, that the image builds, that
+uid 10001 can write the mounted directory, and that `/health` answers through
+Caddy. Those are the first four things to check on the host. A certificate
+cannot be tested here in any case, since ACME will not issue for a hostname that
+does not resolve and this project owns none.
+
+**So this section is a design, not a report**, and it should be read the way
+decisions 249-254 are written - as arguments about what the deployment *should*
+be - until somebody has run it and said so.
+
 ### Still open
 
 - **A plan edited into a currency its wallet does not hold stops the whole tick.**
@@ -6179,7 +6338,10 @@ run is for is not confirmation.
 
 - Migrations through a tool (Alembic), replacing the hand-rolled PRAGMA-guarded
   `ALTER`s that `sqlite_unit_of_work.py` already flags as the manual version.
-- `docker compose`, a reverse proxy with TLS, and a VPS.
+- `docker compose`, a reverse proxy with TLS, and a VPS. The first two exist as
+  configuration - `Dockerfile`, `compose.yaml`, `Caddyfile`, `.env.example` - and
+  are argued in "The deployment" above. Neither has been run, and the VPS is not
+  a file: DNS, a firewall and a host remain somebody's afternoon.
 - **Backups with a tested restore.** A backup nobody has restored is a belief,
   not a backup, and this is the one item whose absence is unrecoverable.
 - Structured logging and error tracking.

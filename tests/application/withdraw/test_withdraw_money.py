@@ -67,6 +67,13 @@ class RecordingTransactionRepository(TransactionRepository):
         # invented by a test double rather than exercised by one.
         raise NotImplementedError
 
+    def pending_credit_total(self, wallet_id, currency):
+        # The balance cap's read, and the same line for the same reason: it is
+        # asked by ``InitiateDeposit._prepare``, which this module does not drive
+        # and a withdrawal has nothing to do with. A withdrawal is money going
+        # out; this aggregate is money coming in.
+        raise NotImplementedError
+
 
 # --- A withdrawal debits the wallet and holds the money ---
 

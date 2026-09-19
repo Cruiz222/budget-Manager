@@ -1,0 +1,159 @@
+# The whole deployment: one application image, one reverse proxy, one file.
+#
+# Decision 52 argued for exactly this shape - "docker compose on a VPS behind a
+# reverse proxy with TLS is the whole of what this needs - a deployment that can
+# be understood in an afternoon, rather than an operational surface that would
+# have to be learned before it could be used." This file is that afternoon.
+#
+#     cp .env.example .env     # then fill it in; .env is gitignored
+#     docker compose up -d --build
+#
+# Three services and one image. `api` and `tick` are the same build told to do
+# two different things, which is the point rather than a saving: the CLI and the
+# API resolve their database through one setting (`BUDGET_DB`, decision 246), so
+# running them from one image with one `environment:` block is what makes it
+# impossible for a schedule and a balance to disagree about which file they are
+# looking at.
+
+name: budget
+
+# Shared by every service that touches money. `BUDGET_DB` is spelled out here
+# rather than left to the image's default, because the default is `budget.db` in
+# the *working directory* - which inside a container is not a place anything is
+# mounted, so a container that relied on it would create a fresh database on
+# every start and serve a wallet with no history. This is decision 246's failure
+# wearing a different hat: one variable, one file, both presentations.
+x-money-environment: &money-environment
+  BUDGET_DB: /data/budget.db
+
+services:
+  api:
+    # One name for one build. Both services carry `build: .` and the same
+    # `image:`, which is what tells compose to build this context *once* and run
+    # the result twice - rather than building two identical images under two
+    # generated names and having the tick be a copy that can drift.
+    image: budget
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *money-environment
+    # The database, on the host, as a plain file. **A bind mount rather than a
+    # named volume**, and the reason is the next item on the checklist: backups
+    # with a restore somebody has actually run. `sqlite3 .backup` from the host
+    # is a one-liner against `./data/budget.db` and an exercise in docker
+    # plumbing against a volume, and the difference is exactly the friction that
+    # decides whether the backup gets written at all.
+    #
+    # It is read-write and it has to be: every connection runs `executescript`
+    # with the schema and the PRAGMAs-guarded migrations in
+    # `open_sqlite_connection`, so a `:ro` mount fails on open rather than
+    # merely failing to write. The *directory* is mounted, not the file,
+    # because SQLite writes its rollback journal beside the database.
+    #
+    # **`./data` has to exist and be owned by the container user before the
+    # first `up`, and that is the one step compose will not do for you.** Docker
+    # creates a missing bind-mount source as root, and the container runs as
+    # uid 10001 - so the failure is not a mount error but SQLite reporting an
+    # unwritable directory, from inside `/health`, which reads as a broken
+    # database rather than a broken permission. Once:
+    #
+    #     install -d -o 10001 -g 10001 data
+    #
+    # A named volume would sidestep this, because compose copies the image's
+    # ownership of `/data` into a fresh one. The bind mount is chosen anyway,
+    # for the reason above it - and the cost of that choice is this command.
+    volumes:
+      - ./data:/data
+    # Nothing is published. The proxy is the only door, and this port is
+    # reachable across the compose network and nowhere else - which is the
+    # container-sized version of the argument `__main__.py` makes for loopback.
+    expose:
+      - "8000"
+    # `/health` and not a new endpoint: it opens a unit of work and discards it,
+    # so it already distinguishes "the process is up" from "the process can
+    # serve", and answers 503 rather than 500 when it cannot. A probe that
+    # existed only for compose would be a second thing to keep true.
+    #
+    # `urllib` rather than `curl`, because `python` is in the image and curl
+    # would be a package installed to answer one question.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          try:
+              sys.exit(0 if urllib.request.urlopen(
+                  "http://127.0.0.1:8000/health", timeout=4).status == 200 else 1)
+          except Exception:
+              sys.exit(1)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Long enough for the rate limiter to warm before a failure counts. The
+      # warm is one synchronous SELECT before the server accepts anything, and
+      # it is also what makes a cold start measurably slower than a warm one.
+      start_period: 15s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    # The only published ports in this file, and they are both load-bearing:
+    # 443 serves, and 80 exists so that a request to `http://` is redirected
+    # rather than refused. Caddy also uses 80 as one of the two ACME challenge
+    # paths - the other is TLS-ALPN on 443 - so an installation that closed 80
+    # would keep renewing over 443 and lose only the redirect. Left open,
+    # because a user who types the hostname without a scheme should land on the
+    # site rather than on nothing.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      APP_DOMAIN: "${APP_DOMAIN:?set APP_DOMAIN in .env to the hostname this deployment answers on}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and keys, and Caddy's own state. **A named volume, unlike
+      # the database**, and the asymmetry is deliberate: a certificate is
+      # reproducible from the domain and an ACME account, so there is nothing
+      # here worth backing up - and losing it costs one re-issue rather than
+      # any money.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+  # One pass, then exit - the shape the README already documents for the tick,
+  # which is why this is a `run` and not a service that stays up.
+  #
+  #     */5 * * * * cd /srv/budget && docker compose run --rm tick >> tick.log 2>&1
+  #
+  # Five minutes and not an hour, an absolute `cd`, and the output appended to a
+  # file rather than mailed: the README's "Running the scheduler" section argues
+  # all three, and none of that changes by being in a container. What *does*
+  # change is what the host needs - `docker` and nothing else, where the
+  # documented line needed a Python, a venv and an install.
+  #
+  # **A profile, so `up -d` does not start it.** A tick that ran once at boot and
+  # then sat exited would be a tick whose log a reader would mistake for a
+  # working schedule. Naming a profiled service in a command activates it, so
+  # `docker compose run --rm tick` reaches it and `docker compose up -d` does
+  # not.
+  tick:
+    image: budget
+    build: .
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      <<: *money-environment
+    volumes:
+      - ./data:/data
+    # No session and no login: `main` dispatches `plan tick` above the line that
+    # resolves an actor (decision 91), which is what lets this run on a machine
+    # where nobody has ever signed in.
+    command: ["python", "-m", "app.presentation.cli", "plan tick"]
+
+volumes:
+  caddy_data:
+  caddy_config:

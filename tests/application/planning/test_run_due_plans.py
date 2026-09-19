@@ -41,6 +41,24 @@ def payout(amount: str, label: str = "salary") -> Instruction:
     )
 
 
+def usd_payout(amount: str, label: str = "salary") -> Instruction:
+    """One payout in a currency no wallet in this file is held in.
+
+    A second helper rather than a ``currency`` parameter on the one above, for the
+    reason ``payout`` gives for being a copy: the two are used for different
+    claims. Every other test here is about an amount, and an amount's currency is
+    the wallet's; the one class that calls this is about the currency *not* being
+    the wallet's, and a default parameter would let a test that meant the first
+    thing quietly get the second.
+    """
+    return Instruction(
+        action=PlannedAction.PAYOUT,
+        amount=Money(Decimal(amount), Currency.USD),
+        label=label,
+        destination=BANK_DESTINATION,
+    )
+
+
 #: The unverified row of the limits table, which is the tier every account in this
 #: file is at - none of them has a profile.
 UNVERIFIED = limits_for(Tier.UNVERIFIED, NGN)
@@ -434,6 +452,64 @@ class TestATierBlockedPlanDoesNotStopTheTick:
         )
         assert wallet_after(factory, blocked_wallet).locked_balance == Money(
             Decimal(OVER_THE_TRANSACTION_CEILING), NGN
+        )
+
+
+class TestAMismatchedPlanDoesNotStopTheTick:
+    """The same regression as the class above, one refusal type over.
+
+    A plan whose amounts are in another currency than its wallet's used to raise
+    ``CurrencyMismatchError`` straight out of ``ExecutePlanRun._blocking_reason``
+    - ``Money`` refuses arithmetic between two currencies, and the refusal is a
+    raise rather than a return. The tick is a loop, so that ended it: every plan
+    after the mismatched one in that pass did not run.
+
+    ``_currency_block`` answers it as a ``RunBlockReason`` instead, for exactly
+    the reason ``_limit_block`` does one branch later, and this class is the
+    second half of that argument rather than a repeat of it. The two refusals
+    arrive from different layers - one from ``Wallet``/``Money``, one from
+    ``tier`` - so a fix written for one of them is not evidence about the other.
+
+    **The plan is seeded directly rather than through ``PlanService``, and that
+    is now the only way to build it.** ``create_plan`` and ``edit_instructions``
+    both refuse a foreign-currency plan, so no door produces this state any more
+    - which is the right shape for a *resilience* test: the mismatch on disk is
+    pre-existing data, written by an older build or by a direct write, and the
+    question is whether a tick that meets it survives.
+    """
+
+    def test_a_mismatched_plan_does_not_stop_the_next_plan(
+        self, build_wallet, build_plan, tmp_path
+    ):
+        # Funded for the payout it would make, so the currency is the only thing
+        # standing in its way - a wallet that was also short would be blocked
+        # either way and this test would prove nothing about currencies.
+        mismatched_wallet = build_wallet(locked="10000")
+        mismatched = build_plan(
+            wallet_id=mismatched_wallet.wallet_id,
+            instructions=(usd_payout("2000"),),
+        )
+        paid_wallet = build_wallet(locked="10000")
+        paid = build_plan(wallet_id=paid_wallet.wallet_id)
+        scheduler, factory = build_scheduler(tmp_path)
+        # Seeded first, so list_by_status returns it first - which is what makes
+        # "the tick carried on" mean the *later* plan ran.
+        seed(factory, [(mismatched_wallet, mismatched), (paid_wallet, paid)])
+
+        runs = scheduler.execute(ANCHOR)
+
+        assert [run.plan_id for run in runs] == [mismatched.plan_id, paid.plan_id]
+        assert runs[0].status is RunStatus.BLOCKED
+        assert runs[0].reason is RunBlockReason.CURRENCY_MISMATCH
+        # Nothing moved in the wallet that could not be run: the block is the
+        # whole of what happened to it.
+        assert wallet_after(factory, mismatched_wallet).locked_balance == Money(
+            Decimal("10000"), NGN
+        )
+        # And the plan behind it paid, in the same tick, with nothing raised.
+        assert runs[1].status is RunStatus.SUCCEEDED
+        assert wallet_after(factory, paid_wallet).locked_balance == Money(
+            Decimal("8000"), NGN
         )
 
 

@@ -72,3 +72,34 @@ class RunBlockReason(Enum):
     member - which is free to add, per the note above, and which no row already
     written would become wrong by.
     """
+
+    CURRENCY_MISMATCH = "currency_mismatch"
+    """The plan's money is in a currency the wallet it draws on does not hold.
+
+    **An addition to the set, and the note at the top of this file is why it
+    has to be.** No row already written under another member changes meaning
+    because this exists: a mismatched plan did not previously block as
+    ``INSUFFICIENT_BALANCE`` or as anything else, because it did not previously
+    block at all. It raised.
+
+    **Which is the whole argument for the member.** A plan in USD drawn on an
+    NGN wallet used to reach ``_money_block``, where ``Money`` refused the
+    comparison between two currencies - so the tick died and every plan after it
+    in the pass did not run. One plan's bad edit stopped everybody's runs. That
+    is the failure ``_limit_block`` already refuses to commit one door over, and
+    the reasoning transfers exactly: five instructions judged one at a time
+    would raise on the fourth and take the tick down, so a refusal that is a
+    *fact about one plan* is recorded as a block and the loop carries on.
+
+    **A block rather than a pause is what it means for the owner.** The run did
+    not happen and the plan stops until a human looks at it - which is right in
+    a way ``INSUFFICIENT_BALANCE`` is not, because topping up cannot fix this.
+    The remedy is to edit the instructions back into the wallet's currency, and
+    the blocked run is the record that says so.
+
+    **The door is closed on the other side too.** ``PlanService`` now re-applies
+    the currency rule on ``edit_instructions``, so a plan cannot be moved into
+    this state any more. This member exists for the plans that were already put
+    there, and as the backstop that makes the tick's resilience a property of
+    the scheduler rather than a promise about every writer.
+    """

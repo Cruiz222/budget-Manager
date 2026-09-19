@@ -20,6 +20,11 @@ class SettlementOutcome(Enum):
 
       - ``DEPOSIT_CREDITED``, ``TRANSFER_SETTLED``, ``HOLD_RELEASED`` and
         ``PAYMENT_REVERSED`` each describe a movement that **did** happen.
+      - ``BALANCE_CAP_EXCEEDED`` is the fifth movement, so it belongs on the same
+        side of the line - and it is the one member that reports a movement *and*
+        an alarm, because the account it landed in is now over a ceiling that
+        exists to stop exactly this. See its own docstring for why it is not a
+        refusal.
       - ``UNKNOWN_REFERENCE``, ``AMOUNT_DISAGREES``, ``ALREADY_SETTLED``,
         ``WRONG_KIND`` and ``WALLET_CLOSED`` each describe why nothing happened.
         They are deliberately separate rather than one ``IGNORED``: they call for
@@ -52,6 +57,34 @@ class SettlementOutcome(Enum):
 
     PAYMENT_REVERSED = "payment_reversed"
     """A settled payout was returned. The money went back; the row is REVERSED."""
+
+    BALANCE_CAP_EXCEEDED = "balance_cap_exceeded"
+    """A charge arrived and was credited, and the account is now over its cap.
+
+    **The money moved, so this is not a refusal - and it is reported anyway
+    because it is the one thing a settlement can do that nobody asked for.** The
+    ordinary path refuses an over-cap deposit *before* the payer is sent
+    anywhere: see ``InitiateDeposit._prepare``, which adds what is already in
+    flight to the projected balance for precisely this reason. This member is the
+    residue of the case that check cannot reach - two collections opened in the
+    same instant, both reading a wallet that still fits, both paid. When that
+    happens the money is real and it is the payer's, and it is already inside the
+    system.
+
+    **So crediting and saying nothing was the one answer that was not
+    available.** Refusing here is not an option the code has rather than one it
+    declined: ``PaymentProvider`` has no transfer method, so there is no rail to
+    send the money back on, and a row left PENDING over money that has arrived
+    would be a lie the reconciler repeats for ever. What is left is to accept it
+    and to say so in the vocabulary an operator already reads. That is what this
+    member buys: the webhook's log line carries it beside the reference, the
+    reconciler's report counts it, and the cap being crossed is a fact in a log
+    rather than an inference from a balance nobody was watching.
+
+    The ceiling that was crossed is anti-mule rather than a product nudge -
+    ``check_credit``'s docstring gives the argument - so an operator reading this
+    line is reading about a control, not a limit somebody found annoying.
+    """
 
     UNKNOWN_REFERENCE = "unknown_reference"
     """No ledger row is filed under this reference. Nothing moved."""
@@ -97,7 +130,7 @@ class SettledPayment:
     def moved_money(self) -> bool:
         """Whether this settle changed a balance.
 
-        True for the four members that describe a movement and false for every
+        True for the five members listed in ``_MOVEMENTS`` and false for every
         refusal - which is what makes it useful in a test ("assert nothing
         moved") without re-listing the members, and what keeps a further refusal
         from silently reading as a movement the day it is added.
@@ -105,14 +138,20 @@ class SettledPayment:
         return self.outcome in _MOVEMENTS
 
 
-#: The four outcomes that changed something. Named rather than derived, because
+#: The five outcomes that changed something. Named rather than derived, because
 #: the alternative - a naming convention, or checking the value string for a
-#: prefix - would be a rule the next member could break without noticing.
+#: prefix - would be a rule the next member could break without noticing. That is
+#: also what made ``BALANCE_CAP_EXCEEDED`` a decision rather than a line: it is
+#: listed here because the money *did* move, and the fact that it arrived with an
+#: alarm attached does not change what happened to the balance. A member that
+#: reports a movement and is left out of this set would make ``moved_money``
+#: answer "no" about a wallet that had just been credited.
 _MOVEMENTS = frozenset(
     {
         SettlementOutcome.DEPOSIT_CREDITED,
         SettlementOutcome.TRANSFER_SETTLED,
         SettlementOutcome.HOLD_RELEASED,
         SettlementOutcome.PAYMENT_REVERSED,
+        SettlementOutcome.BALANCE_CAP_EXCEEDED,
     }
 )

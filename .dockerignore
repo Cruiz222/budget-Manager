@@ -1,0 +1,51 @@
+# What the image does not need, which is nearly everything.
+#
+# The build context is sent to the daemon in full before a single instruction
+# runs, so this file is the difference between a build that uploads a venv and
+# one that uploads the source. `.venv/` is the one that matters - it is hundreds
+# of megabytes of a Linux environment that the image installs its own copy of
+# from `requirements.txt` - and it is why this file exists at all.
+
+# The development environment, rebuilt inside the image from requirements.txt.
+.venv/
+
+# History, and the identity of whoever built the image.
+.git/
+.gitignore
+
+# The test suite. `requirements-dev.txt` is not installed either: a deployment
+# does not carry a test runner, and pytest with nothing to collect is a lie
+# about what the image can do.
+tests/
+.pytest_cache/
+requirements-dev.txt
+pyproject.toml
+
+# Documentation and the checklist. Read by people, mounted by nothing.
+docs/
+README.md
+claude.md
+
+# **The environment file, which must never reach an image.** A secret baked into
+# a layer is a secret in every registry that layer was pushed to, and `docker
+# history` does not forget. The negation below is the same one `.gitignore`
+# carries, for the same reason: the file with no values in it is documentation
+# and belongs in both.
+.env
+.env.*
+!.env.example
+
+# Databases, journals and backups. The image is expected to be pointed at a
+# mounted `/data`, and a copy of a real database inside a built image would be
+# exactly the mistake the bind mount exists to avoid.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+
+# Bytecode, caches, and whatever an editor left behind.
+__pycache__/
+*.py[cod]
+.vscode/
+project.zip

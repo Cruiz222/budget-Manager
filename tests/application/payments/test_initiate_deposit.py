@@ -48,6 +48,7 @@ from uuid import uuid4
 import pytest
 
 from app.application.payments.initiate_deposit import InitiateDeposit
+from app.application.payments.settle_payment import SettlePayment
 from app.domain.identity.exception import TierLimitExceededError
 from app.domain.identity.limitKind import LimitKind
 from app.domain.identity.profile import Profile
@@ -71,6 +72,8 @@ from app.domain.payments.exception import (
     PayerEmailRefusedError,
     PaymentProviderUnavailableError,
 )
+from app.domain.payments.providerEvent import ProviderEvent
+from app.domain.payments.providerOutcome import ProviderOutcome
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
@@ -87,6 +90,17 @@ ACTOR = TEST_USER_ID
 #: this suite reads it: a test that hard-coded the number would go on passing -
 #: and asserting a refusal that no longer happens - after somebody raised the cap.
 CAP = limits_for(Tier.UNVERIFIED, NGN).max_balance
+
+#: Two amounts that each fit under the cap and do not fit together.
+#:
+#: Derived from the cap rather than typed out, so ``TestMoneyAlreadyInFlight``
+#: keeps making its point after somebody raises it. Floor-divided, so both are
+#: whole naira with no rounding to reason about. What the test itself asserts is
+#: the property that matters - each below the cap, the sum above it - because a
+#: pair that stopped summing to a breach would leave the test passing while
+#: asserting nothing.
+TWO_THIRDS_OF_THE_CAP = CAP.amount * 2 // 3
+HALF_THE_CAP = CAP.amount // 2
 
 #: The moment every synthetic row in this file is stamped with, for the reason
 #: ``tests/conftest.POT_MOMENT`` exists: a stored value a test asserts about should
@@ -524,6 +538,137 @@ class TestTheRefusals:
         assert provider.requests == []
 
 
+class TestMoneyAlreadyInFlight:
+    """**The burst the balance cap could not see, and the door that now closes it.**
+
+    ``_prepare`` compares the projected balance against the account's cap, and it
+    used to project only what the wallet *held* - so N collections opened a moment
+    apart each read the same untouched balance, each fit under the ceiling, and
+    all of them settled. The daily outflow cap had counted money in flight since
+    it was written, in the port's own words: *"a cap that ignored held money would
+    let a burst of in-flight payouts each pass on its own."* The balance cap had
+    no equivalent on the inbound side, and it is the ceiling whose argument is
+    anti-mule rather than convenience.
+
+    These tests are about the projection, so they assert the *provider was not
+    called* rather than only that something raised: "it refused" and "the payer
+    was never sent to a payment page" are different statements, and only the
+    second one is worth anything to the person who would have been billed.
+    """
+
+    def test_a_second_collection_over_the_cap_is_refused_while_the_first_is_open(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """Two thirds and a half, against a wallet holding nothing.
+
+        Each amount fits under the cap by itself; together they do not. That is
+        the whole arrangement, and it is why the second refusal could not have come
+        from the amount - the same deposit is accepted by the control below.
+        """
+        # The arrangement, asserted rather than assumed: a test about a ceiling
+        # whose numbers stopped adding up to a breach would go on passing while
+        # asserting nothing.
+        assert TWO_THIRDS_OF_THE_CAP < CAP.amount
+        assert HALF_THE_CAP < CAP.amount
+        assert TWO_THIRDS_OF_THE_CAP + HALF_THE_CAP > CAP.amount
+
+        wallet = build_wallet(available="0")
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        first = service.execute(
+            wallet.wallet_id, Money(TWO_THIRDS_OF_THE_CAP, NGN), "invoice-1"
+        )
+        assert first.status is TransactionStatus.PENDING
+
+        with pytest.raises(TierLimitExceededError) as refused:
+            service.execute(
+                wallet.wallet_id, Money(HALF_THE_CAP, NGN), "invoice-2"
+            )
+
+        assert refused.value.kind is LimitKind.MAX_BALANCE
+        # Only the first request ever left this process. The second payer would
+        # have been sent to a checkout page for money the wallet could not accept.
+        assert len(provider.requests) == 1
+        # And nothing was written for the refusal either: ``_prepare`` refuses
+        # before the row, so the ledger holds the one open collection and it is
+        # still open.
+        ledger = rows(factory, wallet)
+        assert len(ledger) == 1
+        assert ledger[0].status is TransactionStatus.PENDING
+        assert stored(factory, wallet).available_balance == Money(0, NGN)
+
+    def test_a_settled_deposit_is_counted_once_and_not_twice(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """**The control, and the test that catches a double count.**
+
+        The same arrangement as the refusal above, one settlement later: two
+        thirds of the cap has *arrived* rather than being in flight, and the
+        collection opened on top of it is the remainder that lands exactly on the
+        ceiling. Landing on it is allowed, and that makes this the sharpest
+        available check that a settled row is not added a second time - it is
+        already in the wallet's balance, and a ``pending_credit_total`` that
+        counted ``SUCCESSFUL`` rows would project two thirds of the cap twice and
+        refuse a deposit that fits. One naira more of double counting and this
+        test is red, which is why the amount is the remainder rather than
+        something comfortably small.
+
+        Note the two cannot be the *same* amount and stay a control, which is
+        worth seeing rather than taking on trust: while the first collection is
+        open the projection is ``0 + A + B``, and once it has settled it is
+        ``A + 0 + B``. Those are the same number, because the in-flight total is
+        deliberately an exact substitute for the balance that has not moved yet -
+        so the control has to be a deposit that *fits*, not one that did not.
+        """
+        wallet = build_wallet(available="0")
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+        # The remainder, so that the settled balance plus this lands on the cap.
+        remainder = Money(CAP.amount - TWO_THIRDS_OF_THE_CAP, NGN)
+
+        first = service.execute(
+            wallet.wallet_id, Money(TWO_THIRDS_OF_THE_CAP, NGN), "invoice-1"
+        )
+        # Settled through the real door, then the remainder asked for.
+        SettlePayment(factory).settle(
+            ProviderOutcome(
+                event=ProviderEvent.CHARGE_SUCCEEDED,
+                reference=first.provider_reference,
+                amount=Money(TWO_THIRDS_OF_THE_CAP, NGN),
+            )
+        )
+        assert stored(factory, wallet).available_balance == Money(
+            TWO_THIRDS_OF_THE_CAP, NGN
+        )
+
+        second = service.execute(wallet.wallet_id, remainder, "invoice-2")
+
+        assert second.status is TransactionStatus.PENDING
+        assert len(provider.requests) == 2
+
+    def test_a_collection_that_would_breach_the_cap_is_still_refused(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """The in-flight total is *added*, not substituted for the balance.
+
+        A wallet near its cap with nothing in flight must still refuse, and a test
+        that only ever exercised the open-collection path could pass on an
+        implementation that had quietly stopped reading the balance at all.
+        """
+        wallet = build_wallet(available=str(CAP.amount))
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+
+        with pytest.raises(TierLimitExceededError):
+            service.execute(wallet.wallet_id, Money(1, NGN), "invoice-1")
+
+        assert provider.requests == []
+
+
 class TestACurrencyTheRailCannotCollect:
     """The guard, and the two orderings that decide what a caller is told.
 
@@ -722,6 +867,45 @@ class TestTheSameKeyTwice:
             service.execute(wallet.wallet_id, Money(5000, NGN), "invoice-7")
 
         assert len(rows(factory, wallet)) == 1
+
+    def test_a_retry_that_would_only_breach_if_counted_twice_is_still_a_repeat(
+        self, tmp_path, build_wallet, payer, build_payment_provider
+    ):
+        """**The dedupe is asked before the ceiling, and this is the request that
+        makes the order matter.**
+
+        The ceiling reads every open collection as money on its way in - that is
+        what closes the burst bypass one class up - and a retry under the same key
+        would then be counted against the sum it already is: the wallet holds
+        nothing, one collection for two thirds of the cap is open, and the retry
+        asks for that two thirds again. Counted a second time the projection is
+        four thirds of the cap, which breaches, so a ceiling-first door answers
+        "this account may not hold that much" to a client who asked once and lost
+        the response.
+
+        The answer owed is the fact about the *request* rather than the account:
+        this key is already open. That is why the assertion below is the exact
+        repeat error and not a tier refusal - the two are unrelated types, so a
+        regression that swapped the order fails here rather than passing on the
+        strength of "something was refused".
+
+        ``TWO_THIRDS_OF_THE_CAP`` is the amount because of the property the
+        constant carries: it fits under the cap once and does not fit twice. The
+        first call succeeding is the control, and without it this test would pass
+        against a door that refused the request for being too large at all.
+        """
+        wallet = build_wallet(available="0")
+        provider = build_payment_provider()
+        service, factory = a_deposit_service(tmp_path, provider)
+        seed(factory, wallet, payer)
+        amount = Money(TWO_THIRDS_OF_THE_CAP, NGN)
+
+        service.execute(wallet.wallet_id, amount, "invoice-7")
+
+        with pytest.raises(DepositAlreadyInitiatedError):
+            service.execute(wallet.wallet_id, amount, "invoice-7")
+
+        assert len(provider.requests) == 1
 
     def test_two_different_keys_are_two_deposits(
         self, tmp_path, build_wallet, payer, build_payment_provider

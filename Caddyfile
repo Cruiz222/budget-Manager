@@ -1,0 +1,32 @@
+# The entire TLS story, and the point of choosing Caddy is that this is the
+# entire file.
+#
+# Caddy obtains the certificate for the hostname below from an ACME issuer on
+# the first request that arrives, stores it in its /data volume, renews it about
+# thirty days before expiry, keeps an OCSP staple current, and redirects HTTP to
+# HTTPS. None of that is configured here because none of it is a decision this
+# deployment is making differently from the default - and a reverse proxy whose
+# renewal depends on a cron entry somebody has to remember is a reverse proxy
+# whose certificate expires on a weekend.
+#
+# `{$APP_DOMAIN}` is read from the environment, which compose fills from `.env`.
+# A literal hostname here would be a hostname baked into an image, so the same
+# image could not answer on staging and production without a rebuild - and the
+# value would be in git, which is the one place a deployment's name is fine to
+# be and the one place a wrong one is easy to miss.
+
+{$APP_DOMAIN} {
+	reverse_proxy api:8000
+
+	# Access logs go here, and deliberately do not yet.
+	#
+	# `log` is one line and would put every request at the proxy into Caddy's
+	# JSON log, which is close to what the checklist's logging item asks for. It
+	# is not uncommented here because that item is a design job rather than a
+	# line - what the format is, where the lines are shipped, how long they are
+	# kept, and what a request is correlated by - and turning it on would move a
+	# decision out of that job and into a proxy config where nobody would look
+	# for it.
+	#
+	# `log`
+}

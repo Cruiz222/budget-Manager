@@ -21,6 +21,12 @@ _OUTFLOWS = (TransactionType.WITHDRAWAL, TransactionType.PAYOUT)
 #: this one exists so the in-memory store is not a second opinion.
 _COUNTED = (TransactionStatus.PENDING, TransactionStatus.SUCCESSFUL)
 
+#: The one type that brings value *in*, and so the only one ``pending_credit_total``
+#: has anything to say about. Named here rather than inlined for the same reason
+#: ``_OUTFLOWS`` is: the balance cap is about what a wallet is about to hold, and
+#: the only row that changes that from outside is a deposit.
+_CREDIT = TransactionType.DEPOSIT
+
 class InMemoryTransactionRepository(TransactionRepository):
     def __init__(self):
         self.transactions = {}
@@ -106,6 +112,34 @@ class InMemoryTransactionRepository(TransactionRepository):
             if transaction.amount.currency is not currency:
                 continue
             if not start <= transaction.created_at < end:
+                continue
+            total = total + transaction.amount
+        return total
+
+    def pending_credit_total(self, wallet_id, currency):
+        """The money in flight into this wallet, mirroring the SQL filter exactly.
+
+        See the port for what counts and why there is no time window. The
+        mirroring is the point here for the reason above, and the one difference
+        from ``outflow_total_between`` is the pair of rules that are *not*
+        applied: there is no ``created_at`` bound, and ``SUCCESSFUL`` is not
+        counted - the first because a pending collection has no day, the second
+        because its money is already in the wallet's balances and the caller adds
+        those separately.
+
+        ``_CREDIT`` is the single type, named at module level for the reason
+        ``_OUTFLOWS`` is: the rule reads in one place rather than as a literal in
+        the middle of a loop.
+        """
+        total = Money(Decimal("0.00"), currency)
+        for transaction in self.transactions.values():
+            if transaction.wallet_id != wallet_id:
+                continue
+            if transaction.type is not _CREDIT:
+                continue
+            if transaction.status is not TransactionStatus.PENDING:
+                continue
+            if transaction.amount.currency is not currency:
                 continue
             total = total + transaction.amount
         return total

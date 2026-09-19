@@ -19,12 +19,26 @@ decision a deployment makes explicitly - by passing its own ``--host``, which is
 what the ``--factory`` form above exists to allow - rather than one this default
 makes for it.
 
-The reason was rewritten in Phase 2a and the conclusion was not. This paragraph
-used to say the header named a user and proved nothing, so anyone on the network
-could act as anyone through the server. The header is gone and that hole is
-closed, but plain HTTP is not TLS and the credentials are real now, so the bind
-is still right for a different reason. Rewritten rather than left, because a
-rationale that outlives its reason reads as a constraint that has lifted.
+**This paragraph now describes one of two ways to run this, and the other one is
+``compose.yaml``.** That file is the deployment: it passes ``--host 0.0.0.0``
+because the only thing that can reach the port is Caddy on the compose network,
+and Caddy is what terminates TLS. So the bind above is the right answer for
+running this on the machine you are sitting at - which is what ``python3 -m
+app.presentation.api`` is for - and no longer a statement about how the software
+is deployed. The default did not change; what changed is that there is now
+somewhere else for a deployment to be, and the deployment makes its own choice
+in the place that choice belongs.
+
+The reason has now been rewritten twice and the conclusion has not changed
+either time. It used to say the header named a user and proved nothing, so
+anyone on the network could act as anyone through the server. That header is
+gone and that hole is closed. Phase 2a rewrote it to point at real credentials
+crossing plain HTTP, which is still true here and still why loopback is the
+default. Phase 4 added the deployment, which answers that objection with a proxy
+rather than with a bind address. Rewritten rather than left both times, because
+a rationale that outlives its reason reads as a constraint that has lifted -
+and after the second rewrite it is worth saying plainly that this one *has*
+lifted, for everything except a bare local run.
 """
 
 import uvicorn

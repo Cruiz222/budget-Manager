@@ -4,9 +4,14 @@ from collections.abc import Callable
 from datetime import datetime
 
 from app.domain.money.destination import Destination
-from app.domain.money.exception import InvalidAmountError, MoneyError
+from app.domain.money.exception import (
+    InvalidAmountError,
+    MoneyError,
+    ReferenceAlreadyRefusedError,
+)
 from app.domain.money.money import Money
 from app.domain.money.transaction import Transaction
+from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.repositories.transaction_repository import TransactionRepository
@@ -168,6 +173,24 @@ class WalletOperation(ABC):
             internal_reference
         )
         if existing is not None:
+            # A FAILED row is a *refusal*, not an outcome, and the lookup above
+            # answers with a row whatever its status - so returning it would
+            # report a movement that never happened as one that did, and on an
+            # announced operation would compose a receipt for it. So the retry
+            # is refused instead. See ``ReferenceAlreadyRefusedError`` for why
+            # the row cannot be re-opened and why a fresh key is the way to ask
+            # again.
+            #
+            # PENDING and SUCCESSFUL are the real dedupe hit: the movement is
+            # under way or already done, the row *is* the outcome, and a client
+            # retrying after a lost response gets the same answer it would have
+            # got the first time - which is what makes this door retryable.
+            if existing.status is TransactionStatus.FAILED:
+                raise ReferenceAlreadyRefusedError(
+                    f"the reference {internal_reference!r} already names a "
+                    f"refused {self.transaction_type.value}; a retry needs a "
+                    f"fresh reference"
+                )
             return existing
 
         # 3. Record intent BEFORE touching the wallet. A payout reaches here

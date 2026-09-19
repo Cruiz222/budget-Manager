@@ -1045,14 +1045,25 @@ class WalletService:
         in one place, instead of being spread through the flow every operation
         shares.
 
-        **Silent too for a transaction that is still PENDING**, which is the
-        second reason to send nothing and a different one. A row in ``ANNOUNCED``
-        says the operation is worth telling the owner about; a PENDING row says
-        the thing worth telling them about has not happened yet. Every sentence
+        **Silent too unless the row actually succeeded**, which is the second
+        reason to send nothing and a different one. A row in ``ANNOUNCED`` says
+        the operation is worth telling the owner about; the row's status says
+        whether the thing worth telling them about has happened. Every sentence
         ``compose.wallet_movement`` writes is past tense and specific - *"5000.00
         NGN left the wallet"*, *"5000.00 NGN was paid to ..."* - so a receipt
         composed here would assert a transfer that no one has made, to a person
         who may act on it.
+
+        **The guard reads ``is not SUCCESSFUL`` rather than ``is not PENDING``,
+        and the difference is a bug that was reachable.** PENDING and FAILED are
+        both "not yet a fact", but only the first was being skipped - so a FAILED
+        row reaching here was announced, which is the loudest possible version of
+        the lie above: a receipt for a movement that was *refused*. Nothing could
+        reach this with one today, because ``WalletOperation.execute`` now raises
+        rather than returning a FAILED row (see ``ReferenceAlreadyRefusedError``)
+        - but the guard was asking the narrower question, and the state it failed
+        to exclude is the one that must never be announced. ``SettlePayment``'s
+        own ``_announce`` asks it the wide way, and the two now agree.
 
         It would also be built from a lie about time: ``wallet_movement`` stamps
         the message with ``transaction.completed_at``, which is ``None`` until a
@@ -1079,7 +1090,7 @@ class WalletService:
         if kind is None:
             return
 
-        if transaction.status is TransactionStatus.PENDING:
+        if transaction.status is not TransactionStatus.SUCCESSFUL:
             return
 
         notification = compose.wallet_movement(

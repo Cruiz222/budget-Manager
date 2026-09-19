@@ -375,3 +375,134 @@ def test_outflow_is_one_wallets_and_one_currencys():
         Decimal("500.00"), Currency.USD
     )
 
+
+# --- what is on its way in ---------------------------------------------------
+#
+# The mirror of the section above, and the reason the port grew a second
+# aggregate: the daily outflow cap counted money already in flight while the
+# balance cap did not, so a burst of deposits each passed on its own. These tests
+# are the filter that closes it, and the case they are most about is the one that
+# is *excluded* - a settled deposit - because counting it would double the money
+# the caller adds from the wallet's own balances.
+
+
+def build_credit(wallet_id, **overrides):
+    """A movement of value *into* ``wallet_id``, at ``MIDDAY`` by default."""
+    kwargs = dict(
+        wallet_id=wallet_id,
+        type=TransactionType.DEPOSIT,
+        amount=Money(Decimal("1000.00"), Currency.NGN),
+        internal_reference=str(uuid4()),
+        created_at=MIDDAY,
+    )
+    kwargs.update(overrides)
+    return Transaction(**kwargs)
+
+
+def credits(repository, wallet_id, currency=Currency.NGN):
+    """That wallet's money in flight, with the currency filled in."""
+    return repository.pending_credit_total(wallet_id, currency)
+
+
+def test_credits_of_an_empty_ledger_is_zero_in_the_wallets_currency():
+    """Zero rather than ``None``, carrying the currency it was asked about.
+
+    The caller adds this to a wallet's balances on every path, so an absent
+    answer would make the cap's arithmetic conditional on there being a deposit
+    open - which is exactly backwards, since the ordinary case is that there is
+    not.
+    """
+    repository = InMemoryTransactionRepository()
+
+    total = credits(repository, uuid4())
+
+    assert total == Money(0, Currency.NGN)
+    assert total.currency is Currency.NGN
+
+
+def test_credits_count_a_deposit_that_has_not_arrived():
+    """The whole point of the read: money is coming and the wallet does not hold it."""
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    repository.save(build_credit(wallet_id))
+
+    assert credits(repository, wallet_id) == Money(Decimal("1000.00"), Currency.NGN)
+
+
+@pytest.mark.parametrize(
+    ("transaction_type", "settle"),
+    [
+        # Arrived - so its money is in the wallet's balances, which the caller
+        # adds separately. This is the row that must not be counted twice.
+        (TransactionType.DEPOSIT, "successful"),
+        # The attempt is over and nothing is coming.
+        (TransactionType.DEPOSIT, "failed"),
+        # A deposit was taken back, which is a finished fact about money that did
+        # land - and the balance it landed in was already reconciled against it.
+        (TransactionType.DEPOSIT, "reversed"),
+        # Moved between the wallet's own two balances: a pot is money the wallet
+        # already holds, and the cap counts what it holds.
+        (TransactionType.LOCK_FUNDS, None),
+        (TransactionType.UNLOCK_FUNDS, None),
+        # Value leaving. The balance cap faces inbound value only.
+        (TransactionType.WITHDRAWAL, None),
+    ],
+)
+def test_credits_exclude_every_row_whose_money_is_not_still_coming(
+    transaction_type, settle
+):
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    transaction = build_credit(wallet_id, type=transaction_type)
+    if settle == "successful":
+        transaction.mark_successful()
+    elif settle == "failed":
+        transaction.mark_failed()
+    elif settle == "reversed":
+        transaction.mark_successful()
+        transaction.reverse()
+    repository.save(transaction)
+
+    assert credits(repository, wallet_id) == Money(0, Currency.NGN)
+
+
+def test_credits_have_no_window_and_are_summed_exactly():
+    """A payment waiting across midnight is the row that most needs counting.
+
+    Unlike the outflow total, which is bounded by a day because its ceiling is a
+    daily allowance, a pending collection has no day - so one opened long before
+    the moment being judged still counts. The assertion is over a sum of
+    hundredths, which is the accumulation that would drift first if these were
+    ever added as floats.
+    """
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    for _ in range(3):
+        repository.save(build_credit(wallet_id, amount=Money(Decimal("0.01"), Currency.NGN)))
+    # Stamped a year before the rows above, and still counted.
+    repository.save(
+        build_credit(
+            wallet_id,
+            amount=Money(Decimal("999.99"), Currency.NGN),
+            created_at=datetime(2025, 3, 2),
+        )
+    )
+
+    assert credits(repository, wallet_id) == Money(Decimal("1000.02"), Currency.NGN)
+
+
+def test_credits_are_one_wallets_and_one_currencys():
+    wallet_id = uuid4()
+    repository = InMemoryTransactionRepository()
+    mine = build_credit(wallet_id, amount=Money(Decimal("300.00"), Currency.NGN))
+    theirs = build_credit(uuid4(), amount=Money(Decimal("9000.00"), Currency.NGN))
+    foreign = build_credit(wallet_id, amount=Money(Decimal("500.00"), Currency.USD))
+    for transaction in (mine, theirs, foreign):
+        repository.save(transaction)
+
+    assert credits(repository, wallet_id) == Money(Decimal("300.00"), Currency.NGN)
+    assert credits(repository, wallet_id, Currency.USD) == Money(
+        Decimal("500.00"), Currency.USD
+    )
+    assert credits(repository, uuid4()) == Money(0, Currency.NGN)
+

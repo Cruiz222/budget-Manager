@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from app.application.payments.settle_payment import SettlePayment
 from app.application.payments.settledPayment import SettlementOutcome
+from app.domain.identity.tier import Tier, limits_for
 from app.domain.money.currency import Currency
 from app.domain.money.destination import Destination
 from app.domain.money.destinationKind import DestinationKind
@@ -49,6 +50,13 @@ DESTINATION = Destination(
     name="Chinedu Okafor",
     details={"bank_code": "058"},
 )
+
+#: The most an account with no profile may hold, in the wallet's own currency.
+#:
+#: Read from the table rather than typed out, like every other limit test in this
+#: suite: a test that hard-coded the number would go on passing - and asserting a
+#: crossing that no longer happens - after somebody raised the cap.
+CAP = limits_for(Tier.UNVERIFIED, NGN).max_balance
 
 
 def a_settler(tmp_path, recipient=None, name="settle.db"):
@@ -224,6 +232,72 @@ class TestAChargeCredits:
 
         receipts = pending_receipts(factory)
         assert [one.kind for one in receipts] == [NotificationKind.WALLET_DEPOSIT]
+
+
+class TestACreditThatCrossesTheCap:
+    """The residue of the burst, and the one outcome that is an alarm as well.
+
+    ``InitiateDeposit._prepare`` refuses an over-cap deposit before the payer is
+    sent anywhere, so this state is only reachable by the case that check cannot
+    reach: two collections opened in the same instant, both reading a wallet that
+    still fit, and both paid. When it happens the money is real, it is the
+    payer's, and it is already inside the system - and ``PaymentProvider`` has no
+    transfer method, so there is no rail to send it back on. Refusing to credit
+    would leave the money at the provider with no automated path home and a row
+    saying it was settled.
+
+    So the credit is applied and the crossing is *reported*, which is what these
+    tests pin: the balance moved, the row finished, and the outcome says a
+    ceiling was crossed. See ``SettlementOutcome.BALANCE_CAP_EXCEEDED``.
+    """
+
+    def test_the_credit_is_applied_and_the_crossing_is_named(
+        self, tmp_path, build_wallet
+    ):
+        wallet = build_wallet(available="1000")
+        row = a_deposit(wallet, amount=str(CAP.amount), reference="dep-1")
+        settler, factory = a_settler(tmp_path)
+        seed(factory, wallet, row)
+
+        result = settler.settle(
+            settled(ProviderEvent.CHARGE_SUCCEEDED, "dep-1", str(CAP.amount))
+        )
+
+        assert result.outcome is SettlementOutcome.BALANCE_CAP_EXCEEDED
+        # A movement rather than a refusal, and this assertion is the one that
+        # says so: ``moved_money`` is what the reconciler's report counts, and a
+        # member left out of ``_MOVEMENTS`` would report "no" about a wallet that
+        # had just been credited.
+        assert result.moved_money
+        assert available(factory, wallet) == Money(CAP.amount + Decimal("1000"), NGN)
+        assert stored_row(factory, "dep-1").status is TransactionStatus.SUCCESSFUL
+
+        # The numbers come from ``check_credit``'s own fields rather than from a
+        # second comparison written here, so both figures are the rule's.
+        assert str(CAP) in result.detail
+        assert str(Money(CAP.amount + Decimal("1000"), NGN)) in result.detail
+
+    def test_a_credit_that_lands_exactly_on_the_cap_is_not_reported(
+        self, tmp_path, build_wallet
+    ):
+        """The boundary, at this door as well as in the domain and the deposit one.
+
+        ``check_credit`` refuses a balance *above* the cap, so a wallet that lands
+        exactly on it is within its limits and nothing was crossed. Pinned here
+        because this is the third place that comparison is asked, and a courtesy
+        check is exactly the kind of code that quietly becomes ``>=`` - the
+        deposit would be refused while it fitted, or in this case reported as a
+        breach while it was not.
+        """
+        wallet = build_wallet(available=str(CAP.amount - Decimal("5000")))
+        row = a_deposit(wallet, reference="dep-1")
+        settler, factory = a_settler(tmp_path)
+        seed(factory, wallet, row)
+
+        result = settler.settle(settled(ProviderEvent.CHARGE_SUCCEEDED, "dep-1"))
+
+        assert result.outcome is SettlementOutcome.DEPOSIT_CREDITED
+        assert available(factory, wallet) == CAP
 
 
 class TestATransferThatLanded:

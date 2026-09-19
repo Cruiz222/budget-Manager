@@ -205,6 +205,39 @@ class ConfirmationExpiredError(MoneyError):
 class ConfirmationAlreadyUsedError(MoneyError):
     pass
 
+# --- A key that was spent by a refusal ------------------------------------
+# Raised by ``WalletOperation.execute`` when the reference it was handed
+# already names a **FAILED** row.
+#
+# **The bug this closes is a false success, and it is the only shape of it
+# ``WalletOperation`` could produce.** Deduplication reads
+# ``get_by_internal_reference``, a global lookup that answers with the row
+# *whatever its status*. So a caller who retried under a key whose first
+# attempt was refused was handed that FAILED row back, moved nothing, and was
+# told the movement had succeeded - and on the announced operations a receipt
+# was composed for a payment that never happened. Returning a FAILED row is
+# therefore not a dedupe hit; it is a refusal that has been read as an outcome.
+#
+# **Why the retry is refused rather than allowed to run.** Re-opening the
+# FAILED row would mean mutating a ledger entry, which ``claude.md`` forbids
+# outright - corrections are compensating entries, never edits to history - and
+# no ``Transaction`` transition expresses it. Neither can the retry simply write
+# a second row: ``transactions.internal_reference`` is ``NOT NULL UNIQUE``, and
+# the FAILED row is the audit trail of the refused attempt. So the honest answer
+# is that this key has been spent, and a caller who has fixed whatever was wrong
+# asks again under a **fresh** key - which is the retry shape
+# ``test_a_failed_release_can_be_retried_and_the_retry_succeeds`` already
+# documents.
+#
+# **A 409, by being added to the ``CONFLICT`` tuple in
+# ``app.presentation.api.errors``.** The row exists and its own state refuses
+# this, which is the same row ``ConfirmationAlreadyUsedError`` and
+# ``DepositAlreadyInitiatedError`` sit on - and the latter is the closest
+# precedent: the deposit door refuses a reused key for the same reason and in
+# the same words.
+class ReferenceAlreadyRefusedError(MoneyError):
+    pass
+
 # --- A key that cannot become a reference --------------------------------
 # Raised by ``app.domain.money.reference.scoped_reference``, which is the one
 # place a caller's idempotency key is turned into a ledger reference - and so the

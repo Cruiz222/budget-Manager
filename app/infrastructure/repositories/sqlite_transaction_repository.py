@@ -230,6 +230,52 @@ class SqliteTransactionRepository(TransactionRepository):
             start=Money(Decimal("0.00"), currency),
         )
 
+    def pending_credit_total(self, wallet_id, currency: Currency) -> Money:
+        """See the port for what counts and why there is no time window.
+
+        **The sum is done in Python and not by ``SUM()``, for the reason above
+        rather than by analogy.** Amounts are stored as TEXT and SQLite's
+        ``SUM`` coerces a text operand to REAL, so ``SELECT SUM(amount)`` would
+        do the arithmetic in binary floating point - and this total is added to
+        a wallet's balances and compared against the balance cap with ``>``, so
+        a hair under admits a deposit that is a hair over. This is the same
+        hazard in the same units, one method over.
+
+        **There is no ``created_at`` bound**, unlike the method above, and the
+        absence is the port's argument rather than an omission: a day bounds an
+        outflow because its ceiling is a daily allowance, and a pending
+        collection has no day. It is in flight until it settles or is abandoned,
+        whenever that happens - so a payment waiting across midnight is counted,
+        which is precisely the row that most needs counting.
+
+        ``PENDING`` is the only status, because it is the only one whose money
+        is neither in the wallet nor gone. ``SUCCESSFUL`` would be double
+        counting - the caller adds the wallet's balances separately - and
+        ``FAILED`` and ``REVERSED`` are finished facts about money that is not
+        coming.
+        """
+        rows = self._connection.execute(
+            """
+            SELECT amount
+            FROM transactions
+            WHERE wallet_id = ?
+              AND currency = ?
+              AND type = ?
+              AND status = ?
+            """,
+            (
+                uuid_to_text(wallet_id),
+                enum_to_text(currency),
+                enum_to_text(TransactionType.DEPOSIT),
+                enum_to_text(TransactionStatus.PENDING),
+            ),
+        ).fetchall()
+
+        return sum(
+            (text_to_money(row["amount"], currency) for row in rows),
+            start=Money(Decimal("0.00"), currency),
+        )
+
     def _row_to_transaction(self, row) -> Transaction:
         currency = text_to_enum(Currency, row["currency"])
         return Transaction(

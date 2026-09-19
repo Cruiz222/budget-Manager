@@ -16,6 +16,7 @@ from app.domain.money.exception import (
     ConfirmationExpiredError,
     ConfirmationNotFoundError,
     InsufficientFundsError,
+    ReferenceAlreadyRefusedError,
     WalletAlreadyActiveError,
     WalletAlreadyClosedError,
     WalletAlreadyFrozenError,
@@ -869,6 +870,46 @@ class TestTheReceiptForAWalletCommand:
             )
 
         assert notifications_of(factory) == []
+
+    def test_replaying_a_refused_reference_says_nothing_either(
+        self, tmp_path, build_wallet
+    ):
+        """The test above taken one step further, and the step is the whole defect.
+
+        ``test_a_rejected_operation_says_nothing`` pins the *first* call: the
+        refusal raises, ``_run`` never reaches ``_announce``, and the user is left
+        reading the error. What it did not pin is the retry. The dedupe lookup
+        answers with a row whatever its status, so a replay used to be handed the
+        FAILED row, ``execute`` returned it normally, and ``_run`` carried on as
+        though the deposit had happened - wallets saved, commit reached, and a
+        receipt composed. The user is told the deposit succeeded and is emailed
+        about it, and the money never arrived.
+
+        Both halves of the fix are asserted here because either one alone leaves
+        the defect reachable on this path. The refusal is what stops the replay
+        from being reported as an outcome; the silence is what stops it being
+        *announced* as one. The balance is the third: nothing moved, on either
+        call.
+        """
+        wallet = build_wallet(status=WalletStatus.CLOSED)
+        service, factory = build_service(tmp_path, recipient=RECIPIENT)
+        seed(factory, wallet)
+        reference = str(uuid4())
+
+        with pytest.raises(WalletClosedError):
+            service.deposit(wallet.wallet_id, Money(Decimal("5000"), NGN), reference)
+
+        assert notifications_of(factory) == []
+
+        with pytest.raises(ReferenceAlreadyRefusedError):
+            service.deposit(wallet.wallet_id, Money(Decimal("5000"), NGN), reference)
+
+        assert notifications_of(factory) == []
+        # Unchanged from what ``build_wallet`` built it with, so the assertion
+        # reads as "the deposit did not land" rather than as a magic number.
+        assert get_wallet(factory, wallet.wallet_id).available_balance == Money(
+            Decimal("10000"), NGN
+        )
 
     def test_with_no_recipient_the_command_happens_and_says_nothing(
         self, tmp_path, build_wallet

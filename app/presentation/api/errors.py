@@ -102,6 +102,7 @@ from app.domain.money.exception import (
     InsufficientFundsError,
     MaturityNotExtendedError,
     MoneyError,
+    ReferenceAlreadyRefusedError,
     TransactionNotFoundError,
     WalletAlreadyActiveError,
     WalletAlreadyClosedError,
@@ -338,6 +339,7 @@ CONFLICT = (
     PasswordResetAlreadyUsedError,
     PhoneVerificationExpiredError,
     PhoneVerificationAlreadyUsedError,
+    ReferenceAlreadyRefusedError,
 )
 
 

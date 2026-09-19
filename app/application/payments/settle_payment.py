@@ -1,6 +1,10 @@
+from uuid import UUID
+
 from app.application.notifications import compose
 from app.application.payments.settledPayment import SettlementOutcome, SettledPayment
 from app.application.unit_of_work import UnitOfWork, UnitOfWorkFactory
+from app.domain.identity.exception import TierLimitExceededError
+from app.domain.identity.tier import check_credit, tier_for
 from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
@@ -45,6 +49,15 @@ class SettlePayment:
     middle two are the ones worth reading twice - see ``release_hold`` for why
     giving money back is not ``apply_deposit``, and ``ProviderEvent`` for why a
     failure and a reversal are different facts that happen to pay out the same.
+
+    **A fifth thing can be said about a charge, and it is said on top of the
+    first.** A charge is the only one of the four that raises what the wallet
+    holds - the other three either move no balance or move money between two the
+    wallet already had - so it is the only one that can leave an account above its
+    ceiling. ``_cap_crossed`` below asks that question once the credit has been
+    applied, and the answer travels in the outcome rather than as a refusal: see
+    ``SettlementOutcome.BALANCE_CAP_EXCEEDED`` for why accepting loudly is the
+    only shape this can take.
 
     **Idempotency is the row's own status, and no table is needed for it.** A
     second ``CHARGE_SUCCEEDED`` finds a row that is no longer PENDING and stops.
@@ -131,15 +144,21 @@ class SettlePayment:
             uow.transactions.save(row)
             uow.wallets.save(wallet)
             self._announce(uow, wallet, row)
+
+            movement = self._movement_for(outcome.event)
+            detail = f"{outcome.event.value} applied to a {row.type.value}"
+            if outcome.event is ProviderEvent.CHARGE_SUCCEEDED:
+                crossed = self._cap_crossed(uow, owner, wallet)
+                if crossed is not None:
+                    movement = SettlementOutcome.BALANCE_CAP_EXCEEDED
+                    detail = crossed
         except BaseException:
             uow.rollback()
             raise
         else:
             uow.commit()
             return SettledPayment(
-                outcome=self._movement_for(outcome.event),
-                reference=outcome.reference,
-                detail=f"{outcome.event.value} applied to a {row.type.value}",
+                outcome=movement, reference=outcome.reference, detail=detail
             )
 
     # --- the table ----------------------------------------------------------
@@ -256,6 +275,52 @@ class SettlePayment:
             SettlementOutcome.ALREADY_SETTLED,
             f"this {row.type.value} is already {row.status.value}",
         )
+
+    @staticmethod
+    def _cap_crossed(uow: UnitOfWork, owner: UUID, wallet: Wallet) -> str | None:
+        """Whether the credit just applied left this wallet over its cap.
+
+        Returns the sentence for the log if it did, and ``None`` if it did not -
+        which is the ordinary case, and the reason this is a question asked on
+        the way past rather than a branch the class is built around.
+
+        **The ceiling is asked for rather than restated.** ``check_credit`` is the
+        same function ``InitiateDeposit._prepare`` calls to refuse this deposit
+        before the payer is ever sent anywhere, and the same one the direct-credit
+        door calls - so "what is over the cap" has one definition in this
+        codebase, and this is a third caller rather than a third copy. What the
+        exception carries is why it is worth catching rather than re-deriving:
+        ``limit`` and ``attempted`` are the ceiling and the balance that breached
+        it, as structured fields rather than prose, so the sentence below can be
+        written about a credit that has *happened* instead of borrowing a message
+        that says "would leave".
+
+        **The catch is the whole shape of this method, and it is the same move
+        ``_limit_block`` makes in ``RunDuePlans`` one layer over.** There, a tier
+        refusal about one plan is turned into that plan's block reason rather than
+        allowed to end the scheduler tick; here, a tier refusal about one wallet
+        is turned into an outcome rather than allowed to end the webhook. In both
+        cases the fact is about one account and the exception would be about the
+        whole run - and here it is sharper still, because the money has already
+        been credited by the time this runs. The question is not "may this be
+        applied" but "should somebody be told", and a refusal that answers the
+        first cannot answer the second.
+
+        Both balances, because a pot is money this account still holds - the
+        reading ``check_credit``'s own docstring gives, and the one the door uses
+        when it projects the same sum.
+        """
+        try:
+            check_credit(
+                tier_for(uow.profiles.find_for_user(owner)),
+                wallet.available_balance + wallet.locked_balance,
+            )
+        except TierLimitExceededError as exceeded:
+            return (
+                f"the wallet was credited and now holds {exceeded.attempted}, "
+                f"above the {exceeded.limit} maximum balance for this account"
+            )
+        return None
 
     @staticmethod
     def _movement_for(event: ProviderEvent) -> SettlementOutcome:
