@@ -1,0 +1,593 @@
+/*
+ * One stylesheet for every page, and the only file in this repository that is
+ * not Python, HTML or a document.
+ *
+ * **It is served from the same application that renders the pages**, mounted at
+ * /app/static - so there is no CDN, no build step, no font download and no
+ * second process. A page here makes exactly two network requests: itself, and
+ * this file. (The Google button on the two identity pages is a third, and only
+ * when that installation has configured Google.)
+ *
+ * **Colours are tokens, and both schemes are complete.** Every colour is defined
+ * once on :root, and the dark block redefines the same names - so nothing has a
+ * colour that exists only in one scheme, and a value that was missed shows up as
+ * a light-on-light rather than as a subtly wrong grey.
+ *
+ * **Nothing here is load-bearing.** With this file absent every page is still
+ * readable, still navigable and still correct; it decides how things look and
+ * never what they say.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --ground: #fbfaf8;
+  --surface: #ffffff;
+  --edge: #e4e0d9;
+  --edge-strong: #cfc9bf;
+
+  --ink: #1c1a17;
+  --ink-soft: #5d574e;
+  --ink-faint: #8b8378;
+
+  --accent: #1f5f4b;
+  --accent-ink: #ffffff;
+  --accent-quiet: #e8f0ec;
+
+  --warn: #8a5a00;
+  --warn-quiet: #fbf1dc;
+  --stop: #8c2f2f;
+  --stop-quiet: #fbe9e7;
+
+  --radius: 10px;
+  --gap: 1rem;
+  --measure: 68ch;
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
+    monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #14140f;
+    --surface: #1d1c17;
+    --edge: #302e26;
+    --edge-strong: #45423a;
+
+    --ink: #f0ede6;
+    --ink-soft: #b3ac9f;
+    --ink-faint: #857e72;
+
+    --accent: #6fc0a2;
+    --accent-ink: #10241d;
+    --accent-quiet: #1e2e28;
+
+    --warn: #e0b667;
+    --warn-quiet: #2e2718;
+    --stop: #e79b95;
+    --stop-quiet: #2e1d1c;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* --- the shell ---------------------------------------------------------- */
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.9rem max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  border-bottom: 1px solid var(--edge);
+  background: var(--surface);
+}
+
+.wordmark {
+  font-weight: 650;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.who {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.who-name {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 16rem;
+}
+
+main {
+  padding: 1.5rem max(1rem, env(safe-area-inset-left)) 3rem;
+}
+
+.foot {
+  padding: 1.25rem max(1rem, env(safe-area-inset-left)) 2rem;
+  border-top: 1px solid var(--edge);
+  color: var(--ink-faint);
+  font-size: 0.8rem;
+}
+
+.foot p {
+  max-width: var(--measure);
+  margin: 0 auto;
+}
+
+/* --- layout ------------------------------------------------------------- */
+
+.sheet {
+  max-width: 56rem;
+  margin: 0 auto;
+}
+
+.sheet.narrow {
+  max-width: 32rem;
+}
+
+.panel {
+  margin-top: 1.5rem;
+  padding: 1.1rem 1.2rem;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+}
+
+.panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  letter-spacing: -0.005em;
+}
+
+.actions {
+  display: grid;
+  gap: var(--gap);
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 40rem) {
+  .actions {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* --- type --------------------------------------------------------------- */
+
+h1 {
+  margin: 0 0 0.4rem;
+  font-size: 1.6rem;
+  letter-spacing: -0.02em;
+}
+
+h1.failure {
+  font-size: 2.6rem;
+  color: var(--stop);
+  font-variant-numeric: tabular-nums;
+}
+
+.lede {
+  margin: 0 0 1.25rem;
+  color: var(--ink-soft);
+  max-width: var(--measure);
+}
+
+.crumb {
+  margin: 0 0 0.75rem;
+  font-size: 0.85rem;
+}
+
+.crumb a {
+  color: var(--ink-soft);
+}
+
+.muted {
+  color: var(--ink-faint);
+}
+
+.small {
+  font-size: 0.82rem;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  overflow-wrap: anywhere;
+}
+
+/* --- forms -------------------------------------------------------------- */
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0;
+}
+
+.stack label {
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  margin-top: 0.4rem;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="email"],
+select {
+  width: 100%;
+  padding: 0.55rem 0.65rem;
+  font: inherit;
+  color: var(--ink);
+  background: var(--ground);
+  border: 1px solid var(--edge-strong);
+  border-radius: 8px;
+}
+
+input:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button {
+  font: inherit;
+  padding: 0.55rem 0.9rem;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--edge-strong);
+  border-radius: 8px;
+  cursor: pointer;
+  align-self: start;
+}
+
+button.primary {
+  margin-top: 0.9rem;
+  color: var(--accent-ink);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+button.linkish {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--ink-soft);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: 0.9rem;
+}
+
+a.button {
+  display: inline-block;
+  padding: 0.55rem 0.9rem;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+a.button.quiet {
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--edge-strong);
+  font-weight: 400;
+}
+
+.or {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.25rem 0;
+  color: var(--ink-faint);
+  font-size: 0.8rem;
+}
+
+.or::before,
+.or::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--edge);
+}
+
+.google-slot {
+  min-height: 2.6rem;
+}
+
+.note {
+  margin-top: 1.25rem;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+
+/* --- wallet list -------------------------------------------------------- */
+
+.cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--gap);
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 40rem) {
+  .cards {
+    grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  }
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.card-main {
+  display: block;
+  padding: 1rem 1.2rem 0.6rem;
+  text-decoration: none;
+  color: var(--ink);
+}
+
+.card-amount {
+  font-size: 1.7rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.card-currency,
+.card-label {
+  color: var(--ink-faint);
+  font-size: 0.85rem;
+  margin-left: 0.35rem;
+}
+
+.card-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.1rem 0.75rem;
+  margin: 0;
+  padding: 0.6rem 1.2rem 1rem;
+  border-top: 1px solid var(--edge);
+  font-size: 0.85rem;
+}
+
+.card-facts dt {
+  color: var(--ink-faint);
+}
+
+.card-facts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.empty {
+  padding: 1.5rem 1.2rem;
+  background: var(--accent-quiet);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+}
+
+.empty h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+
+.empty p {
+  margin: 0;
+  color: var(--ink-soft);
+  max-width: var(--measure);
+}
+
+/* --- one wallet --------------------------------------------------------- */
+
+.balance {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+  margin: 0.25rem 0 0.15rem;
+}
+
+.balance-amount {
+  font-size: 2.4rem;
+  font-weight: 650;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.balance-currency,
+.balance-label {
+  color: var(--ink-faint);
+}
+
+.balance-locked {
+  flex-basis: 100%;
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+}
+
+.pots {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.pot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.6rem 0;
+  border-top: 1px solid var(--edge);
+}
+
+.pot:first-child {
+  border-top: none;
+}
+
+.pot-name {
+  font-weight: 600;
+}
+
+.pot-balance {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- ledger ------------------------------------------------------------- */
+
+.scroller {
+  overflow-x: auto;
+}
+
+.ledger {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.ledger th,
+.ledger td {
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+  border-bottom: 1px solid var(--edge);
+  vertical-align: top;
+}
+
+.ledger th {
+  color: var(--ink-faint);
+  font-weight: 500;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ledger td:nth-child(3) {
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- one confirmation --------------------------------------------------- */
+
+.request {
+  padding: 1.1rem 1.2rem;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-left: 4px solid var(--edge-strong);
+  border-radius: var(--radius);
+}
+
+.request.status-awaiting {
+  border-left-color: var(--warn);
+}
+
+.request.status-confirmed {
+  border-left-color: var(--accent);
+}
+
+.request.status-expired {
+  border-left-color: var(--ink-faint);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0;
+}
+
+.facts dt {
+  color: var(--ink-faint);
+  font-size: 0.85rem;
+}
+
+.facts dd {
+  margin: 0;
+}
+
+.facts dd.big {
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  background: var(--edge);
+  color: var(--ink-soft);
+}
+
+.badge-awaiting {
+  background: var(--warn-quiet);
+  color: var(--warn);
+}
+
+.badge-confirmed {
+  background: var(--accent-quiet);
+  color: var(--accent);
+}
+
+.badge-expired {
+  background: var(--stop-quiet);
+  color: var(--stop);
+}

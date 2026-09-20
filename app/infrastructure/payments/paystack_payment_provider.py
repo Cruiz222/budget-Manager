@@ -202,12 +202,12 @@ class PaystackPaymentProvider(PaymentProvider):
     There is no partially-successful initialization to model - a collection was
     either opened or it was not.
 
-    Holds a secret key and nothing else. No client, no connection, no session:
-    each call opens what it needs and closes it again, the same choice
-    ``SmtpNotificationChannel`` makes and for the same reason - a long-lived
-    connection is state that outlives the request, and state that outlives the
-    request is what has to be thought about at shutdown. The cost is a handshake
-    per call, and this endpoint is human-paced.
+    Holds a secret key and where a payer comes back to, and nothing else. No
+    client, no connection, no session: each call opens what it needs and closes it
+    again, the same choice ``SmtpNotificationChannel`` makes and for the same
+    reason - a long-lived connection is state that outlives the request, and state
+    that outlives the request is what has to be thought about at shutdown. The
+    cost is a handshake per call, and this endpoint is human-paced.
     """
 
     def __init__(
@@ -216,6 +216,7 @@ class PaystackPaymentProvider(PaymentProvider):
         timeout: int = DEFAULT_TIMEOUT,
         *,
         currencies: frozenset[Currency] = SUPPORTED_CURRENCIES,
+        callback_url: str | None = None,
     ):
         self._secret_key = secret_key
         self._timeout = timeout
@@ -226,6 +227,20 @@ class PaystackPaymentProvider(PaymentProvider):
         # rather than a constant - which is the bug this file used to have, and it
         # is not provable against a provider that only ever collects one currency.
         self._currencies = currencies
+        # Where the payer is sent once they have paid, or ``None`` for nowhere in
+        # particular - which is what every installation did before the setting
+        # existed. ``currencies`` and ``timeout`` are the precedent: a
+        # per-deployment fact, keyword-only, with a default that keeps every
+        # existing construction working.
+        #
+        # **It is an absolute address rather than a path**, because Paystack is
+        # the one that will send a browser to it: a relative path would be
+        # resolved against *their* origin, and the payer would land on
+        # paystack.co. So the absolute form is not a preference a caller may get
+        # wrong, and it is why this is a wiring concern rather than one this file
+        # could fix up - the composition root is the only frame that knows the
+        # public origin, and this parameter is how that fact arrives.
+        self._callback_url = callback_url
 
     def supported_currencies(self) -> frozenset[Currency]:
         """What this account will collect in. See the port for the contract.
@@ -274,6 +289,22 @@ class PaystackPaymentProvider(PaymentProvider):
         ``amount.currency.value`` makes the disagreement unrepresentable, because
         there is now one object deciding both.
 
+        **A payer is sent back somewhere, when this installation has said where.**
+        ``callback_url`` is added to the payload only when one was given at
+        construction, and the conditional is the point rather than a guard: an
+        installation with no public address must send byte-for-byte the payload it
+        sent before this field existed, because ``"callback_url": null`` is a third
+        thing - not "nowhere in particular" but "here is a field whose value is
+        nothing" - and a provider is free to refuse that for reasons it will not
+        explain. So the absent case is an absent key.
+
+        **What this buys is a browser, not a settlement.** Paystack sends the payer
+        to this address once they have finished paying; whether the deposit is
+        credited is decided by ``/webhooks/paystack`` and by nothing else, so a
+        person who lands back here may well see their balance unchanged for a few
+        seconds. That is the honest reading of the return and it is why the setting
+        is optional: an installation without it loses a courtesy, not a payment.
+
         **The check above the request is a backstop, not the door.** The door is
         ``InitiateDeposit``, which asks ``supported_currencies`` and refuses before
         a payer is sent anywhere - and that is the refusal a client sees. This one
@@ -287,15 +318,21 @@ class PaystackPaymentProvider(PaymentProvider):
                 f"it collects {_currency_names(self._currencies)}"
             )
 
+        payload = {
+            "email": email,
+            "amount": _subunit(amount),
+            "reference": reference,
+            "currency": amount.currency.value,
+        }
+        if self._callback_url is not None:
+            # Added rather than passed as ``None``. See the docstring: the absent
+            # case is an absent key, not an empty value.
+            payload["callback_url"] = self._callback_url
+
         status, response = self._request(
             "POST",
             "/transaction/initialize",
-            payload={
-                "email": email,
-                "amount": _subunit(amount),
-                "reference": reference,
-                "currency": amount.currency.value,
-            },
+            payload=payload,
             answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
         )
 

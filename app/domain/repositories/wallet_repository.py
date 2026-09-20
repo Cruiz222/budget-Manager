@@ -36,6 +36,36 @@ class WalletRepository(ABC):
         pass
 
     @abstractmethod
+    def list_for_owner(self, user_id) -> list[Wallet]:
+        """Every wallet this owner holds, oldest first.
+
+        **It takes an owner id, and that is the whole of its defence.** The
+        method ``get_by_id`` was removed for - and the paragraph in ``get_owned``
+        is about - a signature with an *owner-shaped hole* in it: a lookup that
+        named a wallet and not a person, so that whoever called it got whatever
+        it found. This names the person and not the wallet, which is the same
+        rule read in the other direction. There is no argument to this method
+        that a caller could fill in with somebody else's wallet, because there is
+        no wallet argument at all.
+
+        **An empty list is an answer, unlike ``get_owned``'s raise.** That
+        method is asked about one wallet a caller already has an id for, so
+        finding nothing is a contradiction worth refusing; this is asked by
+        somebody who does not know what they hold, so "nothing" is the ordinary
+        state of a person who has not opened a wallet yet. The asymmetry is the
+        same one ``WalletNotEmptyError`` and an empty ledger have: absence is
+        only a refusal when the question presupposed a presence.
+
+        **The caller is a person looking at their own account.** Its arrival is
+        what closes the last gap in the browser client - ``WalletService`` had
+        ``get_wallet`` and ``transactions_for_wallet``, both of which demand a
+        wallet id, and a person who has never been told one cannot begin. It is
+        equally owed to the JSON API, which has the same hole for the same
+        reason, and which is why it is a route as well as a port method.
+        """
+        pass
+
+    @abstractmethod
     def owner_of(self, wallet_id) -> object:
         """Return the id of the user who owns this wallet, or raise.
 

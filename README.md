@@ -5498,9 +5498,10 @@ why the smoke test below belongs to the deployment host and not to a laptop.
 **What has actually been run, stated precisely, because the difference between
 this paragraph and the rest of this file is the point.**
 
-*Ran, and passed:* the `.env` recipe and `mkdir -p data`, on a machine with no
-root. That is decision 255's fix validated by an execution rather than by an
-argument, and it is the only part of this deployment that has been.
+*Ran, and passed, here:* the `.env` recipe and `mkdir -p data`, on a machine with
+no root. That is decision 255's fix validated by an execution rather than by an
+argument - and for a while it was the only part of this deployment that anything
+had run.
 
 *Ran, and found a trap:* `caddy validate`, invoked by hand without `APP_DOMAIN`
 in the environment. An empty `{$APP_DOMAIN}` leaves the site header as a bare
@@ -5512,25 +5513,343 @@ person to run the validator by hand is not sent to the wrong place. Under compos
 the state is unreachable, because `${APP_DOMAIN:?}` refuses to compose without
 it.
 
-*Never ran:* `docker compose config`, `docker build`, `docker compose up`. The
-Compose plugin was absent, installing it needed root, and root was refused. So
-the four things still unverified are that the compose file parses, that the image
-builds, that the uid-matched container can write `./data`, and that `/health`
-answers through Caddy.
+*Not runnable here:* `docker compose config`, `docker build`, `docker compose up`.
+The Compose plugin was absent, installing it needed root, and root was refused -
+so this machine could not run any of the three, and no amount of care with these
+files changes that.
 
-**`.github/workflows/ci.yml` is where three of those four get checked instead**,
-on every push, by a runner that has a daemon and a Compose plugin - which is a
-better home for them than a laptop anyway, since a check nobody can run on the
-machine the code is written on is a check that only exists on a machine nobody
-deploys from. A certificate is outside what any runner can verify, and the
-container-answers-a-request step is left to the host on purpose: it needs the
-mount ownership that a runner does not have in the right shape, and a green tick
-that only sometimes means something is worse than an open item.
+*Ran, and passed, on a machine that has both:* the first two of those, in
+`.github/workflows/ci.yml`, on run 1 against `65a9cf7`. That is the first
+execution `compose.yaml`, `Caddyfile` and `Dockerfile` have ever had - the compose
+file parses, and the image builds. It is worth naming what makes that evidence
+rather than merely a tick, because GitHub reports `success` for a *skipped* job
+too: the thing to check is that the steps executed. They did - `Validate
+compose.yaml`, `Validate the Caddyfile` and `Build the image` are steps 3 to 5 of
+that job, and none is skipped. So two of the four things that were unverified are
+now verified. The two that are not are still that the uid-matched container can
+write `./data`, and that `/health` answers through Caddy - and neither is
+checkable without starting a container on a host.
 
-**So this section is a design with two executions behind it, not a report**, and
-it should be read the way decisions 249-255 are written - as arguments about
-what the deployment *should* be - until somebody has run it on the host and said
-otherwise.
+**`.github/workflows/ci.yml` is where those get checked instead**, on every push,
+by a runner that has a daemon and a Compose plugin - which is a better home for
+them than a laptop anyway, since a check nobody can run on the machine the code is
+written on is a check that only exists on a machine nobody deploys from. That is
+no longer an intention: run 1 is green, and the checks it was written for are
+exactly the ones that were previously unfalsifiable from here - `docker compose
+config`, `caddy validate` against the real file, and `docker build`. A certificate
+is outside what any runner can verify, and the container-answers-a-request step is
+left to the host on purpose: it needs the mount ownership that a runner does not
+have in the right shape, and a green tick that only sometimes means something is
+worse than an open item.
+
+**So this section is a design with a green build behind it, and still not a
+report**, and decisions 249-255 should still be read as arguments about what the
+deployment *should* be. The arguments have survived contact with a runner; none
+has yet survived contact with a host.
+
+### A client at all
+
+The checklist's i19 says the product surface is "a CLI and a JSON API - complete
+and tested, and unusable by anybody who is not holding a terminal", and calls
+that "the largest single piece of unlisted work between here and the MVP
+sentence". The MVP sentence is *"a person signs up, opens a wallet, locks money
+into a pot, and gets paid on a schedule"*, and every clause of it had a use case
+and a route behind it. None of it had a screen.
+
+This section is that screen. It is server-rendered HTML in the same application -
+one image, one port, one process, no CORS, no Node, no build step - and
+`Dockerfile`, `compose.yaml` and `Caddyfile` are unchanged by it. The pages live
+under `/app`, and `GET /` is a redirect into them.
+
+```
+uvicorn app.presentation.api.app:create_app --factory --port 8000
+# then, in a browser: http://localhost:8000/app/
+```
+
+**Four questions were settled before any of it was written, and three of the
+answers are the architecture.**
+
+| Question | Answer |
+|---|---|
+| Where does the browser keep the token? | an httpOnly cookie, `Secure`, `SameSite=Lax`, set on sign-in and cleared on sign-out |
+| What shape is the client? | server-rendered HTML in the same app - one image, one port, no CORS, no Node, no build step |
+| How much of it? | the MVP sentence, plus the withdrawal flow and its confirmation page |
+| Rendering and forms | Jinja2 and `python-multipart` - two new runtime dependencies |
+
+**Three findings changed the shape of it, and each is a place the plan was wrong
+before it was code.**
+
+*The withdrawal confirmation mails nothing, and an earlier note of mine said it
+did.* `routes/confirmations.py` is as explicit as it can be: "there is no
+re-authentication here, no password, no second factor... this is an **accident
+guard**, a second look before something irreversible, not a security control."
+The flows that mail a code are the email change, the password reset and the phone
+verification. So the withdrawal is a form, then a page with a button, and the
+page that asks for the withdrawal says in as many words that no code was sent -
+because that page is where a person forms the opposite expectation.
+
+*There was no way for a person to find their own wallet.* `WalletService` had
+`get_wallet(wallet_id)` and `transactions_for_wallet(wallet_id)`, both of which
+demand an id, and no read that produced one. The CLI never exposed the gap
+because a person at a terminal types the id they were handed when they opened the
+wallet. Nobody types a UUID into a browser. So `GET /wallets` was added - a new
+read in the port, both adapters, the service and the API - and it is owed to the
+JSON API for exactly the same reason.
+
+*`/wallets/{id}` and `/confirmations/{id}` were already taken.* The API's
+namespace is flat and prefix-free by deliberate policy, so a browser-facing
+`/wallets/{id}` would have collided with it. Hence `/app`.
+
+**The surface, which is thirteen routes and one redirect.**
+
+| Method | Path | Does |
+|---|---|---|
+| GET | `/` | 303 to `/app/` |
+| GET | `/app/sign-in` | address or phone + password, Google button, links |
+| POST | `/app/sign-in` | `LogIn` → cookie → 303 `/app/` |
+| POST | `/app/sign-in/google` | `LogInWithGoogle` → cookie → 303 `/app/` |
+| GET | `/app/sign-up` | address + password, Google button |
+| POST | `/app/sign-up` | `SignUp` then `LogIn` → cookie → 303 `/app/` |
+| POST | `/app/sign-up/google` | `SignUpWithGoogle` then `LogInWithGoogle` → cookie |
+| POST | `/app/sign-out` | `LogOut` → cookie cleared → 303 `/app/sign-in` |
+| GET | `/app/` | the person's wallets, their balances, and an empty state with a currency form |
+| POST | `/app/wallets` | `open_wallet` → 303 `/app/` |
+| GET | `/app/wallets/{wallet_id}` | balance, pots, recent ledger, withdrawal and deposit forms |
+| POST | `/app/wallets/{wallet_id}/withdrawals` | `request_confirmation(WITHDRAWAL)` → 303 to the confirmation |
+| POST | `/app/wallets/{wallet_id}/deposits` | `InitiateDeposit` → 303 to `authorization_url` |
+| GET | `/app/confirmations/{confirmation_id}` | the request, its derived status, and a button when it is `awaiting` |
+| POST | `/app/confirmations/{confirmation_id}/confirm` | `WalletService.confirm` → 303 `/app/wallets/{wallet_id}` |
+
+Every POST ends in a 303, so a reload cannot re-submit a money operation.
+
+#### The decisions
+
+**256. One credential, two faces.** The cookie holds *the same opaque token*
+`POST /sessions` already issues, and not a second kind of secret. `web_actor`
+resolves it with the same `ResolveActorFromSession` the API's `current_actor`
+uses, so there is one session table, one thirty-day lifetime, and one logout -
+`DELETE /sessions/current` ends the browser's session exactly as it ends the
+CLI's, which is what makes "sign out everywhere" a thing this system can already
+do. The API's session machinery does not learn that a browser exists.
+
+The alternative - a cookie holding a distinct, browser-only credential - would
+have been a second session store, a second lifetime, a second revocation path and
+a second answer to "is this person signed in?". Nothing about it is impossible,
+and every part of it is a second place for the two answers to disagree. What the
+browser needed was not a different kind of credential; it was a different place
+to keep one.
+
+**257. The cookie is `budget_session`, and it is `HttpOnly; Secure;
+SameSite=Lax; Path=/app`.** The `Path` is narrower than `/` on purpose: the
+credential belongs to this layer, nothing outside `/app` reads cookies, and a
+sub-path that never sees it is a smaller surface. The cost is real and is written
+down here rather than discovered: a page that fetched the JSON API with
+`credentials: 'include'` would *not* send this cookie, and would silently
+un-authenticate. There are no such fetches today, and the day one appears this
+paragraph is the thing to read.
+
+`Secure` is the default rather than a deployment's opt-in, and it is a defensible
+default for development too: `localhost` is a secure context in every current
+browser, so `http://localhost:8000/app/` works with the flag on. `WEB_COOKIE_SECURE`
+exists for the case that genuinely needs it off - an http address on a LAN, where
+the browser will refuse to store a `Secure` cookie at all.
+
+**258. CSRF is three layers, and the third is the one that could be got wrong.**
+`SameSite=Lax` is the first: a cross-site POST does not carry the cookie. POST-only
+mutations are the second, and they are not redundant - a `Lax` cookie **is** sent
+on a top-level GET navigation, so a withdrawal reachable by GET would be a
+withdrawal reachable by putting a link in a page, a mail, or a comment thread.
+The third is an `Origin`/`Referer` check on every POST.
+
+**The check compares hosts and not origins**, and that is the whole of the
+decision. This application runs behind Caddy, which terminates TLS: the request
+that reaches it carries `Host: budget.example` while the browser's `Origin` reads
+`https://budget.example`. A comparison of those two strings refuses every real
+user on the one deployment that matters. The rule is: if `Origin` is present, its
+host must equal the `Host` header's, and a mismatch is refused *without* falling
+back to `Referer`; if `Origin` is absent, `Referer` is checked the same way; if
+neither is present, the request is allowed. That last clause is deliberate - a
+browser that sends an `Origin` sends it on every POST it makes, so a request with
+neither header is not a browser on somebody else's page, and its real defence is
+the credential it holds. Refusing there would break the CLI's own tests and every
+program that posts a form.
+
+Both halves are tested, and the second half is the one that earns the file: a
+check that failed closed would pass every refusal test and take the product down.
+
+**259. Two new runtime dependencies, each owing a paragraph in
+`requirements.txt`.** `Jinja2` because the standard library's `string.Template`
+has no autoescaping, and every page here prints a value somebody else supplied -
+the address an account signed up with, the prose of a refusal, a balance parsed
+back out of a submitted form. It is worth saying what the hole would be rather
+than gesturing at XSS: the session cookie is `HttpOnly`, so an injected script
+cannot *read* it, and it does not need to - it can post the withdrawal form on
+the visitor's behalf. Jinja2 escapes by default, which makes `|safe` the thing a
+person has to ask for, and no template in this repository asks.
+
+`python-multipart` adds no capability of ours at all, which makes it the line
+most likely to look deletable. It is not: starlette's `request.form()` checks
+whether the package can be imported *before* it looks at the request, so the
+choice is to declare it or to write a parser by hand - and a hand-rolled parser
+is the same class of mistake the PyJWT paragraph refuses.
+
+**260. The web layer calls the API's service builders directly.** `wallet_service`,
+`log_in_service`, `deposit_service` and the rest take their actor as a parameter
+rather than through `Depends`, so calling one from a page handler with a
+cookie-resolved user is a call and not a hack. The tidier answer - a shared
+`app/presentation/services.py` that both presentations import - is deliberately
+deferred: it would mean editing a module every API test depends on, in a change
+whose subject is somewhere else. What was owed instead is honesty about the one
+claim this falsifies: `dependencies.py`'s docstring said it was "the only place a
+token is read off a request", and it now says that a cookie is the other face of
+the same credential.
+
+**261. One error contract, two renderings.** `errors.install()` gained an
+optional HTML branch keyed on the request path, so the four existing handlers -
+`MoneyError`, `ApiError`, `StarletteHTTPException`, `Exception` - now render a
+page when the request is under `/app` and JSON everywhere else. Nothing about the
+grading changes: the same `status_for` decides the status, the same `detail`
+supplies the prose. A web request that fails **401** is a 303 to `/app/sign-in`
+rather than a page, unless the path is one of the five authentication routes - a
+sign-in page that redirects a failed sign-in to itself is a loop.
+
+The `StarletteHTTPException` handler is the one that earns the wiring rather than
+being tidiness: a mistyped or misused address under `/app` raises inside the
+router, not inside a route, and without it a 405 would answer JSON to a browser.
+
+**262. `GET /wallets` is a new read rather than a client-side workaround.** The
+port gained `list_for_owner(user_id) -> list[Wallet]`, the SQLite adapter orders by
+`rowid` - the `wallets` table has no `created_at`, and insertion order is creation
+order - and the in-memory fake filters explicitly rather than delegating, because
+a fake that let a scoping bug through is exactly the fake a scoping bug hides in.
+An empty list is an answer and not a 404, which is where this differs from the
+read beside it: `GET /wallets/{id}` is asked about a wallet the caller named, so
+finding nothing is a contradiction, while this is asked by somebody who does not
+know what they hold.
+
+**263. `PUBLIC_BASE_URL`, and the join that makes it a callback.** Paystack's
+`/transaction/initialize` takes a `callback_url` - where a payer's browser is sent
+once they have finished - and it has to be absolute, because the browser resolving
+it belongs to somebody else. The setting is the installation's public *origin*
+(`https://budget.example`) and not a landing page; the path a payer should land on
+is a fact about this layer, held in `web/urls.py`, and `create_app` is the one
+frame that holds both. So `urls.callback_url(origin)` performs the join, and it
+concatenates rather than resolving: `urljoin` would silently *replace* the path for
+a base like `https://example.com/x`, and the failure would be a payer landing on a
+page this system does not serve.
+
+`PaymentProvider` did not change. Its payload already had a field that could hold
+this, and the adapter adds the key only when it was given an address, because
+`"callback_url": null` is a third thing - not "nowhere in particular" but "here is
+a field whose value is nothing" - which a provider is free to refuse for reasons
+it will not explain. An installation with no address takes deposits perfectly
+well; its payers are simply not sent back, and the deposit is settled by the
+webhook either way.
+
+**264. Google sign-in is the id_token flow.** Google Identity Services hands a
+token to the *page*, which form-posts it to a route of ours; `LogInWithGoogle` and
+`SignUpWithGoogle` verify it exactly as they verify the CLI's. No `redirect_uri`,
+no client secret, no authorization code. What the arrangement needs is an
+**authorized JavaScript origin** in the Google console - a fact about Google's
+side, which is why nothing on this side has a setting for it. The JavaScript sees
+a Google token and never one of ours.
+
+**265. Signing up does not sign you in, and the page does not pretend otherwise.**
+`POST /users` says so - "a client that wants both makes both requests" - so the
+sign-up handler makes both. It holds the password (or the id_token) it was just
+given, which is what makes the second call a *proof* rather than a find-or-create;
+on success the cookie is set and the person lands on `/app/`.
+
+**266. Two settings, two readers, shaped after the ones already there.**
+`web_from_environment() -> WebSettings` cannot fail, and it is the first reader in
+that module that cannot: a mail account, a payment key, an SMS account and a Google
+client id are each something this system may not have, while there is no deployment
+in which the sign-in page exists but the cookie question does not. So it returns
+`WebSettings` and not `WebSettings | None`. `public_base_url_from_environment()`
+returns `str | None`, because an installation with no public address is a normal
+state rather than an unconfigured one, and it strips a trailing slash - left in, a
+base URL written with one, which is how most people write one, would give every
+payer a `//app/` in their address bar.
+
+#### What the tests assert, and the one place the plan could not be followed
+
+`tests/presentation/web/` drives a real application through `TestClient`, with two
+departures from the API suite that are worth naming. It uses
+`base_url="https://testserver"`, so that the `Secure` default is *exercised*
+rather than switched off for convenience; and it does not follow redirects, so
+every 303 in the flow is assertable rather than invisible.
+
+Nine files, and what each is for:
+
+- **`conftest.py`** - a `Browser` class rather than fixtures for each action, so a
+  test reads as a sequence of things a person did. It funds a wallet by calling
+  `WalletService.deposit` directly, because no request can credit a wallet - that
+  is a precondition builder and not a subject.
+- **`test_credential.py`** - the cookie's flags, its lifetime, that no page body
+  ever contains the token, and that signing out both clears the cookie and kills
+  the session at the API.
+- **`test_isolation.py`** - a second signed-in person gets the *same 404 body*,
+  byte for byte, for a stranger's wallet as for a UUID that never existed.
+- **`test_withdrawal.py`** - the whole flow, then the same confirmation answered
+  twice, then one left past its window. The lapsed case moves the clock at
+  `routes`, which is the boundary where the route reads it.
+- **`test_methods.py`** - every mutating path fetched by GET is a 405 *and* the
+  database is unchanged afterwards, because a route that moved the money and then
+  answered 405 would pass the first assertion.
+- **`test_cross_site.py`** - decision 258's two halves.
+- **`test_namespaces.py`** - derived from `create_app().routes`, so a route added
+  to either presentation later cannot collide quietly.
+- **`test_google.py`** - both directions, against the recording stub verifier.
+- **`test_deposit_return.py`** - decision 263, end to end, plus the absent case.
+
+**The eighth of the plan's verification items could not be written as it was
+stated, and the difference is worth recording.** It asked for "with
+`PUBLIC_BASE_URL` set, the fake provider receives a `callback_url`". That is not
+expressible: the suite's `app` fixture *injects* a provider, and `create_app` only
+composes a callback URL when it has to build one - so an injected fake can never
+be the object that receives it, and `PaymentProvider.initialize_deposit` takes no
+callback argument to pass instead. What is tested is the same property split
+three ways: the join on its own, the reader on its own, and an application built
+from a real environment reaching a real adapter with the address in its payload.
+
+#### What is deliberately not here
+
+Pots are *displayed* and cannot be opened, locked or released from a page. Plans,
+payouts, closing a wallet, the profile, the email change, the password reset and
+the phone verification are all still terminal-only. There is no JavaScript
+anywhere except Google's own button, which is one `<script>` tag and one callback
+that fills a hidden field.
+
+The confirmation page is generic over `ConfirmationKind`, so a payout or a close
+confirmation would render correctly through it today - but no form requests one,
+and adding a form is the work, not the page.
+
+`wallet.html` renders every transaction a wallet has. A wallet with ten thousand
+rows would render ten thousand rows. There is no paging, and that is named here
+rather than discovered later.
+
+#### What this does not close
+
+**i18 stays unticked even though the Google button ships.** Its complaint is the
+missing *setting*, and this work closes the *need* for one - the id_token flow
+needs no redirect address, and what Google requires is an authorized JavaScript
+origin in its console rather than a variable here. That is a different thing from
+supplying the setting, and the checklist entry should be corrected to say which.
+
+**The deposit's return is a courtesy and not a settlement.** Money settles from
+`/webhooks/paystack` and from nowhere else, so a payer who lands back on `/app/`
+may see the old balance for a few seconds. The page says a deposit may be in
+flight for that reason, and it must never say "done".
+
+**`PUBLIC_BASE_URL` and `APP_DOMAIN` hold one fact between them.** Compose knows
+the hostname Caddy answers on; the application needs the origin it is publicly
+reachable at - the same fact plus a scheme. Two variables holding one fact will
+drift, and the honest note is that the day they do, `PUBLIC_BASE_URL` is the one
+to trust, because it is the one the application read.
+
+**No CORS was added and none existed.** The layer is same-origin by construction,
+so that stays true; the moment a separate front-end appears, it becomes a
+decision.
 
 ### Still open
 
@@ -6418,8 +6737,11 @@ run is for is not confirmation.
   `ALTER`s that `sqlite_unit_of_work.py` already flags as the manual version.
 - `docker compose`, a reverse proxy with TLS, and a VPS. The first two exist as
   configuration - `Dockerfile`, `compose.yaml`, `Caddyfile`, `.env.example` - and
-  are argued in "The deployment" above. Neither has been run, and the VPS is not
-  a file: DNS, a firewall and a host remain somebody's afternoon.
+  are argued in "The deployment" above. Their syntax and the image build now run
+  green on every push in `.github/workflows/ci.yml`, which is the first execution
+  any of those files has ever had. What is still not run is `docker compose up`:
+  a certificate and a host are not files, and DNS, a firewall and a `systemctl`
+  remain somebody's afternoon.
 - **Backups with a tested restore.** A backup nobody has restored is a belief,
   not a backup, and this is the one item whose absence is unrecoverable.
 - Structured logging and error tracking.
@@ -6429,7 +6751,10 @@ run is for is not confirmation.
   wrong. That is the argument for the bullet rather than an embarrassment about it. A
   suite whose size has to be maintained by hand is a suite whose size nobody knows,
   and the figure is left out here rather than corrected because the next correction
-  would go stale the same way.
+  would go stale the same way. **This now exists**: `.github/workflows/ci.yml` runs
+  the suite on 3.12 on every push and every pull request, and run 1 was green - on
+  the same run that first executed the deployment files, which is the other half of
+  what the workflow does.
 
 ### Phase 5 - Scale, when a real constraint asks for it
 

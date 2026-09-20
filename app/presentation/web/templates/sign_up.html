@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Create an account{% endblock %}
+
+{% block body %}
+  <div class="sheet narrow">
+    <h1>Create an account</h1>
+    <p class="lede">
+      An email address and a password. You can open a wallet once you are in.
+    </p>
+
+    <form method="post" action="{{ urls.SIGN_UP_PATH }}" class="stack">
+      <label for="email">Email address</label>
+      <input
+        id="email"
+        name="email"
+        type="email"
+        autocomplete="username"
+        autocapitalize="none"
+        spellcheck="false"
+        required
+      >
+
+      <label for="password">Password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        autocomplete="new-password"
+        required
+      >
+
+      {#
+        This form does not ask for the password twice, and the omission is
+        deliberate rather than an oversight. A confirmation box is a defence
+        against a typo in a field nobody can read back; what this system does
+        instead is accept the password and, if it was mistyped, let the person
+        change it. Asking twice would put a second copy of the secret in a second
+        POST body for no check this side can make that the other side could not.
+      #}
+
+      <button type="submit" class="primary">Create account</button>
+    </form>
+
+    <div class="or"><span>or</span></div>
+
+    {% set google_action = urls.SIGN_UP_PATH + "/google" %}
+    {% include "_google_button.html" %}
+
+    <p class="note">
+      Already have an account? <a href="{{ urls.SIGN_IN_PATH }}">Sign in</a>.
+    </p>
+  </div>
+{% endblock %}

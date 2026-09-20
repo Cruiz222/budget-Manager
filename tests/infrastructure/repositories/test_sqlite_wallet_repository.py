@@ -212,3 +212,124 @@ def test_a_wallet_with_no_pots_round_trips_as_no_pots(build_wallet):
 
     assert stored.funds == ()
     assert stored.locked_balance == ngn("0")
+
+
+def test_list_for_owner_round_trips_the_wallets(build_wallet, actor):
+    repository = build_repository()
+    wallet = build_wallet()
+    repository.save(wallet)
+
+    stored = repository.list_for_owner(actor)
+
+    assert [one.wallet_id for one in stored] == [wallet.wallet_id]
+    assert stored[0].available_balance == wallet.available_balance
+    assert stored[0].currency is NGN
+
+
+def test_list_for_owner_of_somebody_who_holds_nothing(build_wallet, actor, stranger):
+    """**An empty list, where ``get_owned`` raises** - see the port for why the
+    two differ. A person who has not opened a wallet yet is the ordinary caller
+    of this method rather than an unexpected one."""
+    repository = build_repository()
+    repository.save(build_wallet(user_id=stranger))
+
+    assert repository.list_for_owner(actor) == []
+
+
+def test_list_for_owner_leaves_out_everybody_elses(build_wallet, actor, stranger):
+    """**The scoping, which is the whole of the method's defence.**
+
+    ``get_owned`` puts the owner in a ``WHERE`` clause so that the wrong wallet is
+    something the method *cannot produce*, whatever a caller does. This one has to
+    do the same thing: the assertion below is about absence rather than about
+    length, so it fails on a query that forgot the filter and merely happened to
+    return one row.
+    """
+    repository = build_repository()
+    mine = build_wallet()
+    repository.save(build_wallet(user_id=stranger))
+    repository.save(mine)
+
+    assert [one.wallet_id for one in repository.list_for_owner(actor)] == [
+        mine.wallet_id
+    ]
+
+
+def test_list_for_owner_is_oldest_first(build_wallet, actor):
+    """``ORDER BY rowid``, asserted rather than assumed.
+
+    The order is part of the port's contract and the page a person lands on draws
+    these in it, so a query that returned them in whatever order SQLite chose
+    would put somebody's wallets in different orders on different runs - which is
+    the kind of failure that looks like a rendering bug for a week.
+    """
+    repository = build_repository()
+    first = build_wallet()
+    second = build_wallet()
+    third = build_wallet()
+    for wallet in (first, second, third):
+        repository.save(wallet)
+
+    assert [one.wallet_id for one in repository.list_for_owner(actor)] == [
+        first.wallet_id,
+        second.wallet_id,
+        third.wallet_id,
+    ]
+
+
+def test_saving_a_wallet_again_does_not_move_it(build_wallet, actor):
+    """**The claim ``ORDER BY rowid`` rests on, tested on its own.**
+
+    ``save`` is an upsert, and the order this method promises is insertion order -
+    so it holds only for as long as ``ON CONFLICT DO UPDATE`` leaves an existing
+    row's rowid alone. A ``save`` rewritten as delete-then-insert would renumber
+    it, and the symptom would be the oldest wallet silently becoming the newest
+    each time somebody deposited into it. Here the first wallet is funded *after*
+    the second one exists, which is exactly when that would happen.
+    """
+    repository = build_repository()
+    first = build_wallet()
+    second = build_wallet()
+    repository.save(first)
+    repository.save(second)
+
+    first.apply_deposit(ngn("500"))
+    repository.save(first)
+
+    assert [one.wallet_id for one in repository.list_for_owner(actor)] == [
+        first.wallet_id,
+        second.wallet_id,
+    ]
+
+
+def test_list_for_owner_brings_each_wallets_pots_with_it(build_wallet, actor):
+    """**The one-pots-query-per-wallet claim from the adapter's docstring**, and
+    the thing most likely to be lost in a rewrite: two wallets, two pots, and the
+    right pot on the right wallet. A query that joined and regrouped, or one that
+    read the pots of the first wallet and reused them, would pass a test with one
+    wallet and fail here.
+    """
+    repository = build_repository()
+    first = build_wallet(locked="4000")
+    second = build_wallet(locked="7000")
+    repository.save(first)
+    repository.save(second)
+
+    stored = {one.wallet_id: one for one in repository.list_for_owner(actor)}
+
+    assert [fund.name for fund in stored[first.wallet_id].funds] == ["Locked"]
+    assert stored[first.wallet_id].locked_balance == ngn("4000")
+    assert stored[second.wallet_id].locked_balance == ngn("7000")
+
+
+def test_list_for_owner_brings_nothing_from_a_strangers_pots(build_wallet, actor, stranger):
+    """The scoping with pots attached, which is where a join would leak: a query
+    that filtered the wallets and joined the funds without carrying the filter
+    into the join would hand back somebody else's reservation."""
+    repository = build_repository()
+    repository.save(build_wallet(user_id=stranger, locked="4000"))
+
+    stored = repository.list_for_owner(actor)
+
+    assert stored == []
+

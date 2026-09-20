@@ -14,15 +14,25 @@ The dependencies below are the whole of the arrangement. None of them holds stat
 between requests, and none could: FastAPI calls them per request and throws the
 result away.
 
-**This module is the only place a token is read off a request.** Every
-authenticated endpoint reaches its actor through ``current_actor``, so the
-question "how does this API decide who is asking?" has one answer, in one
-function, and the answer is a credential rather than an assertion. The header
-that used to be here - ``X-User-Email``, which named a user and proved nothing -
-is gone, and its absence is the phase's whole point: **there is no code path in
-this API by which a request can become a user without presenting a token.** That
-is not a rule anybody has to keep; it is what is left when the only function that
-can produce a ``User`` requires one.
+**Every authenticated endpoint in the JSON API reaches its actor through
+``current_actor``**, so the question "how does this API decide who is asking?"
+has one answer, in one function, and the answer is a credential rather than an
+assertion. The header that used to be here - ``X-User-Email``, which named a user
+and proved nothing - is gone, and its absence is the phase's whole point: **there
+is no code path by which a request can become a user without presenting a
+token.** That is not a rule anybody has to keep; it is what is left when the only
+functions that can produce a ``User`` require one.
+
+**"This module is the only place a token is read off a request" was true until
+the browser client landed, and it is corrected here rather than left to rot.**
+There is now a second reader, ``app.presentation.web.dependencies.web_actor``,
+which reads the same opaque token out of a session cookie instead of an
+``Authorization`` header and resolves it through the same use case. The
+distinction the original sentence was drawing is still the one that matters:
+*there are exactly two functions in this system that produce a ``User`` from a
+request, and both of them demand a credential.* What has changed is only where a
+client may put it - and the two faces are one credential, not two kinds of
+secret. See ``web/dependencies.py``.
 
 **A missing header is this layer's business; a bad one is the domain's.** The
 ``Authorization`` header's *presence* and *shape* are transport concerns, and the

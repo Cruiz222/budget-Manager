@@ -94,3 +94,60 @@ httpx==0.28.1
 # resolved, and this one records what it is expected to. An install that disagrees
 # is telling you the number, not breaking anything.
 PyJWT[crypto]==2.10.1
+
+# Rendering the browser client's pages. A runtime dependency since checklist item
+# i19 landed, and the third departure from the stdlib - but the argument is
+# different in kind from the two above, so it gets a different paragraph rather
+# than a longer version of theirs.
+#
+# httpx and PyJWT are *capability* departures: httpx does something the standard
+# library has no HTTP client for, and PyJWT does RSA. This one is a departure of
+# degree, and it is worth saying plainly rather than dressing up: the stdlib has
+# ``string.Template``, and it could have rendered every page this repository
+# ships. What it does not have is **autoescaping**, and that is the whole of why
+# this line exists.
+#
+# Every page here prints a value somebody else supplied - the address an account
+# signed up with, the prose of a refusal, a wallet's balance parsed back out of
+# a submitted form. An interpolator that writes those into HTML unescaped is a
+# cross-site scripting hole in the one place this system's credential lives: the
+# session cookie is ``HttpOnly``, so a script injected into a page cannot read it
+# - and it does not need to, because it can post the withdrawal form on the
+# visitor's behalf instead. Jinja2 escapes by default, which makes the dangerous
+# thing (``|safe``) the one a person has to ask for, and no template in this
+# repository asks.
+#
+# So the standard this file holds its departures to is met, and slightly
+# differently: ``string.Template`` would be fewer lines today, and a reachable
+# hole the first time somebody signs up with an apostrophe in their name.
+#
+# **Confirm the number below on the first install**, for the reason the PyJWT
+# paragraph above gives - it was pinned without a ``pip`` run behind it, so it
+# records the expected resolution rather than an observed one. Unlike PyJWT's,
+# this one is a mature package whose 3.1 line has been current for years, so a
+# discrepancy is more likely to be a newer patch than a wrong guess.
+Jinja2==3.1.6
+
+# Reading the browser client's form posts. A runtime dependency since i19, and it
+# is the only line in this file that adds **no capability of ours at all** - which
+# is exactly why it needs the paragraph, because it is the line most likely to
+# look deletable.
+#
+# It is not, and the reason is a rule inside starlette rather than a feature this
+# repository uses. ``request.form()`` parses an ``application/x-www-form-urlencoded``
+# body, and starlette's implementation checks whether this package can be imported
+# *before* it looks at the request at all: with it absent, the call raises rather
+# than returning an empty form. So the choice is not "parse forms with this or
+# without it" - it is "declare it, or write a parser by hand", and a hand-rolled
+# one is the thing the PyJWT paragraph refuses in the same words: a subtly wrong
+# parser is a place where two fields can be made to disagree with what the server
+# believes they are.
+#
+# Nothing in this repository imports it and nothing ever will. That is the point:
+# it satisfies starlette's import check and then gets out of the way.
+#
+# **Confirm this number on the first install too**, for the reason given twice
+# above. This one is the least predictable pin in the file - the package's version
+# sits in a long ``0.x`` line, where every release is nominally allowed to change
+# anything, and the number below is the one expected rather than the one seen.
+python-multipart==0.0.20

@@ -1255,3 +1255,145 @@ class TestTheSubunit:
         refused, on a difference nobody could see by reading either function.
         """
         assert _from_subunit(_subunit(an_amount(amount)), NGN) == an_amount(amount)
+
+
+class TestWhereThePayerIsSentBack:
+    """The one outbound field that depends on where this installation lives.
+
+    **It is the only thing ``initialize_deposit`` sends that this system chose
+    rather than derived**, and that is what makes it worth its own class. Every
+    other field in the payload follows from the amount, the reference or the
+    payer; this one is an installation fact - its public address - threaded down
+    from a setting in ``settings.py`` through a join in ``create_app`` to a
+    constructor argument here. Three frames, and the failure if any of them drops
+    it is silent: the deposit works perfectly and the payer is simply left on
+    Paystack's own page at the end.
+
+    **The interesting half is the absent case, not the present one.** A payload
+    with no ``callback_url`` key is what every installation sent before the
+    setting existed, and the docstring on ``initialize_deposit`` argues at length
+    that ``"callback_url": None`` is a *third* thing - a field whose value is
+    nothing - which a provider is free to refuse for reasons it will not explain.
+    So the tests below assert the key's *absence* as carefully as they assert its
+    value, and the last one asserts the difference between the two payloads is
+    exactly one field.
+    """
+
+    CALLBACK_URL = "https://budget.example/app/"
+
+    def open_a_collection(self, provider, reference: str):
+        provider.initialize_deposit(
+            reference=reference, amount=an_amount("5000"), email="payer@localhost"
+        )
+
+    def test_an_installation_with_no_address_sends_no_field(self, provider, requesting):
+        """The default, which is what a fresh clone has."""
+        self.open_a_collection(provider, "ps_ref_callback_1")
+
+        assert "callback_url" not in requesting.call["json"]
+
+    def test_and_that_payload_is_the_one_that_was_always_sent(
+        self, provider, requesting
+    ):
+        """**Written as the whole dict rather than as a missing key**, because
+        "nothing changed" is the actual claim. The literal below is the same one
+        ``test_it_sends_the_payers_email_and_nothing_else_about_them`` asserts,
+        which is the point: two tests, one payload, and adding a field here would
+        have to be a change to both.
+        """
+        self.open_a_collection(provider, "ps_ref_callback_1")
+
+        assert requesting.call["json"] == {
+            "email": "payer@localhost",
+            "amount": 500000,
+            "reference": "ps_ref_callback_1",
+            "currency": "NGN",
+        }
+
+    def test_a_given_address_is_sent_verbatim(self, requesting):
+        """**Verbatim, because a path is not ours to improve.** The adapter is
+        handed an address that already carries the landing path, composed by the
+        one frame holding both the origin and the route table - see
+        ``web.urls.callback_url`` - and an adapter that resolved, joined or
+        normalised it would be a second composer free to disagree with the first.
+        """
+        provider = PaystackPaymentProvider(
+            TEST_PAYSTACK_SECRET, callback_url=self.CALLBACK_URL
+        )
+
+        self.open_a_collection(provider, "ps_ref_callback_1")
+
+        assert requesting.call["json"]["callback_url"] == self.CALLBACK_URL
+
+    def test_none_is_the_same_as_absent(self, requesting):
+        """**The collapsed case, and the one an implementation would get wrong by
+        treating ``None`` as a value.** ``callback_url=None`` spelled explicitly
+        is how the composition root's own join arrives when the setting is unset -
+        ``urls.callback_url(None)`` returns ``None`` - so the two ways of saying
+        nowhere have to produce the same payload, and it has to be the one with no
+        key in it.
+        """
+        provider = PaystackPaymentProvider(
+            TEST_PAYSTACK_SECRET, callback_url=None
+        )
+
+        self.open_a_collection(provider, "ps_ref_callback_1")
+
+        assert "callback_url" not in requesting.call["json"]
+
+    def test_the_address_is_the_only_thing_that_changed(self, requesting):
+        """**The assertion that separates "added a field" from "changed a
+        payload".**
+
+        The two calls below differ in one constructor argument and must therefore
+        differ in one JSON key. Asserted as a difference and not as two literals,
+        so a field added to the adapter for an unrelated reason fails here rather
+        than being copied into both dicts by whoever was updating the test.
+
+        ``requesting.calls`` is read directly rather than through ``requesting.call``
+        - the property that insists on exactly one call, for the reason its own
+        docstring gives: this test is deliberately about two.
+
+        **One reference for both calls, and that is what makes it a difference of
+        one field.** The two collections below are the *same deposit* sent to two
+        installations, so everything derived from the request - the reference, the
+        amount, the payer - is identical by construction, and the only key left
+        that can differ is the one this test is about. Two references would have
+        made the dicts differ in two keys and the assertion would have been
+        comparing spelling rather than the setting.
+        """
+        with_address = PaystackPaymentProvider(
+            TEST_PAYSTACK_SECRET, callback_url=self.CALLBACK_URL
+        )
+        without = PaystackPaymentProvider(TEST_PAYSTACK_SECRET)
+
+        self.open_a_collection(without, "ps_ref_callback_1")
+        self.open_a_collection(with_address, "ps_ref_callback_1")
+
+        no_address, address = requesting.calls
+        assert address["json"] == {
+            **no_address["json"],
+            "callback_url": self.CALLBACK_URL,
+        }
+
+    def test_a_lookup_sends_no_address_at_all(self, requesting):
+        """**Where the payer is sent is a fact about opening a collection and
+        nothing else.** ``outcome_for`` shares ``_request`` with the method above,
+        so the two are one edit apart from each other - and a reconciler asking
+        about a reference is not a moment at which anybody is being sent
+        anywhere.
+
+        The body is asserted to be ``None`` rather than searched for a key, which
+        is the stronger claim and the one this endpoint actually makes: a lookup
+        carries no body at all.
+        """
+        requesting.response = httpx.Response(200, json=a_charge("success"))
+        provider = PaystackPaymentProvider(
+            TEST_PAYSTACK_SECRET, callback_url=self.CALLBACK_URL
+        )
+
+        provider.outcome_for("ps_ref_callback_1")
+
+        assert requesting.call["method"] == "GET"
+        assert requesting.call["json"] is None
+

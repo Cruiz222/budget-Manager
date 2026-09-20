@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+
+{% block body %}
+  <div class="sheet narrow">
+    <h1>Sign in</h1>
+    <p class="lede">
+      One box for your email address or your phone number, and your password.
+    </p>
+
+    {#
+      `required` is on the inputs and not on the route. The route reads every
+      field through `forms.required`, which is the check that counts; this one
+      exists so a person is told by their own browser before a round trip. A
+      form attribute is a courtesy and is treated as one - nothing below relies
+      on it having run.
+    #}
+    <form method="post" action="{{ urls.SIGN_IN_PATH }}" class="stack">
+      <label for="identifier">Email address or phone number</label>
+      <input
+        id="identifier"
+        name="identifier"
+        type="text"
+        autocomplete="username"
+        autocapitalize="none"
+        spellcheck="false"
+        required
+      >
+
+      <label for="password">Password</label>
+      <input
+        id="password"
+        name="password"
+        type="password"
+        autocomplete="current-password"
+        required
+      >
+
+      <button type="submit" class="primary">Sign in</button>
+    </form>
+
+    <div class="or"><span>or</span></div>
+
+    {% set google_action = urls.SIGN_IN_PATH + "/google" %}
+    {% include "_google_button.html" %}
+
+    <p class="note">
+      No account yet? <a href="{{ urls.SIGN_UP_PATH }}">Create one</a>.
+    </p>
+  </div>
+{% endblock %}

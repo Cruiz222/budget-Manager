@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  {#
+    The shell every page is drawn inside, and the only template that knows about
+    the header, the stylesheet and the sign-out button.
+
+    **`user` and `google_client_id` may be undefined here, and that is not
+    sloppiness.** Most pages are rendered by `routes._render`, which passes both;
+    a refusal is rendered by `errors.Browser.render`, which passes neither,
+    because a page explaining a failure has no session to describe. Jinja's
+    default undefined is falsy but raises when printed or dereferenced, so every
+    use of either name below sits inside an `{% if %}` - which is how the two
+    call sites render the same shell without one of them inventing a fake user.
+
+    **No `|safe`, anywhere, on anything a person supplied.** See `templating.py`;
+    the values on these pages include an email address, a reference somebody
+    typed, and the prose of a domain refusal.
+  #}
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Budget{% endblock %} · Budget</title>
+    <link rel="stylesheet" href="{{ urls.STATIC_PREFIX }}/app.css">
+  </head>
+  <body>
+    <header class="bar">
+      <a class="wordmark" href="{{ urls.LANDING_PATH }}">Budget</a>
+      {% if user %}
+        <div class="who">
+          <span class="who-name">{{ user.email or user.phone }}</span>
+          {#
+            Sign-out is a form and not a link, because it changes something: it
+            ends the session. A GET is reachable by anything that can put a URL
+            in front of somebody - an image tag on another site, a link in a
+            mail - and `SameSite=Lax` sends the cookie on a top-level navigation,
+            so a link would be a sign-out anybody could perform on any visitor.
+          #}
+          <form method="post" action="{{ urls.SIGN_OUT_PATH }}">
+            <button type="submit" class="linkish">Sign out</button>
+          </form>
+        </div>
+      {% endif %}
+    </header>
+
+    <main>
+      {% block body %}{% endblock %}
+    </main>
+
+    <footer class="foot">
+      <p>
+        Balances are shown as the ledger has them. A deposit is settled by the
+        payment provider's confirmation, not by this page.
+      </p>
+    </footer>
+  </body>
+</html>

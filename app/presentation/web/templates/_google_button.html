@@ -1,0 +1,90 @@
+{#
+  The Google button, on both identity pages, because the two differ in what they
+  do with the identity and not in how they obtain it.
+
+  **The page talks to Google and this application never does.** Google Identity
+  Services loads a script into this page, Google shows the dialog, and Google
+  hands the *page* a signed id_token. The page then posts that token to a route
+  of ours as an ordinary form field. There is no redirect back to us, no
+  authorization code and no client secret anywhere in this flow - what replaces
+  that half of OAuth is an authorized JavaScript origin recorded in Google's own
+  console, which is a fact about Google's side and therefore has no setting on
+  ours.
+
+  **The id_token is a Google credential and never ours.** Nothing in this page
+  ever holds a session token: the cookie our routes set is `HttpOnly`, so this
+  script cannot read it, and it does not need to - the browser attaches it.
+
+  **`id_token` is our name for the value; `credential` is Google's.** The rename
+  happens here, in the form field's name, and nowhere else. See
+  `routes.sign_in_with_google` for why the two names both exist rather than one
+  of them being "corrected".
+
+  **The button is rendered by Google's script into a slot this template owns**,
+  which is why there is a placeholder with text in it: a script that fails to
+  load leaves the paragraph rather than a blank rectangle, and
+  `startGoogleSignIn` clears the slot before handing it to Google. An
+  installation with no client id renders the explanation instead of the slot -
+  the same text the sign-in page carries, so nobody is left guessing why a
+  button their colleague described is missing.
+#}
+{% if google_client_id %}
+  <form id="google-form" method="post" action="{{ google_action }}">
+    <input type="hidden" name="id_token" value="">
+    <div id="google-button" class="google-slot">
+      <p class="muted small">
+        Google sign-in did not load. If this persists, use your email address and
+        password.
+      </p>
+    </div>
+  </form>
+
+  {#
+    Defined before the script that will call it, so the `onload` attribute
+    cannot fire into a name that does not exist yet. `async defer` plus `onload`
+    rather than a `DOMContentLoaded` listener, because what this waits for is
+    Google's script and not the document.
+  #}
+  <script>
+    function startGoogleSignIn() {
+      var slot = document.getElementById("google-button");
+      var form = document.getElementById("google-form");
+      if (!slot || !form || !window.google || !google.accounts || !google.accounts.id) {
+        return;
+      }
+
+      google.accounts.id.initialize({
+        client_id: {{ google_client_id | tojson }},
+        callback: function (response) {
+          // `credential` is the id_token. No credential means Google declined
+          // to issue one, and posting an empty field would only earn a 400.
+          if (!response || !response.credential) {
+            return;
+          }
+          form.elements.id_token.value = response.credential;
+          form.submit();
+        }
+      });
+
+      slot.replaceChildren();
+      google.accounts.id.renderButton(slot, {
+        type: "standard",
+        theme: "outline",
+        size: "large",
+        text: "continue_with",
+        width: 320
+      });
+    }
+  </script>
+  <script
+    src="https://accounts.google.com/gsi/client"
+    async
+    defer
+    onload="startGoogleSignIn()"
+  ></script>
+{% else %}
+  <p class="muted small">
+    Google sign-in is not set up on this installation. Use your email address and
+    a password.
+  </p>
+{% endif %}

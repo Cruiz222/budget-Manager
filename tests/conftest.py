@@ -361,6 +361,24 @@ SETTINGS_VARIABLES = (
     # a developer with it exported would otherwise change what the suite does - and
     # it is set rather than merely cleared, immediately below.
     "RATE_LIMIT_FLUSH_SECONDS",
+    # ``PUBLIC_BASE_URL`` and ``WEB_COOKIE_SECURE`` are the two the browser client
+    # added, and they are here for the *same* reason as each other rather than for
+    # the reason the credentials above are. Neither is a secret and neither sends
+    # anything anywhere: what they change is what the suite is *testing*.
+    #
+    # A developer with ``PUBLIC_BASE_URL`` exported would give every application
+    # the suite builds a callback address for its payers, so the tests asserting
+    # an installation that has not said where it lives would fail against a shell
+    # that had told it - which is a failure whose message points at the code.
+    "PUBLIC_BASE_URL",
+    # ``WEB_COOKIE_SECURE`` is the sharper half. It defaults to *on*, and the
+    # web suite drives its requests over ``https`` precisely so that it can
+    # assert the default rather than override it. A developer with the variable
+    # set to ``0`` would have every one of those tests run against an
+    # installation whose cookie is not ``Secure`` - and the tests that assert the
+    # flag is present would fail, while the ones that assert a cookie round-trips
+    # would keep passing. The suite would be green about the wrong installation.
+    "WEB_COOKIE_SECURE",
 )
 
 

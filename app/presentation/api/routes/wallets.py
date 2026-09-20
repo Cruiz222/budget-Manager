@@ -31,6 +31,33 @@ def open_wallet(
     return translate.wallet_out(wallet)
 
 
+@router.get("/wallets", response_model=list[schemas.WalletOut])
+def list_wallets(service: WalletService = Depends(wallet_service)) -> list[schemas.WalletOut]:
+    """Every wallet the caller holds, oldest first.
+
+    **This route had to exist before a browser could open a wallet at all.** The
+    two reads beside it - ``GET /wallets/{id}`` and its ledger - both take an id,
+    and until this was added nothing in the API could produce one: a client that
+    had not been told a wallet id had no way to learn it. That is a gap the JSON
+    API carried for as long as the CLI did, and the CLI never exposed it because
+    a person at a terminal types the id they were handed when they opened the
+    wallet. Nobody types one into a browser.
+
+    **An empty list, and not a 404**, which is the one place this differs from
+    ``GET /wallets/{id}`` directly above. That route is asked about a wallet the
+    caller named, so finding nothing is a contradiction; this one is asked by a
+    caller who does not know what they hold, so "nothing" is simply true of an
+    account whose owner has not opened a wallet yet. Answering it with an error
+    would make the first page a new person sees an error page.
+
+    **Ownership is not a parameter and cannot be.** The service was built for one
+    actor before this function ran, so there is no query string, no body and no
+    path through which a caller could ask about somebody else - the same shape
+    ``POST /wallets`` above has for the same reason.
+    """
+    return [translate.wallet_out(one) for one in service.wallets_for_actor()]
+
+
 @router.get("/wallets/{wallet_id}", response_model=schemas.WalletOut)
 def get_wallet(
     wallet_id: UUID, service: WalletService = Depends(wallet_service)

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ status }}{% endblock %}
+
+{#
+  **Every refusal in this system, as a page.** The two values here are not
+  composed by this template: `error` is the exception's own class name and
+  `detail` is the sentence the JSON body would carry, both taken from
+  `errors.body_for` by `web.errors.Browser`. That is what keeps a page and a JSON
+  response from ever disagreeing about what happened - see `api/errors.py`.
+
+  Because they come from there, the 500 case arrives as `InternalServerError` and
+  `internal server error` and nothing more. A page that printed the exception's
+  own message would be more generous than the API is, and that message can hold a
+  path, a SQL fragment or a value out of somebody else's row.
+
+  `user` is not in this template's context - a page explaining a failure has no
+  session to describe - which is why `base.html` guards every use of it.
+#}
+{% block body %}
+  <div class="sheet narrow">
+    <h1 class="failure">{{ status }}</h1>
+    <p class="lede">{{ detail }}</p>
+
+    <p class="muted small">
+      If this was a page you were expecting to reach, signing in again is usually
+      the first thing to try.
+    </p>
+
+    <div class="row">
+      <a class="button" href="{{ urls.LANDING_PATH }}">Your wallets</a>
+      <a class="button quiet" href="{{ urls.SIGN_IN_PATH }}">Sign in</a>
+    </div>
+
+    {#
+      The name of the exception, shown because this page is also a developer's
+      only view of a refusal on a deployment with no JSON client attached. It is
+      the same string the API's `error` field carries, so nothing is disclosed
+      here that a `curl` would not disclose - and the two values that could
+      disclose something are already reduced above.
+    #}
+    <p class="mono small muted">{{ error }}</p>
+  </div>
+{% endblock %}

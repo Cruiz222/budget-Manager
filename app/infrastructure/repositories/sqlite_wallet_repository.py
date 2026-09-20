@@ -135,6 +135,37 @@ class SqliteWalletRepository(WalletRepository):
             raise WalletNotFoundError
         return self._row_to_wallet(row)
 
+    def list_for_owner(self, user_id) -> list[Wallet]:
+        """Every wallet this owner holds, oldest first.
+
+        ``ORDER BY rowid``, for the reason ``_funds_for`` gives one method down:
+        the ``wallets`` table has no ``created_at`` column, so the creation order
+        this is asked for is not recoverable from anything the aggregate stores.
+        It *is* recoverable from how rows are written - ``save`` inserts, and its
+        ``ON CONFLICT DO UPDATE`` keeps an existing row's rowid - so increasing
+        rowid is insertion order, which for this table is creation order. A
+        tiebreak on a column such as ``currency`` was rejected rather than
+        overlooked: it would be an order that happens to be stable rather than
+        the order the method promises.
+
+        **One pots query per wallet, and the number is not a mistake.** A person
+        holds one or two wallets, and the alternative - a join and a regroup -
+        would put the order of ``Wallet.funds`` at the mercy of a result set
+        again, which is the thing ``_funds_for`` goes out of its way to avoid.
+        The cost is bounded by how many wallets one person has opened rather than
+        by how much money is in them.
+        """
+        rows = self._connection.execute(
+            """
+            SELECT wallet_id, user_id, currency, status, available_balance
+            FROM wallets
+            WHERE user_id = ?
+            ORDER BY rowid
+            """,
+            (uuid_to_text(user_id),),
+        ).fetchall()
+        return [self._row_to_wallet(row) for row in rows]
+
     def owner_of(self, wallet_id) -> object:
         """The owner id behind a wallet id, or ``WalletNotFoundError``.
 

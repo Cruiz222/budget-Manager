@@ -80,6 +80,111 @@ class TestOpeningAWallet:
         assert client.get(f"/wallets/{wallet_id}", headers=as_user(BOB)).status_code == 404
 
 
+class TestListingWallets:
+    """``GET /wallets``, which is the read that had no way in before.
+
+    **A client that has not been told a wallet id could not learn one**, and that
+    was true of the CLI too - it never mattered there because a person at a
+    terminal types the id they were handed when the wallet was opened. Nobody
+    types a UUID into a browser, so the gap this closes is not one the browser
+    client invented; it is one it was the first client to run into.
+    """
+
+    def test_a_person_who_has_opened_nothing_gets_an_empty_list(self, client, as_user):
+        """**A list and not a 404**, which is the one place this differs from the
+        read beside it. ``GET /wallets/{id}`` is asked about a wallet the caller
+        named, so finding nothing is a contradiction; this is asked by somebody
+        who does not know what they hold, so "nothing" is merely true - and
+        answering it with an error would make the first page a new person sees an
+        error page.
+        """
+        response = client.get("/wallets", headers=as_user())
+
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_it_gives_back_what_they_opened(self, client, as_user, open_wallet):
+        opened = open_wallet(as_user())
+
+        listed = client.get("/wallets", headers=as_user()).json()
+
+        assert [one["wallet_id"] for one in listed] == [opened]
+
+    def test_the_entries_are_the_ones_the_other_route_returns(
+        self, client, as_user, open_wallet
+    ):
+        """**A list of the same resource rather than a summary of it.**
+
+        A thin listing - ids and currencies - would be cheaper to write and would
+        make the page that uses it fetch each wallet again to draw a balance. The
+        claim is asserted by comparing against the read beside it rather than
+        against a written-out body, so a field added to ``WalletOut`` cannot pass
+        here and fail there.
+        """
+        wallet_id = open_wallet(as_user())
+
+        listed = client.get("/wallets", headers=as_user()).json()
+        single = client.get(f"/wallets/{wallet_id}", headers=as_user()).json()
+
+        assert listed == [single]
+
+    def test_it_is_oldest_first(self, client, as_user, open_wallet):
+        """The order the port promises and the page draws, so a listing that came
+        back in whatever order the store chose would shuffle somebody's wallets
+        between reloads."""
+        first = open_wallet(as_user())
+        second = open_wallet(as_user())
+        third = open_wallet(as_user())
+
+        listed = client.get("/wallets", headers=as_user()).json()
+
+        assert [one["wallet_id"] for one in listed] == [first, second, third]
+
+    def test_it_does_not_show_a_strangers_wallet(self, client, as_user, open_wallet):
+        """**Ownership is not a parameter and cannot be.** The service was built
+        for one actor before the function ran, so there is no query string, no
+        body and no path through which a caller could ask about somebody else -
+        which is why the assertion is about absence rather than about a refusal.
+        """
+        open_wallet(as_user(BOB))
+        mine = open_wallet(as_user(ALICE))
+
+        listed = client.get("/wallets", headers=as_user(ALICE)).json()
+
+        assert [one["wallet_id"] for one in listed] == [mine]
+
+    def test_every_entry_names_the_caller_as_its_owner(self, client, as_user, open_wallet):
+        """**The same claim from inside the body rather than from the count.**
+
+        The test above asserts a stranger's wallet is absent, which a client
+        could satisfy by rendering somebody's wallet under the caller's id. This
+        one reads the owner field and compares it against ``/users/me`` - the
+        same comparison ``test_it_belongs_to_the_caller`` makes about the single
+        read, made again about the listing because it is a second route that
+        could get it wrong on its own.
+
+        **Every ``as_user`` here names its address, and the listing is ``ALICE``'s.**
+        ``as_user()`` is the suite's standard *third* account rather than one of
+        these two - see its own docstring - so listing with the bare call would
+        ask ``test@example.com`` what *it* holds and get an empty list. A test
+        written that way would fail on a correct listing and would still fail on
+        a listing that leaked BOB's wallet, which is the worst kind of assertion.
+        """
+        open_wallet(as_user(BOB))
+        open_wallet(as_user(ALICE))
+
+        mine = client.get("/users/me", headers=as_user(ALICE)).json()["user_id"]
+        listed = client.get("/wallets", headers=as_user(ALICE)).json()
+
+        assert [one["user_id"] for one in listed] == [mine]
+
+    def test_it_needs_a_session_like_everything_else(self, client):
+        """The one route in this file whose actor could plausibly have been
+        optional - a listing with no wallet named in it reads as a listing of the
+        installation's wallets if nobody is asked who is asking."""
+        assert client.get("/wallets").status_code == 401
+
+
 class TestReadingAWallet:
     def test_reading_it_back_gives_the_same_wallet(self, client, as_user):
         """The round trip is closed, which is the least a client can expect.

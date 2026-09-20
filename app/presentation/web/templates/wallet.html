@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block title %}{{ wallet.available_balance.amount }} {{ wallet.currency }}{% endblock %}
+
+{% block body %}
+  <div class="sheet">
+    <p class="crumb">
+      <a href="{{ urls.LANDING_PATH }}">Your wallets</a>
+    </p>
+
+    <div class="balance">
+      <span class="balance-amount">{{ wallet.available_balance.amount }}</span>
+      <span class="balance-currency">{{ wallet.currency }}</span>
+      <span class="balance-label">available</span>
+      {% if wallet.locked_balance.amount != "0.00" %}
+        <span class="balance-locked">
+          {{ wallet.locked_balance.amount }} {{ wallet.currency }} locked in pots
+        </span>
+      {% endif %}
+    </div>
+
+    <p class="muted small">
+      Wallet <code>{{ wallet.wallet_id }}</code> · {{ wallet.status }}
+    </p>
+
+    {% if wallet.funds %}
+      <section class="panel">
+        <h2>Pots</h2>
+        {#
+          Pots are shown and not operated. Every fund operation - open, lock,
+          release - has a use case and a route, and none of them has a form on
+          this page yet: the plan for this layer draws the MVP sentence and the
+          withdrawal flow, and a pot is neither. Rendering the balance is honest
+          about where the money is; offering a button that did not work would
+          not be.
+        #}
+        <ul class="pots">
+          {% for fund in wallet.funds %}
+            <li class="pot">
+              <span class="pot-name">{{ fund.name }}</span>
+              <span class="pot-balance">
+                {{ fund.balance.amount }} {{ fund.balance.currency }}
+              </span>
+              <span class="muted small">
+                {{ fund.kind }}
+                {% if not fund.is_open %} · sealed{% endif %}
+                {% if fund.maturity_date %} · matures {{ fund.maturity_date }}{% endif %}
+              </span>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <div class="actions">
+      <section class="panel">
+        <h2>Move money in</h2>
+        {% if deposits_ready %}
+          <form
+            method="post"
+            action="{{ urls.PREFIX }}/wallets/{{ wallet.wallet_id }}/deposits"
+            class="stack"
+          >
+            <label for="deposit-amount">Amount in {{ wallet.currency }}</label>
+            <input
+              id="deposit-amount"
+              name="amount"
+              type="text"
+              inputmode="decimal"
+              placeholder="0.00"
+              required
+            >
+
+            <label for="deposit-ref">
+              Reference <span class="muted small">(optional)</span>
+            </label>
+            <input id="deposit-ref" name="ref" type="text" autocapitalize="none">
+
+            <button type="submit" class="primary">Continue to payment</button>
+          </form>
+          {#
+            The wording here is load-bearing and must stay in this direction. The
+            money is settled by the provider's confirmation reaching
+            `/webhooks/paystack`, which may happen seconds after the payer
+            returns - so the page they land back on can show the old balance, and
+            saying "done" anywhere would be a lie the ledger has not told.
+          #}
+          <p class="muted small">
+            You will be taken to the payment provider to pay. Your balance
+            changes when the provider confirms the payment, which may be a few
+            seconds after you return.
+          </p>
+        {% else %}
+          <p class="muted small">
+            Payments are not set up on this installation, so money cannot be
+            moved in from here.
+          </p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <h2>Move money out</h2>
+        <form
+          method="post"
+          action="{{ urls.PREFIX }}/wallets/{{ wallet.wallet_id }}/withdrawals"
+          class="stack"
+        >
+          <label for="withdraw-amount">Amount in {{ wallet.currency }}</label>
+          <input
+            id="withdraw-amount"
+            name="amount"
+            type="text"
+            inputmode="decimal"
+            placeholder="0.00"
+            required
+          >
+
+          <label for="withdraw-ref">
+            Reference <span class="muted small">(optional)</span>
+          </label>
+          <input id="withdraw-ref" name="ref" type="text" autocapitalize="none">
+
+          <button type="submit">Review withdrawal</button>
+        </form>
+        {#
+          Nothing is emailed and nothing is texted, and the page says so before
+          the person wonders. The next screen is the second look: the request is
+          recorded here and answered there, by a button, on the strength of the
+          session alone. See `confirmations.py` - this is an accident guard and
+          is not a security control, and a page that implied a mailed code would
+          be implying a defence this system does not have.
+        #}
+        <p class="muted small">
+          Nothing leaves this wallet yet. You will be shown the request and asked
+          to confirm it on the next screen. No code is sent to you.
+        </p>
+      </section>
+    </div>
+
+    <section class="panel">
+      <h2>Activity</h2>
+      {% if transactions %}
+        {#
+          Every row, with no paging. A wallet with ten thousand entries would
+          render ten thousand rows - a real limit of this page, named rather than
+          discovered.
+        #}
+        <div class="scroller">
+          <table class="ledger">
+            <thead>
+              <tr>
+                <th scope="col">When</th>
+                <th scope="col">What</th>
+                <th scope="col">Amount</th>
+                <th scope="col">Status</th>
+                <th scope="col">Reference</th>
+                <th scope="col">Note</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for transaction in transactions %}
+                <tr>
+                  <td class="nowrap">
+                    {{ transaction.created_at.strftime("%Y-%m-%d %H:%M") }}
+                  </td>
+                  <td>{{ transaction.type }}</td>
+                  <td class="nowrap">
+                    {{ transaction.amount.amount }} {{ transaction.amount.currency }}
+                  </td>
+                  <td>{{ transaction.status }}</td>
+                  <td class="mono small">{{ transaction.internal_reference }}</td>
+                  <td class="small">
+                    {% if transaction.narration %}{{ transaction.narration }}{% endif %}
+                    {% if transaction.destination %}
+                      · to {{ transaction.destination.name }}
+                      ({{ transaction.destination.identifier }})
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <p class="muted small">Nothing has moved through this wallet yet.</p>
+      {% endif %}
+    </section>
+  </div>
+{% endblock %}

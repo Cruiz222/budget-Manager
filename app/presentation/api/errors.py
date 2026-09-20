@@ -67,7 +67,9 @@ if somebody later added a friendlier message for the foreign case.
 """
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.domain.identity.exception import (
     DuplicateEmailError,
@@ -654,10 +656,13 @@ async def money_error_handler(request: Request, exc: MoneyError) -> JSONResponse
     in FastAPI's threadpool, which is what a plain ``def`` gets it. A handler
     does no I/O at all - it formats a string - so there is nothing to hand off,
     and making it async keeps it on the event loop where it costs nothing.
+
+    **The grade and the words come from ``status_for`` and ``body_for``** rather
+    than being built here, because the browser client renders the same failure as
+    a page and the two must not be able to disagree. This handler is now the
+    three lines that turn a decision made once into a JSON response.
     """
-    return JSONResponse(
-        status_code=_grade(exc), content=_body(type(exc).__name__, _detail(exc))
-    )
+    return JSONResponse(status_code=status_for(exc), content=body_for(exc))
 
 
 async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
@@ -667,10 +672,16 @@ async def api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
     ``RateLimitedError`` carry its ``Retry-After`` without this handler knowing that
     class exists. Every other ``ApiError`` has an empty mapping and takes the same
     path it always did, so this is a seam rather than a special case.
+
+    It is also the *only* handler that forwards headers, which is why the shared
+    pair is a function returning a body and not a function returning a whole
+    response: there is exactly one failure in this system whose rendering has a
+    second half, and a shared response builder would have to carry a parameter
+    that six of its seven callers pass empty.
     """
     return JSONResponse(
-        status_code=exc.status_code,
-        content=_body(type(exc).__name__, _detail(exc)),
+        status_code=status_for(exc),
+        content=body_for(exc),
         headers=exc.headers or None,
     )
 
@@ -685,13 +696,98 @@ async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResp
     it can carry a file path, a SQL fragment, or a value out of a row that
     belongs to somebody else. So the response says only that something broke, and
     the exception goes to the server's log where it belongs.
+
+    That literal sentence lives in ``body_for`` now, because the browser client
+    needs the same one and a page that said more than this would be a page that
+    leaked what this handler exists to withhold.
     """
-    return JSONResponse(
-        status_code=500, content=_body("InternalServerError", "internal server error")
-    )
+    return JSONResponse(status_code=status_for(exc), content=body_for(exc))
 
 
-def install(app: FastAPI) -> None:
+def status_for(exc: BaseException) -> int:
+    """The status this refusal is rendered with, whichever exception tree it came from.
+
+    **It exists so that a second rendering of a refusal cannot invent its own
+    grade.** The browser client shows the same refusals as pages rather than as
+    JSON, and the one thing that must not differ between the two is the *status* -
+    a page that called a 409 a 400 would be a second opinion about a fact this
+    module exists to decide once. The order of the tests is ``_grade``'s own:
+    domain first, then this layer's, then "a bug", which is the same precedence
+    ``install`` registers handlers in.
+
+    **``StarletteHTTPException`` is the third tree and the one the router
+    raises**, which is how a mistyped ``/app/...`` address becomes a page rather
+    than a JSON body: 404 for a path nothing matches, 405 for a method nothing
+    allows, and 307 for Starlette's own trailing-slash redirect. It is graded by
+    its own status rather than falling through to the 500, because it is not a
+    bug - the framework matched the request and answered it, and the number it
+    chose is the answer.
+    """
+    if isinstance(exc, MoneyError):
+        return _grade(exc)
+    if isinstance(exc, ApiError):
+        return exc.status_code
+    if isinstance(exc, StarletteHTTPException):
+        return exc.status_code
+    return 500
+
+
+def body_for(exc: BaseException) -> dict:
+    """The ``{"error", "detail"}`` pair this failure is rendered with.
+
+    **``status_for``'s twin, and it exists for the identical reason**: the
+    browser client renders a page where the API renders a body, and a page that
+    *said* something different from the JSON would be the same class of mistake
+    as a page that graded it differently. So the pair is decided here, once, by
+    the same tests the three handlers above make - they build their bodies from
+    this function, and a change to what a failure says lands on both renderings
+    at the moment it is made.
+
+    The last two branches are the ones that are not refusals. An unexpected
+    exception gets the 500's fixed words and *not* its own message, for the
+    reason ``unexpected_error_handler`` gives: that message is written for
+    whoever is debugging it and can carry a file path or a value out of somebody
+    else's row. A ``StarletteHTTPException`` keeps the router's own detail, which
+    is the one place this pair is not the system's own prose - "Not Found" rather
+    than a sentence - and it is deliberate: the JSON side answers that same
+    exception with a bare ``{"detail": ...}`` and no ``error`` key at all, so
+    matching it exactly would mean a page with no name in it. The page is the
+    more informative of the two and the number is the same.
+    """
+    if isinstance(exc, (MoneyError, ApiError)):
+        return _body(type(exc).__name__, _detail(exc))
+    if isinstance(exc, StarletteHTTPException):
+        return _body(type(exc).__name__, _detail(exc))
+    return _body("InternalServerError", "internal server error")
+
+
+def _browser_aware(json_handler, browser):
+    """Wrap one JSON handler so the browser client can answer instead.
+
+    **``browser`` is consulted first and only for the paths it claims**, which is
+    what keeps the two renderings from being a choice this module has to make: a
+    request under the client's prefix is the client's, and everything else is the
+    API's, whatever raised. A single application serving both is the point of the
+    arrangement - see ``create_app`` - so "which half is this?" has to be
+    answerable from the request, and this is where it is asked.
+
+    ``None`` means an application with no browser client attached, which is every
+    application a test builds by hand and every one that predates this layer. The
+    JSON handler is then registered *unwrapped* rather than wrapped around a
+    ``None`` check, so the ordinary case is the code that was there before.
+    """
+    if browser is None:
+        return json_handler
+
+    async def handler(request: Request, exc: Exception):
+        if browser.handles(request):
+            return browser.render(request, exc)
+        return await json_handler(request, exc)
+
+    return handler
+
+
+def install(app: FastAPI, browser=None) -> None:
     """Register every handler, in the order that matters.
 
     Registration order does not decide matching - Starlette walks the exception's
@@ -699,7 +795,28 @@ def install(app: FastAPI) -> None:
     before ``Exception`` here is documentation rather than mechanism. It is worth
     having anyway, because "the specific ones first" is the property a reader
     needs to check and the code should be readable as the rule it obeys.
+
+    **``browser`` is the web layer's renderer, and its absence is a supported
+    state.** The four handlers here are unchanged and remain the whole of what
+    happens when it is not given - which is the case for the API alone, for the
+    CLI's tests, and for every test that builds an application by hand. What the
+    parameter changes is only *where the words are put* for requests the client
+    owns: the grade is ``status_for``'s in both cases, and the body is the same
+    ``error``/``detail`` pair, rendered as a page instead of serialised.
+
+    **The fourth handler is FastAPI's own**, imported rather than reimplemented,
+    and registering it explicitly is what keeps a browser's 404 a page. Without
+    it the framework's default answers a mistyped address with JSON - the one
+    failure in this system that no route raises and that ``install`` therefore
+    has to reach for by class. Handing it to ``_browser_aware`` with no browser
+    gives back exactly the default that was there before, so the API's own
+    behaviour is unchanged by its presence; see ``status_for`` for the grade.
     """
-    app.add_exception_handler(MoneyError, money_error_handler)
-    app.add_exception_handler(ApiError, api_error_handler)
-    app.add_exception_handler(Exception, unexpected_error_handler)
+    app.add_exception_handler(MoneyError, _browser_aware(money_error_handler, browser))
+    app.add_exception_handler(ApiError, _browser_aware(api_error_handler, browser))
+    app.add_exception_handler(
+        StarletteHTTPException, _browser_aware(http_exception_handler, browser)
+    )
+    app.add_exception_handler(
+        Exception, _browser_aware(unexpected_error_handler, browser)
+    )

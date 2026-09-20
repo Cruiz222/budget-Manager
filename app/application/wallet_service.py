@@ -628,6 +628,28 @@ class WalletService:
         finally:
             uow.rollback()
 
+    def wallets_for_actor(self) -> list[Wallet]:
+        """Every wallet this service's actor holds, oldest first.
+
+        **The owner is not a parameter**, which is ``open_wallet``'s argument
+        arriving at a read: the actor is bound when the service is built, so
+        there is no spelling of this call that lists wallets belonging to
+        somebody else. It is the read that makes the rest of the API reachable
+        for a client - ``get_wallet`` and ``transactions_for_wallet`` both need a
+        wallet id, and this is the only way to learn one.
+
+        Pure read like ``get_wallet``, with the one difference the port argues:
+        **an empty list is an answer, not a refusal.** A person who has not
+        opened a wallet yet is the ordinary first state of every account, and a
+        ``WalletNotFoundError`` here would make the landing page of a new account
+        an error page.
+        """
+        uow = self._unit_of_work_factory.start()
+        try:
+            return uow.wallets.list_for_owner(self._actor)
+        finally:
+            uow.rollback()
+
     def open_wallet(self, currency: Currency) -> Wallet:
         """Open a new empty wallet for this service's actor, in the given currency.
 

@@ -79,6 +79,18 @@ EXPECTED_OPERATIONS = {
     # the one place in the API where those differ - see ``routes/sessions.py``.
     ("delete", "/sessions/current"),
     ("post", "/wallets"),
+    # --- the collection read, added with the browser client ------------------
+    #
+    # **The route that made a wallet id obtainable.** Every other wallet path
+    # needs an id in it, and this one exists because nothing produced one: a
+    # person at a terminal was handed an id when they opened a wallet and typed
+    # it thereafter, and a browser has no such history. It is scoped to the
+    # caller's own wallets by construction - the service was built for one actor
+    # before the handler ran, so there is no parameter to aim at somebody else -
+    # which is why it belongs in this list rather than in the held one. It reads
+    # balances and moves nothing, and an empty list is an answer rather than a
+    # 404, for the reason the route's own docstring gives.
+    ("get", "/wallets"),
     ("get", "/wallets/{wallet_id}"),
     ("get", "/wallets/{wallet_id}/transactions"),
     ("get", "/wallets/{wallet_id}/funds"),

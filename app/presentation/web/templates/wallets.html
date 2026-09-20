@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Your wallets{% endblock %}
+
+{% block body %}
+  <div class="sheet">
+    <h1>Your wallets</h1>
+
+    {% if wallets %}
+      <ul class="cards">
+        {% for wallet in wallets %}
+          <li class="card">
+            <a class="card-main" href="{{ urls.PREFIX }}/wallets/{{ wallet.wallet_id }}">
+              <span class="card-amount">{{ wallet.available_balance.amount }}</span>
+              <span class="card-currency">{{ wallet.currency }}</span>
+              <span class="card-label">available</span>
+            </a>
+            <dl class="card-facts">
+              <dt>Locked</dt>
+              <dd>{{ wallet.locked_balance.amount }} {{ wallet.currency }}</dd>
+              <dt>Pots</dt>
+              <dd>{{ wallet.funds | length }}</dd>
+              <dt>Standing</dt>
+              <dd>{{ wallet.status }}</dd>
+            </dl>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      {#
+        An account with no wallet is not an error and is not a 404: it is the
+        state every new account is in, and it has exactly one thing to do next.
+        The form below is the whole of that, which is why the currency list sits
+        on this page rather than behind a link of its own.
+      #}
+      <div class="empty">
+        <h2>You have no wallet yet</h2>
+        <p>
+          A wallet holds one currency and is where money arrives, waits and
+          leaves. Open one to begin.
+        </p>
+      </div>
+    {% endif %}
+
+    <section class="panel">
+      <h2>Open a wallet</h2>
+      {#
+        `currencies` is the domain's own enum, passed through from the route, so
+        this list is what the domain accepts rather than a copy of it kept here.
+        A currency added to the enum appears without an edit; the route refuses
+        one that is not there, in the domain's own words.
+      #}
+      <form method="post" action="{{ urls.PREFIX }}/wallets" class="row">
+        <label for="currency">Currency</label>
+        <select id="currency" name="currency">
+          {% for currency in currencies %}
+            <option value="{{ currency }}">{{ currency }}</option>
+          {% endfor %}
+        </select>
+        <button type="submit">Open wallet</button>
+      </form>
+      <p class="muted small">
+        A currency cannot be changed once a wallet is open. Open a second wallet
+        for a second currency.
+      </p>
+    </section>
+  </div>
+{% endblock %}

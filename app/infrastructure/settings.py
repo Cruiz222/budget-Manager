@@ -481,6 +481,109 @@ def google_from_environment(environ=None) -> GoogleSettings | None:
     return GoogleSettings(client_id=_text(environ, "GOOGLE_CLIENT_ID"))
 
 
+@dataclass(frozen=True)
+class WebSettings:
+    """Everything the browser client needs told to it, and nothing else.
+
+    **One field, and it is not a credential.** The web layer's whole configuration
+    is a single question - may a session cookie travel over plain HTTP - and every
+    other fact it needs it reads from the environment through the readers that
+    already exist. That is worth stating because this object sits beside
+    ``PaystackSettings`` and ``GoogleSettings``, which are entirely credentials,
+    and a reader who has just met those will expect a third secret here. There is
+    none: the session token is not a setting, because it is minted per person at
+    sign-in, and the cookie's name, path and flags are properties of the code that
+    writes it.
+
+    Frozen and behaviour-free, exactly as the four objects above: it opens
+    nothing, writes nothing and can be built by hand in a test without going near
+    the environment. The one place it is read is where a ``Set-Cookie`` header is
+    composed.
+    """
+
+    #: Whether the session cookie is marked ``Secure``.
+    #:
+    #: **On by default, and the default is right for development as well as for a
+    #: deployment.** ``Secure`` only stops a cookie travelling over plain HTTP,
+    #: and every current browser treats ``http://localhost`` as a secure context,
+    #: so a person running this on their own machine sets nothing and gets the
+    #: flag that belongs in production. The setting exists for the one case the
+    #: default gets wrong: an installation reached over plain HTTP at an address
+    #: that is *not* localhost - a LAN address during development, say - where a
+    #: ``Secure`` cookie is silently never stored and the symptom is a sign-in
+    #: page that accepts a password and returns to itself.
+    #:
+    #: Trading it off is a real trade and it is why this is ``0``-able rather than
+    #: hard-coded: with it off, the token crosses the network in the clear and
+    #: anybody on the path can read it. So the value that makes a misconfigured
+    #: install *work* is the value that makes it unsafe, and it is deliberately a
+    #: person's decision rather than a fallback the code performs for them.
+    cookie_secure: bool = True
+
+
+def web_from_environment(environ=None) -> WebSettings:
+    """Build the web settings from the environment.
+
+    **The fifth reader of this module's shape and the first that cannot fail**,
+    which is the whole of what is interesting about it. The four above return
+    ``None`` for an installation that is not configured, because a mail account, a
+    payment key, an SMS account and a Google client id are each *something this
+    system may not have*. A browser client is not: the web layer is part of this
+    application and there is no deployment in which the sign-in page exists but
+    the cookie question does not. So the return type is ``WebSettings`` and not
+    ``WebSettings | None``, and ``web_from_environment`` can never hand a caller a
+    ``None`` it would have to argue about.
+
+    That leaves the default doing all the work, and it is a default rather than an
+    absent case - a different thing from ``database_path``'s, which falls back
+    because there is nothing to fall back *from* here. See ``cookie_secure``.
+
+    ``environ`` is injectable for the same reason every reader above injects it,
+    and here it is what lets the suite exercise both values of the flag without
+    monkeypatching the process environment.
+    """
+    environ = os.environ if environ is None else environ
+    return WebSettings(cookie_secure=_flag(environ, "WEB_COOKIE_SECURE", default=True))
+
+
+def public_base_url_from_environment(environ=None) -> str | None:
+    """Where this installation is publicly reachable, or ``None`` if unset.
+
+    **The setting the checklist's Google entry says does not exist**, and it is
+    worth being precise about what it is for, because it is easy to read as one
+    that Google needs. It is not: this system verifies an id_token and never
+    redirects, so nothing here needs an address to be sent *to*. What needs one is
+    Paystack, whose ``/transaction/initialize`` takes a ``callback_url`` - where a
+    payer's browser is sent once they have finished - and that must be an absolute
+    address, because the browser resolving it belongs to somebody else.
+    ``PaystackPaymentProvider`` carries the argument.
+
+    **What is returned is an origin and not a landing page.** ``PUBLIC_BASE_URL``
+    is the deployment fact - ``https://budget.example`` - and the path a payer
+    should land on is a fact about the web layer, held in
+    ``app.presentation.web.urls``. Joining the two belongs to the one frame that
+    knows both, which is ``create_app``; doing it here would put a presentation's
+    route table inside the module whose job is to read strings out of the
+    environment, and the day that route is renamed the settings module would be
+    the thing that broke.
+
+    ``None`` is a normal state and not an error, which is why this returns
+    ``str | None`` where ``web_from_environment`` above does not. An installation
+    with no public address takes deposits perfectly well; its payers are simply
+    not sent back, and the deposit is settled by the webhook either way. A trailing
+    slash is stripped, because the join below it is the caller's and a base URL
+    written with one would otherwise produce a doubled separator in the address a
+    payer's browser is handed.
+
+    A blank value counts as unset, for ``_text``'s reason everywhere else: a
+    variable set to spaces is one somebody meant to fill in, and an address of
+    whitespace would be a callback that sends a payer nowhere.
+    """
+    environ = os.environ if environ is None else environ
+    value = _text(environ, "PUBLIC_BASE_URL")
+    return value.rstrip("/") if value is not None else None
+
+
 def database_path(environ=None) -> str:
     """Where the SQLite database lives.
 

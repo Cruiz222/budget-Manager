@@ -30,6 +30,21 @@ class InMemoryWalletRepository(WalletRepository):
 
         return wallet
 
+    def list_for_owner(self, user_id):
+        """Every wallet this owner holds, oldest first.
+
+        **The filter is the whole method, and it is spelled out rather than
+        delegated.** A fake that returned ``self.wallets.values()`` and left the
+        owner to the caller would let a scoping bug pass here and fail in
+        SQLite - which is exactly the failure the class docstring says a fake is
+        most likely to be believed about. Dict insertion order is the creation
+        order the port asks for, and it is stable, so nothing further is needed
+        to reproduce ``ORDER BY rowid``.
+        """
+        return [
+            wallet for wallet in self.wallets.values() if wallet.user_id == user_id
+        ]
+
     def owner_of(self, wallet_id):
         """The owner id behind a wallet id, or ``WalletNotFoundError``.
 

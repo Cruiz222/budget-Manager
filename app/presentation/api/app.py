@@ -8,10 +8,21 @@ is always the one that is wrong.
 
 What ``create_app`` puts on ``app.state`` is the whole of the configuration: a
 unit of work factory, the mail settings, the payment settings and the provider
-built from them, the SMS settings, the Google settings and verifier, and the rate
-limiter. All are resolved once, when the app is built, and never per request -
-which is what makes a running server act on one configuration rather than on
-whatever the environment happened to be when a request arrived.
+built from them, the SMS settings, the Google settings and verifier, the web
+settings that decide how a browser's cookie is set, the installation's public
+origin, and the rate limiter. All are resolved once, when the app is built, and
+never per request - which is what makes a running server act on one configuration
+rather than on whatever the environment happened to be when a request arrived.
+
+**The public origin is on ``app.state`` and is deliberately not on
+``PaystackSettings``**, which is a deviation from the shape that object would
+naturally have had and is worth a sentence. A ``callback_url`` field there would
+have to hold a whole address, and the *path* half of that address is the web
+layer's business - the JSON API has no opinion about where a browser lands.
+Keeping the origin as its own setting and joining it to ``urls.RETURN_PATH`` on
+the provider line below leaves ``settings`` holding facts about an installation
+and the web package holding facts about URLs, with the composition root as the
+only frame that sees both.
 
 **The rate limiter is the one of those that is not inert**, and the difference is
 worth stating up front because it is the reason this module now has a lifespan and
@@ -42,6 +53,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.composition_root import google_verifier_for, provider_for
 from app.infrastructure.persistence.sqlite_unit_of_work import (
@@ -58,8 +70,10 @@ from app.infrastructure.settings import (
     from_environment,
     google_from_environment,
     paystack_from_environment,
+    public_base_url_from_environment,
     rate_limit_flush_seconds as configured_flush_interval,
     termii_from_environment,
+    web_from_environment,
 )
 from app.presentation.api import errors
 from app.presentation.api.rate_limits import longest_window
@@ -77,6 +91,10 @@ from app.presentation.api.routes import (
     wallets,
     webhooks,
 )
+from app.presentation.web import STATIC_DIRECTORY
+from app.presentation.web import errors as web_errors
+from app.presentation.web import routes as web_routes
+from app.presentation.web import urls as web_urls
 
 
 logger = logging.getLogger(__name__)
@@ -257,24 +275,6 @@ def create_app(
     directly by calling ``flush``. This parameter is the way back in for the test
     that wants the real lifecycle.
     """
-    application = FastAPI(
-        title="Budget Manager",
-        description=(
-            "A personal savings wallet with named locked pots and scheduled "
-            "plans.\n\n"
-            "**Who is asking is carried in an `Authorization: Bearer <token>` "
-            "header**, and the token comes from `POST /sessions`. Register with "
-            "`POST /users`, exchange those credentials for a token, and send it "
-            "with every other request; `DELETE /sessions/current` ends it. "
-            "`GET /users/me` and `GET /health` are the two endpoints that answer "
-            "without any of that - the first only to tell you your token is no "
-            "longer good.\n\n"
-            "There is no way to act as somebody else. A wallet belonging to "
-            "another account is not refused, it is *not there* - the same 404 a "
-            "wallet that never existed gets, with the same body."
-        ),
-    )
-
     if unit_of_work_factory is None:
         unit_of_work_factory = SqliteUnitOfWorkFactory(
             database_path or configured_database_path()
@@ -381,8 +381,22 @@ def create_app(
     application.state.paystack = (
         paystack_from_environment() if paystack_settings is None else paystack_settings
     )
+    #: Where this installation is reachable from the outside, or ``None`` for an
+    #: installation that has not said. It is read *here*, before the provider is
+    #: built, because the provider is the one thing that needs it: Paystack takes
+    #: a ``callback_url`` and it has to be absolute.
+    application.state.public_base_url = public_base_url_from_environment()
     application.state.payment_provider = (
-        provider_for(application.state.paystack)
+        provider_for(
+            application.state.paystack,
+            # **The join happens on this line and nowhere else**, which is the
+            # whole of what ``public_base_url`` being a setting *here* rather
+            # than on ``PaystackSettings`` buys. The origin is ``settings``'s
+            # fact and the landing path is the web layer's; nothing else in this
+            # system holds both, so nothing else could compose them without one
+            # side learning the other's vocabulary. See ``urls.callback_url``.
+            callback_url=web_urls.callback_url(application.state.public_base_url),
+        )
         if payment_provider is None
         else payment_provider
     )
@@ -397,8 +411,34 @@ def create_app(
         if google_verifier is None
         else google_verifier
     )
+    #: How the browser client's cookie is set, and which installation it is.
+    #: One field - see ``WebSettings`` - and it is here rather than read per
+    #: request for the reason every other setting is: a running server acts on
+    #: one configuration, not on whatever the environment was when a request
+    #: arrived. A route that wants it asks for it through ``web_settings``.
+    application.state.web = web_from_environment()
 
-    errors.install(application)
+    # The web layer's renderer, handed over rather than imported by ``errors``.
+    # With no browser the four handlers are exactly what they were before this
+    # layer existed; see ``errors.install``.
+    errors.install(application, browser=web_errors.Browser())
+
+    # The stylesheet, mounted **before any router**, so that no route anywhere in
+    # this system is ever consulted for a path under ``/app/static``. The order
+    # is belt-and-braces rather than a fix for a live collision - nothing
+    # registered today could match a CSS path - and it is written this way so
+    # that the day something can, the mount has already won.
+    #
+    # ``check_dir=False`` and the reason is the one this module already gives for
+    # letting a failed rate-limit warm-start serve anyway: a missing static
+    # directory costs the *appearance* of the pages, not their function, and an
+    # application that refused to boot over a stylesheet would be taking the
+    # money down to protect the CSS.
+    application.mount(
+        web_urls.STATIC_PREFIX,
+        StaticFiles(directory=str(STATIC_DIRECTORY), check_dir=False),
+    )
+
     for module in (
         health,
         users,
@@ -414,5 +454,14 @@ def create_app(
         webhooks,
     ):
         application.include_router(module.router)
+
+    # The browser client, last, and both of its routers carry
+    # ``include_in_schema=False`` - so ``/openapi.json`` describes the JSON
+    # contract and not the pages, which is the same statement as "these are two
+    # presentations of one system". Registration order is not what keeps the two
+    # namespaces apart - ``urls.PREFIX`` is - but putting this layer after the
+    # API says which of the two is the system and which is the face on it.
+    application.include_router(web_routes.root)
+    application.include_router(web_routes.router)
 
     return application

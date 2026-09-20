@@ -82,7 +82,9 @@ def _channel_for(settings: EmailSettings | None, channel=None):
     )
 
 
-def provider_for(settings: PaystackSettings | None, provider=None):
+def provider_for(
+    settings: PaystackSettings | None, provider=None, *, callback_url: str | None = None
+):
     """The payment provider to call: the injected one, Paystack, or none at all.
 
     The exact counterpart of ``_channel_for`` above, one direction of money over.
@@ -107,12 +109,31 @@ def provider_for(settings: PaystackSettings | None, provider=None):
     construction site, and a second construction site is what this function
     exists to prevent - the two would drift over which settings they read, and
     the drift would present as a webhook verified with a key nothing else uses.
+
+    **``callback_url`` is a parameter rather than a fourth settings object, and
+    that is a deliberate refusal to teach this function about a URL.** The value
+    Paystack needs is the installation's public origin *joined to the path a payer
+    should land on*, and only two frames in this system know the second half: the
+    web layer, which owns the page, and ``create_app``, which is where both facts
+    meet. A reader that composed the join itself would have to know a
+    presentation's route table, which is exactly the coupling the settings module
+    exists to avoid - see ``build_request_password_reset`` for the same rule
+    stated about a sentence instead of an address. So this function's job stops at
+    handing the assembled string to the adapter, and the assembly happens one
+    layer up.
+
+    ``None`` is the ordinary case and not an error: it means nobody told this
+    installation where it is publicly reachable, and a deposit then opens with no
+    return address at all. Deposits still work; the payer simply is not sent back.
+    See ``PaystackPaymentProvider.initialize_deposit``.
     """
     if provider is not None:
         return provider
     if settings is None:
         return None
-    return PaystackPaymentProvider(secret_key=settings.secret_key)
+    return PaystackPaymentProvider(
+        secret_key=settings.secret_key, callback_url=callback_url
+    )
 
 
 def google_verifier_for(

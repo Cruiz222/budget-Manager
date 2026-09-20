@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Confirm {{ confirmation.kind }}{% endblock %}
+
+{% block body %}
+  <div class="sheet narrow">
+    <p class="crumb">
+      <a href="{{ urls.PREFIX }}/wallets/{{ confirmation.wallet_id }}">
+        Back to the wallet
+      </a>
+    </p>
+
+    <h1>Confirm this request</h1>
+
+    {#
+      **`status` comes from the server and is not re-derived here.** Nothing on
+      this page compares `expires_at` with the clock the browser happens to hold:
+      a request past its window still stores `awaiting` on the row - nothing
+      sweeps, and expiry is computed - so the server reports `expired` for it and
+      this page draws what it was told. A comparison written here would be a
+      second definition of the window's last instant, free to disagree with the
+      one the next confirm would act on, and it would disagree in the direction
+      of offering a button that refuses.
+    #}
+    {% set status = confirmation.status %}
+
+    <div class="request status-{{ status }}">
+      <dl class="facts">
+        <dt>What</dt>
+        <dd>{{ confirmation.kind.replace("_", " ") }}</dd>
+
+        <dt>Amount</dt>
+        <dd class="big">
+          {% if confirmation.amount %}
+            {{ confirmation.amount.amount }} {{ confirmation.amount.currency }}
+          {% else %}
+            —
+          {% endif %}
+        </dd>
+
+        <dt>Wallet</dt>
+        <dd class="mono small">{{ confirmation.wallet_id }}</dd>
+
+        {% if confirmation.destination %}
+          <dt>Destination</dt>
+          <dd>
+            {{ confirmation.destination.name }}
+            <span class="muted small">
+              ({{ confirmation.destination.identifier }})
+            </span>
+          </dd>
+        {% endif %}
+
+        {% if confirmation.fund_name %}
+          <dt>Pot</dt>
+          <dd>{{ confirmation.fund_name }}</dd>
+        {% endif %}
+
+        <dt>Requested</dt>
+        <dd class="small">
+          {{ confirmation.created_at.strftime("%Y-%m-%d %H:%M") }}
+        </dd>
+
+        <dt>Answer by</dt>
+        <dd class="small">
+          {{ confirmation.expires_at.strftime("%Y-%m-%d %H:%M") }}
+        </dd>
+
+        <dt>Reference</dt>
+        <dd class="mono small">{{ confirmation.internal_reference }}</dd>
+
+        <dt>Status</dt>
+        <dd class="badge badge-{{ status }}">{{ status }}</dd>
+      </dl>
+    </div>
+
+    {% if status == "awaiting" %}
+      {#
+        The button is offered only while the server says the request is live. The
+        form carries nothing but the path - the operation, the wallet, the amount
+        and the destination were decided when the request was recorded, so there
+        is no field here that could carry out a different movement from the one
+        this page just described.
+
+        **No code was sent and none is asked for.** This is a second look, not a
+        check: it establishes that the browser holds the session and nothing
+        more. `confirmations.py` argues that at length; the point of saying it
+        here is that a page which stayed silent would leave a person waiting for
+        a mail that is never coming.
+      #}
+      <form
+        method="post"
+        action="{{ urls.PREFIX }}/confirmations/{{ confirmation.confirmation_id }}/confirm"
+      >
+        <button type="submit" class="primary">Confirm and move the money</button>
+      </form>
+      <p class="muted small">
+        Confirming carries this out. It cannot be undone from here - a mistake is
+        corrected with a reversal, not by deleting anything.
+      </p>
+    {% elif status == "confirmed" %}
+      <p class="muted small">
+        This request has already been answered. Nothing more happens if you see
+        this page again.
+      </p>
+    {% elif status == "expired" %}
+      <p class="muted small">
+        This request expired before it was answered, so it can no longer be
+        carried out. Nothing has moved. Ask for a new one from the wallet.
+      </p>
+    {% else %}
+      <p class="muted small">
+        This request cannot be answered in its current state.
+      </p>
+    {% endif %}
+  </div>
+{% endblock %}
