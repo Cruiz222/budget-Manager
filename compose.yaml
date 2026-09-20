@@ -26,14 +26,36 @@ name: budget
 x-money-environment: &money-environment
   BUDGET_DB: /data/budget.db
 
+# The build, in one place because both services need it and both need the same
+# arguments - and an argument repeated twice is an argument that can be changed
+# once.
+#
+# **`BUDGET_UID` and `BUDGET_GID` are required rather than defaulted, and the
+# refusal is the point.** The container has to run as the uid that owns
+# `./data`, because a bind mount takes its ownership from the host and the only
+# other way to make the two agree is `chown`, which is root. Somebody deploying
+# this may well not have root - the usual shape of a VPS deploy user - so the
+# deployment asks for the number instead of for a privilege.
+#
+# The alternative to refusing here is the Dockerfile's own default of 10001,
+# which produces a container that starts, serves `/health`, and then fails every
+# unit of work on an unwritable directory. That failure reads as a broken
+# database. A missing variable should read as a missing variable, which is the
+# same argument `RATE_LIMIT_FLUSH_SECONDS` makes for raising on a typo.
+x-image-build: &image-build
+  context: .
+  args:
+    BUDGET_UID: "${BUDGET_UID:?run 'id -u' and put it in .env}"
+    BUDGET_GID: "${BUDGET_GID:?run 'id -g' and put it in .env}"
+
 services:
   api:
-    # One name for one build. Both services carry `build: .` and the same
+    # One name for one build. Both services carry `build:` and the same
     # `image:`, which is what tells compose to build this context *once* and run
     # the result twice - rather than building two identical images under two
     # generated names and having the tick be a copy that can drift.
     image: budget
-    build: .
+    build: *image-build
     restart: unless-stopped
     env_file: .env
     environment:
@@ -51,18 +73,24 @@ services:
     # merely failing to write. The *directory* is mounted, not the file,
     # because SQLite writes its rollback journal beside the database.
     #
-    # **`./data` has to exist and be owned by the container user before the
-    # first `up`, and that is the one step compose will not do for you.** Docker
-    # creates a missing bind-mount source as root, and the container runs as
-    # uid 10001 - so the failure is not a mount error but SQLite reporting an
-    # unwritable directory, from inside `/health`, which reads as a broken
-    # database rather than a broken permission. Once:
+    # **`./data` has to exist before the first `up`, and `mkdir` is the whole
+    # of the host-side setup.** Docker creates a missing bind-mount source as
+    # root, and a root-owned directory is not writable by the container user - so
+    # the failure is not a mount error but SQLite reporting an unwritable
+    # directory, from inside `/health`, which reads as a broken database rather
+    # than a broken permission.
     #
-    #     install -d -o 10001 -g 10001 data
+    # `mkdir -p data` is enough and needs no privilege, because the build
+    # arguments above made the container user whoever just ran it. That is the
+    # change from the first version of this file, which asked for
+    # `install -d -o 10001` and therefore for root: the ownership problem was
+    # real, but the answer to it was to move the container to the uid rather
+    # than to move the uid to the container.
     #
-    # A named volume would sidestep this, because compose copies the image's
-    # ownership of `/data` into a fresh one. The bind mount is chosen anyway,
-    # for the reason above it - and the cost of that choice is this command.
+    # A named volume would sidestep even the `mkdir`, since compose copies the
+    # image's ownership of `/data` into a fresh one. The bind mount is chosen
+    # anyway, for the reason above it, and the entire cost of that choice is now
+    # one command that needs nothing.
     volumes:
       - ./data:/data
     # Nothing is published. The proxy is the only door, and this port is
@@ -142,7 +170,7 @@ services:
   # not.
   tick:
     image: budget
-    build: .
+    build: *image-build
     profiles: ["tools"]
     env_file: .env
     environment:

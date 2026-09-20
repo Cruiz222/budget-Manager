@@ -15,6 +15,31 @@
 # value would be in git, which is the one place a deployment's name is fine to
 # be and the one place a wrong one is easy to miss.
 
+# **Run the validator with `APP_DOMAIN` set, or this file will lie to you about
+# which line is broken.**
+#
+# `{$APP_DOMAIN}` with nothing in the environment expands to the empty string,
+# which leaves the site header below as a bare `{`. A bare `{` at the top of a
+# Caddyfile is not an empty site address - it is the opening of the *global
+# options block* - so everything inside is read as a global option, and the first
+# line of it produces:
+#
+#     Error: adapting config using caddyfile: Caddyfile:19: unrecognized global
+#     option: reverse_proxy
+#
+# That names the right line and the wrong cause. `reverse_proxy` is a perfectly
+# good directive in the place it is actually written; what is missing is a
+# hostname, two lines up, and nothing in the message points there.
+#
+# **Compose cannot reach this state**, and that is where the protection lives
+# rather than here: `compose.yaml` declares the variable as
+# `"${APP_DOMAIN:?...}"`, so it refuses to compose at all without a value. Caddy
+# has no equivalent - `{$VAR:default}` would take a default, and a default
+# hostname is worse than a crash, because the deployment would quietly answer on
+# the wrong name. So the refusal stays one layer up, and this note is for
+# whoever runs `caddy validate` by hand.
+#
+#     APP_DOMAIN=localhost caddy validate --config Caddyfile
 {$APP_DOMAIN} {
 	reverse_proxy api:8000
 

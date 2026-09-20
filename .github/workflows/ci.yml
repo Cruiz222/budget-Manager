@@ -1,0 +1,127 @@
+name: CI
+
+# The item this closes, in the checklist's own words: "N tests that nobody runs
+# automatically are a liability that feels like an asset." Until this file
+# existed, the number in that sentence had been maintained by hand and had gone
+# stale twice.
+#
+# **Every push, on every branch**, which for a repository with one author and one
+# branch is the same as saying main is always green. The alternative - running
+# only on pull requests - would never fire for the way this project is actually
+# worked, and a workflow that does not run is a workflow that does not exist.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  suite:
+    name: The suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # **3.12, and pinned deliberately rather than tracking the newest.**
+      # `requirements.txt` pins every dependency to what pip resolved on a
+      # machine running 3.12.3, and `Dockerfile` builds on `python:3.12-slim`.
+      # A matrix here would be a claim that this software supports more than one
+      # interpreter, which nobody has decided and no test asserts. When that
+      # decision is made it belongs in a matrix; until then a single version plus
+      # the Dockerfile's is the honest pair.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      # `-q` and nothing else: the flags that matter are in `pyproject.toml`,
+      # including `--import-mode=importlib`, which two test files sharing a
+      # basename depend on. Repeating them here would be a second copy of a
+      # configuration that is already committed, and the copy in the workflow is
+      # the one that would drift.
+      #
+      # The suite is the whole of this job and takes several minutes. It is not
+      # split, because a suite that is only green when it runs in pieces is a
+      # suite with an undiscovered order dependency - and the money tests share
+      # SQLite files and a rate limiter on purpose.
+      - name: Run the suite
+        run: python -m pytest -q
+
+  deployment:
+    name: The deployment config
+    runs-on: ubuntu-latest
+    # **This job exists because the deployment was written by someone who could
+    # not run it.** README decisions 249-254 describe a `compose.yaml`,
+    # a `Caddyfile` and a `Dockerfile` that have never been executed, and the
+    # honest response to that is not a promise to test it later - it is to test
+    # the parts a runner can test on every push, which is that the files parse
+    # and that the proxy accepts its own configuration.
+    #
+    # What is *not* covered here, and cannot be: a certificate, because ACME
+    # will not issue for a name that does not resolve; the bind mount's
+    # ownership, which depends on the host; and whether the container serves a
+    # request, which needs the image built and run. Those are the three things
+    # still owed to this item.
+    steps:
+      - uses: actions/checkout@v4
+
+      # `.env` is gitignored, and both of the steps below need it to exist.
+      #
+      # **`env_file` is checked for existence at parse time**, so a runner with
+      # no `.env` gets "env file not found" rather than a composed deployment -
+      # which is the right behaviour for a person, since the README's first
+      # instruction is `cp .env.example .env`, and the wrong behaviour for a
+      # checkout in CI, which has no reason to hold a deployment's settings.
+      #
+      # A name in the reserved `.example` domain (RFC 2606), chosen so nothing
+      # here can ever collide with a real host. It is never resolved: `config`
+      # interpolates and validates, and dials nothing.
+      #
+      # The two ids are the runner's own, which is what a real deployment would
+      # put here for the same reason - they decide the uid the image is built
+      # for, and both are required rather than defaulted. `1xxx` rather than
+      # `8xx`, so they cannot collide with a Debian system group inside the
+      # image; that collision is the one way this step could fail for a reason
+      # that is not a real problem.
+      - name: Write the environment file compose.yaml declares
+        run: |
+          {
+            echo "APP_DOMAIN=budget.example"
+            echo "BUDGET_UID=$(id -u)"
+            echo "BUDGET_GID=$(id -g)"
+          } > .env
+
+      # This step also proves the refusal works: `.env` declares nothing else,
+      # and `compose.yaml` names `APP_DOMAIN` as `${APP_DOMAIN:?...}` rather
+      # than defaulting it - so a missing hostname fails here instead of quietly
+      # composing a deployment with no name to answer on.
+      - name: Validate compose.yaml
+        run: docker compose config --quiet
+
+      # The Caddyfile is validated by Caddy itself rather than by an eye,
+      # because the file's whole argument is that almost nothing is configured
+      # in it - and "almost nothing" is exactly the state in which a syntax
+      # error is invisible in review.
+      - name: Validate the Caddyfile
+        run: |
+          docker run --rm \
+            -e APP_DOMAIN=budget.example \
+            -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+
+      # The image is built but *not* started. Building catches the class of
+      # error that only a build can - a `RUN` whose command does not exist, an
+      # instruction in the wrong order, a `COPY` of a path `.dockerignore`
+      # excludes - and one of those was in this Dockerfile when it was first
+      # written: `install -d -o budget` ran before `useradd budget`, so the
+      # build would have failed on a user that did not exist yet.
+      #
+      # Starting it is the step that is still owed, and it is deliberately left
+      # out rather than attempted and left flaky: it needs the mount ownership
+      # that a runner does not have in the right shape, and a green tick that
+      # only sometimes means something is worse than an open item.
+      - name: Build the image
+        run: docker build -t budget:ci .

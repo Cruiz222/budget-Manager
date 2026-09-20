@@ -17,28 +17,49 @@ RUN pip install --no-cache-dir -r /srv/requirements.txt
 WORKDIR /srv
 COPY app /srv/app
 
-# A non-root user, created before anything is chowned to it and after the
-# dependencies so that nothing installed above is owned by it. Nothing in this
-# application needs privilege: it opens one file, one socket and one outbound
-# connection.
+# **The runtime uid and gid are build arguments, and that is not
+# configurability for its own sake - it is what makes the bind mount work
+# without root.** A bind mount takes its ownership from the host directory, so
+# the container user has to be the uid that already owns `./data`; the
+# alternative is chowning the host directory to a fixed uid, and `chown` is
+# root. Which is fine on a machine where you have root and a dead end on one
+# where you do not - and a deployment host is the second kind more often than
+# the first, because nobody should be running `docker compose` as root.
 #
-# The uid is fixed at 10001 rather than left to `useradd`, because the host-side
-# bind-mounted `./data` has to be chowned to the same number - and a uid that
-# varies per build is a uid nobody can write down in an install step.
-RUN useradd --create-home --uid 10001 budget
+# So `compose.yaml` passes `id -u` and `id -g` from `.env`, the container
+# process runs as the person who owns the directory, and `mkdir -p data` is the
+# whole of the host-side setup.
+#
+# The defaults exist so that `docker build .` still works on its own, with no
+# arguments to remember - a bare build gets a self-consistent image whose only
+# flaw is that its uid will not match your host. `compose.yaml` deliberately
+# does *not* fall back to them; it refuses, because a mismatched uid fails later
+# as an unwritable database rather than immediately as a missing setting.
+ARG BUDGET_UID=10001
+ARG BUDGET_GID=10001
+
+# A group and a user at those numbers, created before anything is chowned to
+# them and after the dependencies so that nothing installed above is owned by
+# them. Nothing in this application needs privilege: it opens one file, one
+# socket and one outbound connection.
+#
+# `--no-user-group` and an explicit numeric `--gid` because the group already
+# exists by the line above - without it, `useradd` would try to create a second
+# group of the same name and fail the build.
+RUN groupadd --gid "${BUDGET_GID}" budget \
+ && useradd --uid "${BUDGET_UID}" --gid "${BUDGET_GID}" --no-user-group \
+      --create-home budget
 
 # The directory that holds the database. **The directory matters as much as the
 # file**, and that is why this is a directory and not just a path: SQLite writes
 # its rollback journal beside the database, so the *directory* has to be
-# writable or every unit of work fails on open. Created here and owned by the
-# runtime user, so that a named volume mounted at /data inherits the right
-# ownership rather than arriving root-owned and unwritable.
+# writable or every unit of work fails on open.
 #
 # It is `install -d` and not `mkdir`, because the two things this has to get
 # right - the mode and the owner - are one flag each here and three commands
-# otherwise. Note what this does *not* fix: a bind mount takes its ownership
-# from the host directory, not from the image, which is why `compose.yaml` and
-# the README both carry an `install -d -o 10001` for the host side.
+# otherwise. Note what this does *not* fix, and it is the whole reason for the
+# arguments above: a bind mount takes its ownership from the host directory and
+# ignores this one entirely.
 RUN install -d -o budget -g budget /data
 
 USER budget

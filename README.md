@@ -5303,8 +5303,8 @@ a laptop into one that answers on a hostname. Three files - `Dockerfile`,
 setting the software reads with none of the values in it.
 
 ```
-cp .env.example .env          # fill in APP_DOMAIN and PAYSTACK_SECRET_KEY
-install -d -o 10001 -g 10001 data
+cp .env.example .env          # APP_DOMAIN, PAYSTACK_SECRET_KEY, BUDGET_UID=$(id -u), BUDGET_GID=$(id -g)
+mkdir -p data
 docker compose up -d --build
 ```
 
@@ -5398,13 +5398,9 @@ to be: every connection runs `executescript` with the schema and the
 PRAGMA-guarded migrations in `open_sqlite_connection`, so a `:ro` mount fails on
 open rather than merely failing to write. The *directory* is mounted rather than
 the file, because SQLite writes its rollback journal beside the database. And the
-directory has to exist, owned by the container user, before the first `up` -
-Docker creates a missing bind-mount source as root while the container runs as
-uid 10001, so the failure is not a mount error but SQLite reporting an
-unwritable directory from inside `/health`, which reads as a broken database
-rather than a broken permission. That is why the recipe above has an `install -d`
-in it, and why it is written down rather than being left to the first person to
-hit it.
+directory has to exist before the first `up`, and the container has to be running
+as the uid that owns it - the second half of which is decision 255 and was got
+wrong here first.
 
 **253. `X-Forwarded-For` is still read by nothing, and that is now a choice
 rather than a constraint.** Decision 53 wrote that "until a reverse proxy this
@@ -5433,26 +5429,108 @@ still open, and turning the directive on would make one of those decisions in a
 proxy config where nobody would look for it. The line is in the file so the place
 it goes is not a discovery.
 
-**What this does not do, said plainly.** There is no VPS provisioning here - no
-DNS, no firewall, no user, no unattended-upgrades - because none of that is code
-that can live in this repository.
+**255. The bind mount's ownership problem was solved the wrong way round first,
+and the fix is that the container moves to the uid rather than the uid to the
+container.** The first version of `compose.yaml` created the database directory
+with `install -d -o 10001 -g 10001 data`, which is `chown` with a different
+spelling and needs root. Not having root is the ordinary state of a deployment
+user - nobody should be running `docker compose` as root, and the account this
+is meant to be deployed under is the kind that does not have it - so the single
+setup step of the whole deployment was a command the person deploying it
+probably could not run. The attempt produced `install: cannot change owner and
+permissions of 'data': Operation not permitted`, which is one of the more useful
+errors in this file's history: it arrived before anything else could go wrong,
+and it named the thing that was wrong.
 
-And **none of the three files has been run.** They were written in an
-environment where the command classifier was unavailable, so `docker compose
-config`, a build and a `docker compose up` could not be executed at all - which
-is stated here rather than left to be inferred, because the rest of this file is
-written by someone who ran the thing first and the difference matters. What is
-verified is that `__main__.py` still imports and that the files' own syntax is
-what it claims to be; what is *not* verified is every runtime property they
-assert, including that the compose file parses, that the image builds, that
-uid 10001 can write the mounted directory, and that `/health` answers through
-Caddy. Those are the first four things to check on the host. A certificate
-cannot be tested here in any case, since ACME will not issue for a hostname that
-does not resolve and this project owns none.
+**The answer is a build argument.** `Dockerfile` takes `BUDGET_UID` and
+`BUDGET_GID` and creates its user at those numbers; `compose.yaml` passes `id -u`
+and `id -g` from `.env`; the container process is therefore the person who owns
+`./data`, and `mkdir -p data` is the whole of the host-side setup - one command
+that needs nothing. The ownership was never the problem. Treating one fixed uid
+as a fact about the deployment was.
 
-**So this section is a design, not a report**, and it should be read the way
-decisions 249-254 are written - as arguments about what the deployment *should*
-be - until somebody has run it and said so.
+**Both are required and neither is defaulted, and it is the argument
+`RATE_LIMIT_FLUSH_SECONDS` already makes for raising on a typo.** The Dockerfile
+has defaults, because `docker build .` with no arguments should still produce a
+working image. Compose deliberately does not fall back to them: 10001 produces a
+container that starts, serves `/health`, and then fails every unit of work on an
+unwritable directory - a failure that reads as a broken database and sends the
+reader to SQLite rather than to their environment. A missing variable should read
+as a missing variable. The cost is that a fresh clone has to run `id -u` before
+`up`, which is what `.env.example` says in the place somebody will be reading.
+
+**Two things this does not fix, and both are real.** The gid must not already
+exist inside the image - anything below 1000 probably does, since that is where
+Debian keeps its system groups - so both ids have to come from a normal user
+account. And changing either means rebuilding, because a build argument is baked
+into the layer that uses it. Neither is an argument for the root version; both
+are arguments for the value living in `.env`, beside the command that produces
+it.
+
+**Before any of this, what the host needs - and the machine this was written on
+had none of it, so the failures are recorded rather than the theory.**
+
+- **Docker *with the Compose plugin*.** On Ubuntu, `apt install docker.io` gives
+  you Docker and not `docker compose`: the plugin is a separate package
+  (`docker-compose-v2` on 24.04), and a client without it answers `docker:
+  unknown command: docker compose`. That is a different message from the one a
+  missing Docker gives, and the difference is worth knowing because the fix is
+  different too. Docker's own `docker-ce` bundle includes the plugin; the
+  distribution package does not.
+- **Root, once.** Two separate things want it and neither can be designed
+  around. Adding your user to the `docker` group, because the daemon's socket is
+  root-owned and `usermod -aG docker` writes `/etc/passwd` - which answers
+  `Permission denied` and `cannot lock /etc/passwd` when run without it. And
+  `systemctl enable --now docker`, if the package did not start the daemon.
+  Group membership is read at login, so afterwards you log out and back in, or
+  run `newgrp docker` for one shell.
+- **A hostname whose A record already points at the host**, before Caddy starts.
+  ACME will not issue for a name that does not resolve and does not fall back to
+  anything, so a wrong value here is a proxy that serves nothing - loud, at
+  least.
+
+**A host without root cannot run this deployment at all**, and that is a fact
+about Docker rather than about these files. The database directory no longer
+wants root - decision 255 - but the socket does, and there is no version of
+`docker compose up` that works without either group membership or root. Which is
+why the smoke test below belongs to the deployment host and not to a laptop.
+
+**What has actually been run, stated precisely, because the difference between
+this paragraph and the rest of this file is the point.**
+
+*Ran, and passed:* the `.env` recipe and `mkdir -p data`, on a machine with no
+root. That is decision 255's fix validated by an execution rather than by an
+argument, and it is the only part of this deployment that has been.
+
+*Ran, and found a trap:* `caddy validate`, invoked by hand without `APP_DOMAIN`
+in the environment. An empty `{$APP_DOMAIN}` leaves the site header as a bare
+`{`, which Caddy reads as the opening of the *global options block* - so it
+reported `unrecognized global option: reverse_proxy`, naming the one line in the
+file that was correct and saying nothing about the missing hostname two lines
+above it. `Caddyfile` now carries that error text and its real cause, so the next
+person to run the validator by hand is not sent to the wrong place. Under compose
+the state is unreachable, because `${APP_DOMAIN:?}` refuses to compose without
+it.
+
+*Never ran:* `docker compose config`, `docker build`, `docker compose up`. The
+Compose plugin was absent, installing it needed root, and root was refused. So
+the four things still unverified are that the compose file parses, that the image
+builds, that the uid-matched container can write `./data`, and that `/health`
+answers through Caddy.
+
+**`.github/workflows/ci.yml` is where three of those four get checked instead**,
+on every push, by a runner that has a daemon and a Compose plugin - which is a
+better home for them than a laptop anyway, since a check nobody can run on the
+machine the code is written on is a check that only exists on a machine nobody
+deploys from. A certificate is outside what any runner can verify, and the
+container-answers-a-request step is left to the host on purpose: it needs the
+mount ownership that a runner does not have in the right shape, and a green tick
+that only sometimes means something is worse than an open item.
+
+**So this section is a design with two executions behind it, not a report**, and
+it should be read the way decisions 249-255 are written - as arguments about
+what the deployment *should* be - until somebody has run it on the host and said
+otherwise.
 
 ### Still open
 
