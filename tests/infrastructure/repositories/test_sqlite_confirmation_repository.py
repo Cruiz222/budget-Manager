@@ -199,14 +199,27 @@ def test_the_key_is_scoped_to_the_wallet(build_wallet):
     person posting the same key to two of their own wallets is not a retry, and a
     store that answered it with the first request would be handing them a
     confirmation for the wrong wallet.
+
+    **The second wallet is in dollars, which is what decision 267 costs a test
+    like this one.** One live wallet per currency per owner, so "two of their own
+    wallets" cannot be two naira ones - and the second confirmation is in dollars
+    with it, so the row is shaped like one this system would actually create. What
+    the test is about, the key's scope, is untouched by either.
     """
     owner = uuid4()
     first_wallet = build_wallet(user_id=owner)
-    second_wallet = build_wallet(user_id=owner)
+    second_wallet = build_wallet(user_id=owner, currency=Currency.USD)
     repository = build_repository(first_wallet, second_wallet)
 
     assert repository.add(build_confirmation(first_wallet)) is True
-    assert repository.add(build_confirmation(second_wallet)) is True
+    assert (
+        repository.add(
+            build_confirmation(
+                second_wallet, amount=Money(Decimal("500.00"), Currency.USD)
+            )
+        )
+        is True
+    )
 
     assert (
         repository.find(first_wallet.wallet_id, "ref-1").confirmation_id
@@ -458,9 +471,15 @@ def test_save_does_not_rewrite_what_the_request_said(build_wallet):
     that pinned behaviour there would be pinning the query planner rather than
     this repository. Pointing it at a wallet that exists makes the assertion
     about the columns and nothing else.
+
+    That second wallet is in dollars because decision 267 allows one live wallet
+    per currency per owner, and two rows for one owner is the whole requirement
+    here - the wallet is a foreign key for this test to point at, and its currency
+    plays no part in what is asserted. The re-pointed ``wallet_id`` it *is* asked
+    to hold is a value the ``UPDATE`` never writes, which is exactly the claim.
     """
     wallet = build_wallet()
-    other_wallet = build_wallet(user_id=wallet.user_id)
+    other_wallet = build_wallet(user_id=wallet.user_id, currency=Currency.USD)
     confirmation = build_confirmation(wallet, amount=ngn("500.00"))
     repository = build_repository(wallet, other_wallet)
     repository.add(confirmation)

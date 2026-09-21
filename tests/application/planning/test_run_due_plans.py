@@ -42,20 +42,50 @@ def payout(amount: str, label: str = "salary") -> Instruction:
 
 
 def usd_payout(amount: str, label: str = "salary") -> Instruction:
-    """One payout in a currency no wallet in this file is held in.
+    """One payout in dollars - the second currency this file now deals in.
 
     A second helper rather than a ``currency`` parameter on the one above, for the
     reason ``payout`` gives for being a copy: the two are used for different
-    claims. Every other test here is about an amount, and an amount's currency is
-    the wallet's; the one class that calls this is about the currency *not* being
-    the wallet's, and a default parameter would let a test that meant the first
-    thing quietly get the second.
+    claims. Most tests here are about an amount, and an amount's currency is the
+    wallet's; the ones that call this are either about the currency *not* being
+    the wallet's - the mismatch class below - or about a wallet that is itself in
+    dollars because decision 267 leaves one live wallet per currency per owner,
+    which is what ``second_wallet_and_plan`` arranges. A default parameter would
+    let a test that meant the first thing quietly get the second.
     """
     return Instruction(
         action=PlannedAction.PAYOUT,
         amount=Money(Decimal(amount), Currency.USD),
         label=label,
         destination=BANK_DESTINATION,
+    )
+
+
+def second_wallet_and_plan(
+    build_wallet, build_plan, locked: str = "1000", amount: str = "200"
+):
+    """A dollar wallet for the suite's owner, and a plan that can run against it.
+
+    **Decision 267 is why this is a factory rather than a couple more lines in
+    each test.** A person holds one live wallet per currency, and this file's
+    subject is one tick over several plans - so several of its tests need several
+    wallets for *one* owner, which after that decision means they cannot all be
+    naira. The second one is therefore in dollars, and dollars carry two
+    consequences that a copied two-line arrangement would get wrong: the plan's
+    instruction has to be in dollars too, because ``_currency_block`` answers a
+    mismatched plan as a *block* rather than letting the arithmetic raise; and the
+    amounts have to fit the dollar row of the limits table, which is the tight one
+    (500 a movement, 2,000 a day) rather than the naira row these tests were
+    written against.
+
+    The defaults are a 1,000-dollar wallet paying 200: inside those ceilings with
+    room to spare, and round enough that an assertion after a run reads as the
+    arithmetic it is. Both are dials for the tests that need a *second* wallet
+    only incidentally - the class about the mismatch names its own.
+    """
+    wallet = build_wallet(locked=locked, currency=Currency.USD)
+    return wallet, build_plan(
+        wallet_id=wallet.wallet_id, instructions=(usd_payout(amount),)
     )
 
 
@@ -182,13 +212,13 @@ class TestTicking:
 
     def test_every_due_plan_runs(self, build_wallet, build_plan, tmp_path):
         first_wallet = build_wallet(locked="10000")
-        second_wallet = build_wallet(locked="10000")
+        second_wallet, second_plan = second_wallet_and_plan(build_wallet, build_plan)
         scheduler, factory = build_scheduler(tmp_path)
         seed(
             factory,
             [
                 (first_wallet, build_plan(wallet_id=first_wallet.wallet_id)),
-                (second_wallet, build_plan(wallet_id=second_wallet.wallet_id)),
+                (second_wallet, second_plan),
             ],
         )
 
@@ -296,9 +326,13 @@ class TestTheTransactionBoundary:
         self, build_wallet, build_plan, tmp_path, monkeypatch
     ):
         good_wallet = build_wallet(locked="10000")
-        bad_wallet = build_wallet(locked="10000")
         good = build_plan(wallet_id=good_wallet.wallet_id)
-        bad = build_plan(wallet_id=bad_wallet.wallet_id)
+        # The second wallet is in dollars, because decision 267 leaves one live
+        # wallet per currency per owner and what this test needs is two wallets
+        # rather than two naira ones. Its plan is in dollars to match; that
+        # matters for what the run *would* have paid, and not at all here, where
+        # the executor raises before it reads a single instruction.
+        bad_wallet, bad = second_wallet_and_plan(build_wallet, build_plan)
         scheduler, factory = build_scheduler(tmp_path)
         # good is seeded first, so list_by_status returns it first.
         seed(factory, [(good_wallet, good), (bad_wallet, bad)])
@@ -318,9 +352,13 @@ class TestTheTransactionBoundary:
         self, build_wallet, build_plan, tmp_path, monkeypatch
     ):
         good_wallet = build_wallet(locked="10000")
-        bad_wallet = build_wallet(locked="10000")
         good = build_plan(wallet_id=good_wallet.wallet_id)
-        bad = build_plan(wallet_id=bad_wallet.wallet_id)
+        # The second wallet is in dollars, because decision 267 leaves one live
+        # wallet per currency per owner and what this test needs is two wallets
+        # rather than two naira ones. Its plan is in dollars to match; that
+        # matters for what the run *would* have paid, and not at all here, where
+        # the executor raises before it reads a single instruction.
+        bad_wallet, bad = second_wallet_and_plan(build_wallet, build_plan)
         scheduler, factory = build_scheduler(tmp_path)
         seed(factory, [(good_wallet, good), (bad_wallet, bad)])
 
@@ -330,7 +368,7 @@ class TestTheTransactionBoundary:
             scheduler.execute(ANCHOR)
 
         assert wallet_after(factory, bad_wallet).locked_balance == Money(
-            Decimal("10000"), NGN
+            Decimal("1000"), Currency.USD
         )
         assert plan_after(factory, bad).completed_runs == 0
 
@@ -435,8 +473,12 @@ class TestATierBlockedPlanDoesNotStopTheTick:
             wallet_id=blocked_wallet.wallet_id,
             instructions=(payout(OVER_THE_TRANSACTION_CEILING),),
         )
-        paid_wallet = build_wallet(locked="10000")
-        paid = build_plan(wallet_id=paid_wallet.wallet_id)
+        # The wallet that *is* paid is the second one, and decision 267 is why it
+        # is in dollars: one live wallet per currency per owner leaves no second
+        # naira wallet to be the idle one. Nothing about this test is about the
+        # currency - the plan behind the blocked one only has to run - so it takes
+        # the factory's defaults.
+        paid_wallet, paid = second_wallet_and_plan(build_wallet, build_plan)
         scheduler, factory = build_scheduler(tmp_path)
         # The blocked plan is seeded first, so list_by_status returns it first -
         # which is what makes "the tick carried on" mean the *later* plan ran.
@@ -448,7 +490,7 @@ class TestATierBlockedPlanDoesNotStopTheTick:
         assert runs[0].reason is RunBlockReason.TIER_LIMIT_EXCEEDED
         assert runs[1].status is RunStatus.SUCCEEDED
         assert wallet_after(factory, paid_wallet).locked_balance == Money(
-            Decimal("8000"), NGN
+            Decimal("800"), Currency.USD
         )
         assert wallet_after(factory, blocked_wallet).locked_balance == Money(
             Decimal(OVER_THE_TRANSACTION_CEILING), NGN
@@ -489,8 +531,12 @@ class TestAMismatchedPlanDoesNotStopTheTick:
             wallet_id=mismatched_wallet.wallet_id,
             instructions=(usd_payout("2000"),),
         )
-        paid_wallet = build_wallet(locked="10000")
-        paid = build_plan(wallet_id=paid_wallet.wallet_id)
+        # The wallet the tick goes on to pay is the second one, and decision 267
+        # is why it is in dollars. The mismatch above is the *other* direction -
+        # a naira wallet with a dollar plan - because that is the state the class
+        # above describes, and because the two wallets here have to differ in
+        # something to be two wallets at all.
+        paid_wallet, paid = second_wallet_and_plan(build_wallet, build_plan)
         scheduler, factory = build_scheduler(tmp_path)
         # Seeded first, so list_by_status returns it first - which is what makes
         # "the tick carried on" mean the *later* plan ran.
@@ -509,7 +555,7 @@ class TestAMismatchedPlanDoesNotStopTheTick:
         # And the plan behind it paid, in the same tick, with nothing raised.
         assert runs[1].status is RunStatus.SUCCEEDED
         assert wallet_after(factory, paid_wallet).locked_balance == Money(
-            Decimal("8000"), NGN
+            Decimal("800"), Currency.USD
         )
 
 

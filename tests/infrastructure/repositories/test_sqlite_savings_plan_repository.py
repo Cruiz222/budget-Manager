@@ -271,8 +271,19 @@ def test_get_owned_of_a_foreign_plan_raises_not_found(
 
 
 def test_get_by_wallet_id_returns_only_that_wallets_plans(build_wallet, build_plan):
+    """**The second wallet is in dollars, and it is the same owner's.**
+
+    Decision 267 allows one live wallet per currency per owner, so a second wallet
+    for this owner cannot be a second naira one. Keeping the owner the same is the
+    point rather than a convenience: the filter being tested is the ``wallet_id``
+    one, and a second wallet belonging to somebody else would let an owner filter
+    that also happened to be there mask a wallet filter that was not. The plan on
+    that wallet keeps the fixture's naira instruction, because a plan store reads
+    and writes rows and never asks whether a plan's money matches its wallet - that
+    question belongs to ``PlanService`` and to the run.
+    """
     wallet = build_wallet()
-    other_wallet = build_wallet()
+    other_wallet = build_wallet(currency=Currency.USD)
     repository = build_repository(wallet)
     SqliteWalletRepository(repository._connection).save(other_wallet)
 

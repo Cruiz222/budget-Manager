@@ -15,6 +15,7 @@ from app.domain.money.exception import (
     ConfirmationAlreadyUsedError,
     ConfirmationExpiredError,
     ConfirmationNotFoundError,
+    DuplicateWalletCurrencyError,
     InsufficientFundsError,
     ReferenceAlreadyRefusedError,
     WalletAlreadyActiveError,
@@ -504,6 +505,109 @@ def test_get_wallet_of_unknown_id_raises(tmp_path):
         service.get_wallet(uuid4())
 
 
+class TestOneWalletPerCurrency:
+    """Decision 267, at the layer that decides it.
+
+    **The rule is asserted here and not only over HTTP**, because this is where it
+    lives: the route calls ``open_wallet`` and translates whatever comes back, so a
+    test that only ever posts to ``/wallets`` would pass against a route that did
+    the checking itself - and the CLI and the browser would each then be a door
+    with its own copy of the rule. There is one copy, and it is this one.
+
+    The four claims: a duplicate is refused; a different currency is not; the
+    refusal persists nothing; and a closed wallet does not count as holding its
+    currency.
+    """
+
+    def test_a_second_wallet_in_a_held_currency_is_refused(self, tmp_path):
+        service, _ = build_service(tmp_path)
+        first = service.open_wallet(NGN)
+
+        with pytest.raises(DuplicateWalletCurrencyError) as refused:
+            service.open_wallet(NGN)
+
+        assert str(first.wallet_id) in str(refused.value)
+
+    def test_the_two_currencies_are_two_wallets(self, tmp_path):
+        """Without this, a rule that refused every second wallet would pass the
+        test above and make USD unreachable.
+        """
+        service, factory = build_service(tmp_path)
+
+        naira = service.open_wallet(NGN)
+        dollars = service.open_wallet(Currency.USD)
+
+        held = [one.currency for one in service.wallets_for_actor()]
+        assert held == [NGN, Currency.USD]
+        assert get_wallet(factory, naira.wallet_id).currency is NGN
+        assert get_wallet(factory, dollars.wallet_id).currency is Currency.USD
+
+    def test_the_refusal_writes_nothing(self, tmp_path):
+        """**The check runs before the save, and this is the assertion that it
+        still does.** A refusal that had already written a row would leave a wallet
+        the caller was told they could not have - and, with the store's index
+        underneath, would leave the *next* open in that currency failing too.
+        """
+        service, factory = build_service(tmp_path)
+        kept = service.open_wallet(NGN)
+
+        with pytest.raises(DuplicateWalletCurrencyError):
+            service.open_wallet(NGN)
+
+        assert [one.wallet_id for one in service.wallets_for_actor()] == [kept.wallet_id]
+
+    def test_a_closed_wallet_frees_its_currency(self, tmp_path):
+        """**The one that keeps the rule from being a one-way door.** Closing a
+        wallet and opening another in the same currency is an ordinary thing to
+        want - closing one by mistake should not cost a currency for good - so the
+        rule reads "a wallet that is not closed", in the use case and in the store's
+        index alike.
+        """
+        service, factory = build_service(tmp_path)
+        first = service.open_wallet(NGN)
+        close(service, first.wallet_id)
+
+        second = service.open_wallet(NGN)
+
+        assert second.wallet_id != first.wallet_id
+        # Both are still listed: the currency came back, and the closed wallet's
+        # history did not go anywhere.
+        assert [one.status for one in service.wallets_for_actor()] == [
+            WalletStatus.CLOSED,
+            WalletStatus.ACTIVE,
+        ]
+
+    def test_a_closed_wallet_of_another_currency_changes_nothing(self, tmp_path):
+        """**The filter is on the currency asked for and not on wallets in
+        general.** A closed USD wallet must not stop an NGN wallet being opened,
+        and a live NGN wallet must not be freed by a closed USD one - which is the
+        shape a test written only from the happy path would miss.
+        """
+        service, _ = build_service(tmp_path)
+        dollars = service.open_wallet(Currency.USD)
+        close(service, dollars.wallet_id)
+
+        naira = service.open_wallet(NGN)
+
+        assert naira.currency is NGN
+        with pytest.raises(DuplicateWalletCurrencyError):
+            service.open_wallet(NGN)
+
+    def test_another_person_wallet_does_not_count(self, tmp_path):
+        """A wallet is held by one person, and the rule is per account. Two people
+        may each hold a naira wallet - which is only true if the check is scoped to
+        the actor, and a check written against the wrong key would pass every test
+        above while refusing the second person their first wallet.
+        """
+        service, factory = build_service(tmp_path)
+        service.open_wallet(NGN)
+        somebody_else = as_somebody_else(factory, uuid4())
+
+        theirs = somebody_else.open_wallet(NGN)
+
+        assert theirs.user_id != ACTOR
+
+
 def test_freeze_persists_frozen_then_unfreeze_restores_active(tmp_path, build_wallet):
     wallet = build_wallet()
     service, factory = build_service(tmp_path)
@@ -608,8 +712,16 @@ def test_transactions_for_wallet_returns_ledger_oldest_first(tmp_path, build_wal
 
 
 def test_transactions_for_wallet_ignores_other_wallets(tmp_path, build_wallet):
+    """**The second wallet is in dollars, and decision 267 is why.** One owner may
+    hold one wallet per currency, so two naira wallets cannot both be saved - and a
+    wallet this test needs to *deposit into* cannot be a closed one either. The
+    currency has nothing to do with the claim (one wallet's ledger is not another's
+    wallet's), and the smaller amount is the USD tier's ceiling rather than a
+    preference: an unverified account may hold 3,000 dollars and move 500 at a
+    time, where the same account's naira numbers are a hundred times that.
+    """
     wallet = build_wallet()
-    other_wallet = build_wallet()
+    other_wallet = build_wallet(available="0", currency=Currency.USD)
     service, factory = build_service(tmp_path)
     seed(factory, wallet)
     seed(factory, other_wallet)
@@ -621,7 +733,7 @@ def test_transactions_for_wallet_ignores_other_wallets(tmp_path, build_wallet):
     )
     service.deposit(
         other_wallet.wallet_id,
-        Money(Decimal("7000"), NGN),
+        Money(Decimal("300"), Currency.USD),
         internal_reference=str(uuid4()),
     )
 
@@ -1333,9 +1445,17 @@ class TestTheIdempotencyKeyIsScoped:
         namespacing the second call would have found the first wallet's row and
         returned it - so this wallet would be credited nothing and its owner told
         their deposit succeeded.
+
+        **One of the two is in dollars**, because decision 267 allows one wallet per
+        currency and both of these have to accept a deposit - which a closed wallet
+        will not. It is a better pair for the claim than two naira ones were: the
+        key is scoped to the *wallet*, so two wallets of different currencies
+        sharing it is the same question asked in a shape the store cannot confuse
+        with "the old wallet, seen again". The amounts differ with the currency,
+        because the USD tier's ceilings are the tight ones.
         """
         first_wallet = build_wallet()
-        second_wallet = build_wallet()
+        second_wallet = build_wallet(available="0", currency=Currency.USD)
         service, factory = build_service(tmp_path)
         seed(factory, first_wallet)
         seed(factory, second_wallet)
@@ -1344,7 +1464,7 @@ class TestTheIdempotencyKeyIsScoped:
             first_wallet.wallet_id, Money(Decimal("5000"), NGN), "shared-key"
         )
         second = service.deposit(
-            second_wallet.wallet_id, Money(Decimal("5000"), NGN), "shared-key"
+            second_wallet.wallet_id, Money(Decimal("300"), Currency.USD), "shared-key"
         )
 
         assert first.transaction_id != second.transaction_id
@@ -1352,7 +1472,7 @@ class TestTheIdempotencyKeyIsScoped:
             Decimal("15000"), NGN
         )
         assert get_wallet(factory, second_wallet.wallet_id).available_balance == Money(
-            Decimal("15000"), NGN
+            Decimal("300"), Currency.USD
         )
 
     def test_the_same_key_on_one_wallet_still_deduplicates(
@@ -1532,10 +1652,16 @@ class TestRequestingAConfirmation:
         under one owner is the only arrangement that tells the two scopings
         apart, and the wallet ids in the two answers are what a store keyed by
         owner would have got wrong.
+
+        **The second wallet is in dollars, because decision 267 leaves no other
+        pair.** Two live naira wallets under one owner is exactly what the rule
+        refuses, and this test needs two of the same owner's - so the currencies
+        differ, which costs the test nothing: no money moves here at all, and the
+        request is recorded against whichever wallet it names.
         """
         owner = uuid4()
         own_wallet = build_wallet(user_id=owner)
-        other_wallet = build_wallet(user_id=owner)
+        other_wallet = build_wallet(user_id=owner, currency=Currency.USD)
         factory = SqliteUnitOfWorkFactory(str(tmp_path / "same_reference.db"))
         seed(factory, own_wallet)
         seed(factory, other_wallet)
@@ -1553,7 +1679,7 @@ class TestRequestingAConfirmation:
             ConfirmationKind.WITHDRAWAL,
             MOMENT,
             internal_reference="rent",
-            amount=Money(Decimal("100"), NGN),
+            amount=Money(Decimal("100"), Currency.USD),
         )
 
         assert first.created is True and second.created is True

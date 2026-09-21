@@ -135,6 +135,13 @@ class TestMoneyIsAString:
         must not have to reformat it - and if it had to, it would be reimplementing
         ``translate.money_out``'s format spec, which is the thing having one
         function for it exists to prevent.
+
+        **The second wallet is in dollars, and decision 267 is why.** Two wallets
+        of one currency are refused now, and this test's second plan needs a wallet
+        of its own - one that has not already been drawn on by the first - so the
+        second currency is exactly what the rule leaves available. It also makes
+        the round trip a stronger claim than it was: the amount crosses currencies
+        and is still read back unchanged.
         """
         headers = as_user()
         first = create_plan(open_wallet(headers), headers).json()
@@ -142,7 +149,7 @@ class TestMoneyIsAString:
         assert quoted == "2500.00"
 
         again = create_plan(
-            open_wallet(headers),
+            open_wallet(headers, currency="USD"),
             headers,
             instructions=[
                 {"action": "payout", "amount": quoted, "label": "Same as before",

@@ -29,6 +29,8 @@ from app.domain.money.exception import (
     ConfirmationAlreadyUsedError,
     ConfirmationExpiredError,
     ConfirmationNotFoundError,
+    CurrencyNotOfferedError,
+    DuplicateWalletCurrencyError,
     InvalidConfirmationWindowError,
     MoneyError,
     WalletHasActivePlansError,
@@ -95,6 +97,31 @@ class ConfirmedOperation:
     confirmation: Confirmation
     wallet: Wallet
     transaction: Transaction | None
+
+
+#: The currencies this installation will open a wallet in, in the order they are
+#: offered. Decision 268 narrowed it to one.
+#:
+#: **The second of three sets, and the narrowing is deliberate at every step.**
+#: ``Currency`` says what this code can *represent* - ``NGN`` and ``USD``, because
+#: the money domain is not the layer that knows what is for sale. This says what
+#: the installation will *open a wallet in*. ``SUPPORTED_CURRENCIES`` in the
+#: Paystack adapter says what this account can *collect*. Each is a different
+#: door answering a different question, and the wallet door's answer is this one.
+#:
+#: **It lives here rather than in the domain, on purpose.** ``Currency``'s own
+#: comment argues that the money domain is meant to be the part that does not
+#: know about rails; a menu is the same kind of fact one layer along. The set is
+#: beside the door it governs, and every other door - the web dropdown, the CLI's
+#: ``choices``, the limits listings - reads it from here rather than keeping a
+#: copy that could drift.
+#:
+#: **A tuple and not a frozenset**, which is where this departs from the rail's
+#: shape one door over. A frozenset has no order, and this is a menu: it is
+#: rendered in the order written, and today that order is the one ``Currency``
+#: declares. Adding a member back is adding it here, and it appears in the
+#: dropdown, the CLI and both listings without an edit to any of them.
+OFFERED_CURRENCIES: tuple[Currency, ...] = (Currency.NGN,)
 
 
 class WalletService:
@@ -658,9 +685,62 @@ class WalletService:
         named somebody else, so it is gone: the wallet is opened for whoever this
         service acts for, and there is no longer a spelling that opens one for
         anybody else.
+
+        **One wallet per currency, and this is where that is decided.** The actor's
+        existing wallets are read first and a second wallet in a currency they
+        already hold one in is refused with ``DuplicateWalletCurrencyError`` - the
+        refusal that says "use the wallet you have", which is a different sentence
+        from the rail's ``CurrencyNotCollectableError``. A wallet that has been
+        **closed** is not counted: closing frees its currency, so the same currency
+        can be opened again afterwards.
+
+        **And one currency on the menu, which is checked first.** Decision 268
+        narrowed ``OFFERED_CURRENCIES`` to ``NGN``, so a call asking for ``USD`` is
+        refused with ``CurrencyNotOfferedError`` before the account is read at all.
+        The order is the sentence rather than an optimisation: "we do not open
+        those" answers a question about the currency, and asking about the
+        account's wallets first would answer a question nobody asked. Note what
+        this does *not* say - ``USD`` is still a member of ``Currency``, still a
+        currency this codebase can hold, and a dollar wallet already in the store
+        still works. What is gone is the menu item, and the difference matters
+        because it is the difference between a guard with no live case and a guard
+        whose case is a legacy row.
+
+        **Why the check is here and not in the aggregate.** ``Wallet`` sees one
+        wallet; siblings are not its business, and the state this rule exists to
+        prevent - two like-currency rows already on disk - must not make every
+        future *read* of one of them raise. So the aggregate is untouched and this
+        door carries the rule, which is ``DuplicateFundNameError``'s arrangement
+        one level up: the use case refuses first, and a store-level backstop sits
+        underneath for the gap between the check and the write.
+
+        **That gap is real here** in a way it is not for a fund's name: two
+        simultaneous requests can both read an empty list and both save, because
+        the read and the write are separate statements in one transaction and
+        nothing serialises them. The backstop is a partial unique index on
+        ``wallets(user_id, currency) WHERE status <> 'CLOSED'`` - see
+        ``SqliteUnitOfWorkFactory`` - and if it ever fires the caller sees a store's
+        integrity error rather than this domain one, which is the honest outcome
+        for a race that should not have happened.
         """
+        if currency not in OFFERED_CURRENCIES:
+            # Raised before the Unit of Work is opened, so a request for a
+            # currency that is not for sale costs no transaction at all. The
+            # sentence names what *is* offered rather than only what is not,
+            # which is the one thing a caller can act on.
+            raise CurrencyNotOfferedError(
+                f"this installation opens "
+                f"{', '.join(one.value for one in OFFERED_CURRENCIES)} wallets, "
+                f"and {currency.value} is not one of them"
+            )
         uow = self._unit_of_work_factory.start()
         try:
+            for held in uow.wallets.list_for_owner(self._actor):
+                if held.currency is currency and held.status is not WalletStatus.CLOSED:
+                    raise DuplicateWalletCurrencyError(
+                        f"a {currency.value} wallet is already open on this "
+                        f"account ({held.wallet_id})"
+                    )
             wallet = Wallet(
                 wallet_id=uuid4(),
                 user_id=self._actor,

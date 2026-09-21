@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
+import sqlite3
 from uuid import uuid4
 
 import pytest
@@ -14,6 +15,7 @@ from app.infrastructure.persistence.sqlite_unit_of_work import open_sqlite_conne
 from app.infrastructure.repositories.sqlite_wallet_repository import (
     SqliteWalletRepository,
 )
+from tests.conftest import TEST_USER_ID
 
 NGN = Currency.NGN
 
@@ -262,10 +264,18 @@ def test_list_for_owner_is_oldest_first(build_wallet, actor):
     these in it, so a query that returned them in whatever order SQLite chose
     would put somebody's wallets in different orders on different runs - which is
     the kind of failure that looks like a rendering bug for a week.
+
+    **Three wallets, and decision 267 is why they are not three naira ones.** A
+    second *live* wallet in a currency the owner already holds is refused by the
+    index below, so a third row for one owner has to be either a second currency
+    or a closed one - and this test uses both, which keeps its claim about order
+    intact: the closed wallet is still a row, still listed, and still where it was
+    put. A closed wallet is the *first* one on purpose, so the assertion cannot
+    pass by an accident of which end of the list sorts by status.
     """
     repository = build_repository()
-    first = build_wallet()
-    second = build_wallet()
+    first = build_wallet(status=WalletStatus.CLOSED)
+    second = build_wallet(currency=Currency.USD)
     third = build_wallet()
     for wallet in (first, second, third):
         repository.save(wallet)
@@ -286,10 +296,15 @@ def test_saving_a_wallet_again_does_not_move_it(build_wallet, actor):
     it, and the symptom would be the oldest wallet silently becoming the newest
     each time somebody deposited into it. Here the first wallet is funded *after*
     the second one exists, which is exactly when that would happen.
+
+    The second wallet is in dollars because decision 267 makes two live naira
+    wallets for one owner unsavable - and the claim here is about ``rowid`` under
+    an upsert, which has nothing to do with currency. Two rows is what it needs,
+    not two naira.
     """
     repository = build_repository()
     first = build_wallet()
-    second = build_wallet()
+    second = build_wallet(currency=Currency.USD)
     repository.save(first)
     repository.save(second)
 
@@ -308,10 +323,16 @@ def test_list_for_owner_brings_each_wallets_pots_with_it(build_wallet, actor):
     right pot on the right wallet. A query that joined and regrouped, or one that
     read the pots of the first wallet and reused them, would pass a test with one
     wallet and fail here.
+
+    **One of the two is in dollars**, because decision 267 makes a second live
+    naira wallet for one owner unsavable and this test needs two rows for *one*
+    owner. It is the better pair anyway: a pot's balance carries its wallet's
+    currency, so a repository that read the pots and stamped them with the wrong
+    wallet's currency would now be caught here rather than at the page.
     """
     repository = build_repository()
     first = build_wallet(locked="4000")
-    second = build_wallet(locked="7000")
+    second = build_wallet(locked="7000", currency=Currency.USD)
     repository.save(first)
     repository.save(second)
 
@@ -319,7 +340,9 @@ def test_list_for_owner_brings_each_wallets_pots_with_it(build_wallet, actor):
 
     assert [fund.name for fund in stored[first.wallet_id].funds] == ["Locked"]
     assert stored[first.wallet_id].locked_balance == ngn("4000")
-    assert stored[second.wallet_id].locked_balance == ngn("7000")
+    assert stored[second.wallet_id].locked_balance == Money(
+        Decimal("7000"), Currency.USD
+    )
 
 
 def test_list_for_owner_brings_nothing_from_a_strangers_pots(build_wallet, actor, stranger):
@@ -332,4 +355,60 @@ def test_list_for_owner_brings_nothing_from_a_strangers_pots(build_wallet, actor
     stored = repository.list_for_owner(actor)
 
     assert stored == []
+
+
+class TestTheOneWalletPerCurrencyIndex:
+    """The store's backstop for decision 267, and the reason it is not the rule.
+
+    **``WalletService.open_wallet`` is the rule**; this index sits underneath it for
+    the gap between that use case's check and its write, where two simultaneous
+    requests can both read an empty list. So these tests drive the *repository*
+    directly - the layer below the check - because that is the only way to reach a
+    state the check exists to prevent. A test that went through the service would
+    assert the rule and never the backstop.
+
+    What it refuses is a second *live* wallet in a currency the owner already holds;
+    what it must not refuse is a second one in a different currency, or one whose
+    sibling is closed. Those two exceptions are the whole content of the
+    ``WHERE`` clause, so both are asserted here rather than assumed.
+    """
+
+    def test_a_second_live_wallet_in_a_held_currency_is_refused(self, build_wallet):
+        repository = build_repository()
+        repository.save(build_wallet(currency=NGN))
+
+        with pytest.raises(sqlite3.IntegrityError):
+            repository.save(build_wallet(currency=NGN))
+
+    def test_a_second_wallet_in_a_different_currency_is_fine(self, build_wallet):
+        repository = build_repository()
+        repository.save(build_wallet(currency=NGN))
+
+        repository.save(build_wallet(currency=Currency.USD))
+
+        assert len(repository.list_for_owner(TEST_USER_ID)) == 2
+
+    def test_a_closed_wallet_does_not_hold_the_currency(self, build_wallet):
+        """The ``WHERE status <> 'CLOSED'`` half, which is what keeps closing a
+        wallet from burning its currency for good. A plain ``UNIQUE (user_id,
+        currency)`` would fail here - and it would be a rule nobody chose.
+        """
+        repository = build_repository()
+        repository.save(build_wallet(currency=NGN, status=WalletStatus.CLOSED))
+
+        repository.save(build_wallet(currency=NGN))
+
+        assert len(repository.list_for_owner(TEST_USER_ID)) == 2
+
+    def test_another_person_may_hold_the_same_currency(self, build_wallet, stranger):
+        """Per *owner*, not per currency: the index is on ``(user_id, currency)``,
+        and an index that forgot the owner column would let one person's wallet
+        refuse everybody else's.
+        """
+        repository = build_repository()
+        repository.save(build_wallet(user_id=stranger, currency=NGN))
+
+        repository.save(build_wallet(currency=NGN))
+
+        assert len(repository.list_for_owner(TEST_USER_ID)) == 1
 

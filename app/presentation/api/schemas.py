@@ -423,7 +423,7 @@ class WebhookAck(BaseModel):
 
 
 class OpenWalletIn(BaseModel):
-    currency: str = Field(examples=["NGN"], description="e.g. NGN, USD, GHS")
+    currency: str = Field(examples=["NGN"], description="e.g. NGN, USD")
 
 
 class OpenFundIn(BaseModel):

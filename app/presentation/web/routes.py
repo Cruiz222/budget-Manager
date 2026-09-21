@@ -35,11 +35,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import RedirectResponse
 
-from app.application.wallet_service import WalletService
+from app.application.wallet_service import OFFERED_CURRENCIES, WalletService
 from app.domain.identity.phoneNumber import fold_phone
 from app.domain.identity.user import User, fold_email
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.currency import Currency
+from app.domain.money.walletStatus import WalletStatus
 from app.presentation.api import rate_limits, translate
 from app.presentation.api.dependencies import (
     deposit_service,
@@ -331,19 +332,31 @@ def wallets(request: Request, user: User = Depends(web_actor)):
     the currency form is on this page rather than on one of its own because
     opening the first wallet is the only thing a new account can do.
 
-    ``Currencies`` is passed as the values of the domain enum, so the form offers
+    ``currencies`` is passed as the values of the domain enum, so the form offers
     exactly what the domain accepts - a currency added to the enum appears here
-    without an edit, and one removed disappears from it.
+    without an edit, and one removed disappears from it. **It is then narrowed to
+    the ones this person can actually open**, which is decision 267 arriving at the
+    page: a currency they already hold a wallet in is not offered, because offering
+    it would put the refusal at the end of the form's only path and make the
+    default choice an error. A closed wallet does not narrow anything - closing
+    frees the currency, which is the same rule as everywhere else.
+
+    The refusal is still reachable and still correct: a page left open in a tab, or
+    a form posted twice, carries a currency that is taken by the time it arrives,
+    and the door answers with the domain's own ``DuplicateWalletCurrencyError``.
+    Hiding the option is courtesy; refusing it is the rule.
     """
     service = wallet_service(request, actor=user)
+    wallets = service.wallets_for_actor()
+    held = {
+        one.currency for one in wallets if one.status is not WalletStatus.CLOSED
+    }
     return _render(
         request,
         "wallets.html",
         user=user,
-        wallets=[
-            translate.wallet_out(one) for one in service.wallets_for_actor()
-        ],
-        currencies=[currency.value for currency in Currency],
+        wallets=[translate.wallet_out(one) for one in wallets],
+        currencies=[currency.value for currency in Currency if currency not in held],
     )
 
 

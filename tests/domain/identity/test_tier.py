@@ -160,9 +160,11 @@ def test_identifying_an_account_raises_every_ceiling():
     """The whole point of a tiered programme, asserted for every currency at once.
 
     Written over currencies rather than against one, because a table where the
-    higher tier was worth more in NGN and *less* in EUR would be a typo nobody
-    noticed - the kind of mistake that only shows up as a support ticket from the
-    one user holding that currency.
+    higher tier was worth more in NGN and *less* in the other currency would be a
+    typo nobody noticed - the kind of mistake that only shows up as a support
+    ticket from the one user holding it. It used to name EUR; decision 267 removed
+    that currency rather than this paragraph, which is why the sentence is about a
+    set rather than about a member.
     """
     for currency in Currency:
         unverified = limits_for(Tier.UNVERIFIED, currency)

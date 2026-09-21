@@ -87,12 +87,16 @@ httpx==0.28.1
 # client id. That is what makes this flow cheaper to run than the redirect one, and
 # it is also the half that is deliberately deferred to Phase 4 - see the README.
 #
-# **Confirm the number below on the first install.** It is pinned the way the rest
-# of this file is, but the pin was written without a ``pip`` run available in the
-# environment that authored it, which is the one thing this file's convention
-# cannot supply from memory: every other line here records what pip actually
-# resolved, and this one records what it is expected to. An install that disagrees
-# is telling you the number, not breaking anything.
+# **This number was expected rather than observed, and the first install has now
+# observed it.** It was pinned from memory, because the environment that authored
+# it had no ``pip`` run available - which is the one thing this file's convention
+# cannot supply, since every other line here records what pip actually resolved.
+# Rather than leave that unsaid, the number was written down with a note asking
+# whoever installed first to check it, and that install resolved exactly this:
+# ``PyJWT`` 2.10.1, with ``cryptography`` 50.0.1 arriving through the ``crypto``
+# extra. The note is kept rather than deleted, because "was this number seen or
+# guessed" is not a question a reader can answer from the line itself, and the
+# three paragraphs in this file that ask it are the only places it is answered.
 PyJWT[crypto]==2.10.1
 
 # Rendering the browser client's pages. A runtime dependency since checklist item
@@ -121,11 +125,12 @@ PyJWT[crypto]==2.10.1
 # differently: ``string.Template`` would be fewer lines today, and a reachable
 # hole the first time somebody signs up with an apostrophe in their name.
 #
-# **Confirm the number below on the first install**, for the reason the PyJWT
-# paragraph above gives - it was pinned without a ``pip`` run behind it, so it
-# records the expected resolution rather than an observed one. Unlike PyJWT's,
-# this one is a mature package whose 3.1 line has been current for years, so a
-# discrepancy is more likely to be a newer patch than a wrong guess.
+# **This number was expected rather than observed, and the first install has now
+# observed it too** - the same standing note the PyJWT paragraph above carries.
+# ``jinja2`` 3.1.6 installed exactly as pinned, with ``markupsafe`` 3.0.3
+# arriving as its own dependency. The agreement is the unsurprising half of the
+# news here: this is a mature package whose 3.1 line has been current for years,
+# so a disagreement would have been a newer patch rather than a wrong guess.
 Jinja2==3.1.6
 
 # Reading the browser client's form posts. A runtime dependency since i19, and it
@@ -146,8 +151,9 @@ Jinja2==3.1.6
 # Nothing in this repository imports it and nothing ever will. That is the point:
 # it satisfies starlette's import check and then gets out of the way.
 #
-# **Confirm this number on the first install too**, for the reason given twice
-# above. This one is the least predictable pin in the file - the package's version
-# sits in a long ``0.x`` line, where every release is nominally allowed to change
-# anything, and the number below is the one expected rather than the one seen.
+# **This number was expected rather than observed, and the first install has now
+# observed it** - the third of the three notes, and the one with the most room to
+# have been wrong, because the package's version sits in a long ``0.x`` line where
+# every release is nominally allowed to change anything. It resolved to 0.0.20,
+# exactly as pinned. The note is kept for the reason the other two are.
 python-multipart==0.0.20

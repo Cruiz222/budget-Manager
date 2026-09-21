@@ -183,9 +183,16 @@ class CurrencyNotCollectableError(PaymentError):
     which is the other refusal shaped like it. A closed wallet is the money
     domain's own statement about a wallet; this is a statement about the meeting
     of a wallet and a *rail*, and the money domain has no opinion about what a
-    rail can collect - it holds five currencies happily and is right to. Filing
-    this beside ``CurrencyMismatchError`` would say the domain knew, and it does
-    not. See ``PaymentProvider.supported_currencies``.
+    rail can collect - it holds every currency ``Currency`` names, and after
+    decision 267 that is ``NGN`` and ``USD``. Filing this beside
+    ``CurrencyMismatchError`` would say the domain knew, and it does not. See
+    ``PaymentProvider.supported_currencies``.
+
+    **Since the trim, ``USD`` is the only currency that can reach here**, and that
+    is what makes this a *live* refusal rather than a defensive one: the currency
+    list no longer contains anything the rail's account has never heard of, so the
+    one remaining case is the one that was always the point - a currency this
+    system holds happily and this account cannot collect.
 
     **A 409, and the two neighbours it is worth ruling out.** Not a 400: the
     request is well formed, the wallet is the caller's, and there is nothing in

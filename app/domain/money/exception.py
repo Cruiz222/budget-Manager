@@ -31,6 +31,64 @@ class WalletAlreadyClosedError(MoneyError):
 class WalletAlreadyActiveError(MoneyError):
     pass
 
+# --- One currency on the menu ---------------------------------------------
+# Raised by ``WalletService.open_wallet`` when the currency asked for is one
+# this installation does not open wallets in. Decision 268 narrowed the menu to
+# ``NGN``, and the set that decides it - ``OFFERED_CURRENCIES`` - lives beside
+# the door rather than in this module, because the money domain holds every
+# member of ``Currency`` and has no opinion about which of them are for sale.
+#
+# **Checked before the one below it**, and the order is the sentence a person
+# gets: "we do not open those" is an answer about the currency, while "you
+# already have one" is an answer about their account. A currency that is not on
+# the menu can be neither, so asking the account question first would answer a
+# question nobody asked.
+#
+# **Its remedy is what earns it a name of its own, and it is the third of
+# three.** ``UnsupportedCurrencyError`` says this system has never heard of that
+# currency - the input is a typo. ``CurrencyNotOfferedError`` says the system
+# knows it perfectly well and this installation does not sell it - the input is
+# correct and the answer is "not here". ``DuplicateWalletCurrencyError`` below
+# says the currency is offered and the account already has one - the answer is
+# "use the wallet you have". Three refusals, three remedies, and a caller handed
+# one name for all of them would have to guess which.
+#
+# **A 400, and by omission rather than by listing.** This class is deliberately
+# in no grade tuple in ``app/presentation/api/errors.py``, so that module's
+# default catches it - and its own docstring is the argument for why that is the
+# right place to be caught: every unnamed ``MoneyError`` is a 400, because "a
+# refusal this module has never heard of is far more likely to be about a value
+# the caller sent than about a resource's state". This is exactly that. Nothing
+# is wrong with the request's shape and no wallet's state refuses it; the value
+# asked for is not one this installation has.
+class CurrencyNotOfferedError(MoneyError):
+    pass
+
+
+# --- One wallet per currency ----------------------------------------------
+# Raised by ``WalletService.open_wallet`` when the actor already holds a wallet
+# in the currency being asked for. It is graded CONFLICT like the three above it -
+# the request is well formed, the currency is one this system deals in, and it is
+# the state of the account that refuses.
+#
+# **Its remedy is what earns it a name of its own**, and the name it is *not* is
+# the interesting part: it is not ``DuplicateFundNameError`` over a currency, and
+# it is not ``CurrencyNotCollectableError`` either. That one says the rail cannot
+# collect this currency in *any* wallet, so the answer is "pay some other way";
+# this one says the rail is fine and the currency is taken, so the answer is "the
+# wallet you already have is the one to use". A caller handed one name for both
+# would have to guess between them.
+#
+# **``CLOSED`` is not a wallet for this purpose**, and that is a decision rather
+# than an oversight: closing a wallet frees its currency, so the same currency can
+# be opened again afterwards. Without that, a closed wallet would be a currency
+# burned for the account's lifetime, and closing one by mistake would be
+# unfixable. The filter is written in ``open_wallet`` and again in the store's
+# partial index; the two must agree, and the index is the one that cannot be
+# bypassed.
+class DuplicateWalletCurrencyError(MoneyError):
+    pass
+
 # --- Closing a wallet -----------------------------------------------------
 # Two refusals that ``Wallet.close`` and ``WalletService.close_wallet`` can
 # produce, and they are separate names because they have separate remedies: one

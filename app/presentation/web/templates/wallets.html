@@ -44,24 +44,35 @@
     <section class="panel">
       <h2>Open a wallet</h2>
       {#
-        `currencies` is the domain's own enum, passed through from the route, so
-        this list is what the domain accepts rather than a copy of it kept here.
-        A currency added to the enum appears without an edit; the route refuses
-        one that is not there, in the domain's own words.
+        `currencies` is the domain's own enum, passed through from the route and
+        then narrowed to the ones this person can open - so the list here is what
+        the domain accepts *and* what is left, rather than a copy of either kept
+        here. A currency added to the enum appears without an edit; one that is
+        already held does not appear at all, because decision 267 refuses it at the
+        door and a form whose default choice is an error is worse than a shorter
+        list. `currencies` being empty is a real state - a wallet in every currency
+        the system serves - and it is a sentence rather than a form.
       #}
-      <form method="post" action="{{ urls.PREFIX }}/wallets" class="row">
-        <label for="currency">Currency</label>
-        <select id="currency" name="currency">
-          {% for currency in currencies %}
-            <option value="{{ currency }}">{{ currency }}</option>
-          {% endfor %}
-        </select>
-        <button type="submit">Open wallet</button>
-      </form>
-      <p class="muted small">
-        A currency cannot be changed once a wallet is open. Open a second wallet
-        for a second currency.
-      </p>
+      {% if currencies %}
+        <form method="post" action="{{ urls.PREFIX }}/wallets" class="row">
+          <label for="currency">Currency</label>
+          <select id="currency" name="currency">
+            {% for currency in currencies %}
+              <option value="{{ currency }}">{{ currency }}</option>
+            {% endfor %}
+          </select>
+          <button type="submit">Open wallet</button>
+        </form>
+        <p class="muted small">
+          A currency cannot be changed once a wallet is open. Open a second wallet
+          for a second currency.
+        </p>
+      {% else %}
+        <p class="muted">
+          You already hold a wallet in every currency this system serves. A closed
+          wallet frees its currency, so closing one brings it back here.
+        </p>
+      {% endif %}
     </section>
   </div>
 {% endblock %}

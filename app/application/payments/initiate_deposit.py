@@ -79,17 +79,19 @@ class InitiateDeposit:
 
     **A wallet in a currency this installation cannot collect is refused at the
     same door, for the same reason, and it is the newer of the two.** The rail is
-    enabled for particular currencies and ``Currency`` has five members, so a
-    collection opened for any of the other four would be taken at the far end in
-    the wrong one - and because ``SettlePayment`` compares what arrived against
-    what the row asked for, the disagreement would surface as a row that can
-    never settle, *after* the payer had paid. The check is
-    ``PaymentProvider.supported_currencies`` asked of the provider rather than a
-    constant held here, so the set has one home: the adapter that has to honour
-    it. **This is not a restriction on opening a wallet** - a wallet is a
-    container, and one holding US dollars holds pots and plans and can be
-    credited directly - it is a restriction on one door, and it is recorded in
-    the README as a departure from where the checklist first put it.
+    enabled for particular currencies and ``Currency`` names two, so a collection
+    opened for the other one would be taken at the far end in the wrong currency -
+    and because ``SettlePayment`` compares what arrived against what the row asked
+    for, the disagreement would surface as a row that can never settle, *after* the
+    payer had paid. The check is ``PaymentProvider.supported_currencies`` asked of
+    the provider rather than a constant held here, so the set has one home: the
+    adapter that has to honour it. **This is not a restriction on opening a
+    wallet** - a wallet is a container, and one holding US dollars holds pots and
+    plans and can be credited directly - it is a restriction on one door, and it is
+    recorded in the README as a departure from where the checklist first put it.
+    (It read "five members" here until decision 267 trimmed the enum to ``NGN`` and
+    ``USD``; the sentence is unchanged in shape because the shape was never about
+    the count.)
 
     **The balance ceiling is refused here too, and for the same reason as the
     closed wallet rather than a different one.** A deposit that would leave the

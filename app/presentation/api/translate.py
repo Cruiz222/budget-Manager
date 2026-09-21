@@ -498,8 +498,8 @@ def tier_limits_out(tier: Tier) -> list[schemas.TierLimitOut]:
     completeness test's own shape read from the other end: a currency added to
     the enum with no row in the table would be a ``KeyError`` here, at the
     translation, which is loud. Iterating the table would silently send a
-    shorter list and a client rendering a KES wallet would find no row and have
-    nothing to say.
+    shorter list and a client rendering a wallet in some other currency would
+    find no row and have nothing to say.
     """
     return [
         schemas.TierLimitOut(

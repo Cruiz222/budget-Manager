@@ -498,6 +498,14 @@ def test_build_scheduler_runs_a_plan_whose_owner_it_was_never_told(
 #: adapter, and reusing the fake's key would make the two indistinguishable.
 SECRET = "sk_test_" + "a" * 32
 
+#: A callback address, in the shape ``create_app`` assembles one: an origin with
+#: no trailing slash, joined to the web layer's landing path. Written out rather
+#: than imported from ``web.urls``, because what is under test here is that a
+#: string *this function is handed* survives the trip into the adapter - and a
+#: value borrowed from the module that composes it would move with it if the
+#: composition changed.
+CALLBACK_URL = "https://budget.example/app/"
+
 
 def a_pending_deposit(wallet, amount="5000", reference="dep-1") -> Transaction:
     """A deposit row as ``InitiateDeposit`` leaves it: asked for, not arrived.
@@ -547,6 +555,16 @@ def test_provider_for_turns_settings_into_paystack(monkeypatch):
     Asserting on the constructor arguments rather than on the class, for the
     reason the channel test above does: the mistake this wiring could make is a
     *value*, and one field is all there is to get wrong.
+
+    **Two fields now, and the second one is always passed.** ``callback_url`` is
+    the address a payer is sent back to, and the composition root is the only
+    frame holding both halves of it - the installation's public origin and the
+    web layer's landing path. It arrives here as ``None`` for an installation
+    that has not said where it lives, and the adapter is handed that ``None``
+    rather than being left to default it, for the reason the two tests below
+    ``test_provider_for_remembers_a_callback_url`` argue: "the setting is unset"
+    and "the caller forgot the argument" would otherwise be the same call, and
+    only one of them is a supported installation.
     """
     captured = {}
 
@@ -560,7 +578,61 @@ def test_provider_for_turns_settings_into_paystack(monkeypatch):
 
     provider_for(PaystackSettings(secret_key=SECRET))
 
-    assert captured == {"secret_key": SECRET}
+    assert captured == {"secret_key": SECRET, "callback_url": None}
+
+
+def test_provider_for_remembers_a_callback_url(monkeypatch):
+    """**The third frame of the join, asserted where the string changes hands.**
+
+    ``web.urls.callback_url`` composes the address out of the installation's
+    origin and this layer's landing path, and ``create_app`` is what calls it.
+    What this test pins is the hop between that call and the adapter: the
+    assembled string arrives as a constructor argument and is not dropped,
+    re-derived or defaulted on the way. The failure if it were is the one
+    ``test_deposit_return.py`` describes - a deposit that works perfectly and
+    leaves the payer on Paystack's own page with nothing to notice.
+    """
+    captured = {}
+
+    class RecordingProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        composition_root, "PaystackPaymentProvider", RecordingProvider
+    )
+
+    provider_for(PaystackSettings(secret_key=SECRET), callback_url=CALLBACK_URL)
+
+    assert captured == {"secret_key": SECRET, "callback_url": CALLBACK_URL}
+
+
+def test_an_injected_provider_is_handed_no_callback_url(build_payment_provider):
+    """**The limitation the deposit-return tests are built around, pinned here.**
+
+    An injected provider comes back untouched and is never told where the payer
+    should land, because the join above only happens on the path that *builds* an
+    adapter. That is not a defect to fix - a test double has no use for the
+    address - but it is a fact about this suite that a reader would otherwise
+    have to infer from a fixture: it is why ``test_deposit_return.py`` builds its
+    own application out of a real environment instead of using the suite's
+    ``app``, and why no other test in this repository can assert that a provider
+    received a callback.
+
+    An attribute check rather than an ``is`` comparison alone, so this stays true
+    if the fake grows one: the claim is about what was *passed in*, not about the
+    object's identity.
+    """
+    injected = build_payment_provider()
+
+    chosen = provider_for(
+        PaystackSettings(secret_key=SECRET),
+        injected,
+        callback_url=CALLBACK_URL,
+    )
+
+    assert chosen is injected
+    assert not hasattr(injected, "callback_url")
 
 
 def test_an_injected_provider_beats_the_settings(monkeypatch, build_payment_provider):

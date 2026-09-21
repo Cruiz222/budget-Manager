@@ -317,13 +317,31 @@ class TestWhatIsNotWarned:
         assert notifier.execute(HALF_PAST_ELEVEN) == []
 
     def test_an_upcoming_plan_on_one_wallet_does_not_warn_for_another(
-        self, build_wallet, build_plan, tmp_path
+        self, build_wallet, build_plan, tmp_path, stranger
     ):
+        """**The claim is about the window being asked of each plan**, and it takes
+        two wallets to say so: the one due at noon is inside it and warns, the one
+        due at six is not and does not, in the same pass. A notifier that answered
+        "a plan is due soon" without coming back to ask *which* would report both.
+
+        **The second wallet belongs to somebody else, which is a detail of how it
+        is built rather than part of what is asserted.** Decision 267 leaves one
+        live wallet per currency per owner, so two wallets for one owner would have
+        to differ in currency - and a plan whose money is in a currency its wallet
+        cannot hold is a state this system refuses at every door, which would make
+        the arrangement carry a claim this test does not want to make. Ownership
+        costs nothing here and needs no coaxing: the notifier takes no actor and
+        lists every ACTIVE plan in the installation, so whose plan it is never
+        enters the question. A warning for a plan that is not yours is what a
+        system-wide job is for.
+        """
         first_wallet = build_wallet(locked="10000")
-        second_wallet = build_wallet(locked="10000")
+        second_wallet = build_wallet(locked="10000", user_id=stranger)
         soon = build_plan(wallet_id=first_wallet.wallet_id, anchor=NOON)
         later = build_plan(
-            wallet_id=second_wallet.wallet_id, anchor=datetime(2026, 3, 2, 18, 0)
+            wallet_id=second_wallet.wallet_id,
+            user_id=stranger,
+            anchor=datetime(2026, 3, 2, 18, 0),
         )
         notifier, factory = build_notifier(tmp_path)
         seed(factory, [(first_wallet, soon), (second_wallet, later)])

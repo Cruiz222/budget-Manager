@@ -132,13 +132,19 @@ def _limits(
 #: silently change its meaning the day the rate moved, and a ceiling that moves on
 #: its own is not a ceiling.
 #:
-#: So each currency's numbers are a deliberate choice, and the non-NGN ones are
-#: *conservative*: they are set lower than the naira column rather than converted
-#: from it, because the currencies this system does not actually collect in are
-#: the ones it should be most careful about - see ``### Still open`` in the README
-#: on the provider hard-coding ``NGN`` while wallets in four other currencies are
-#: creatable. A USD wallet's deposits are already broken at the far end; it should
-#: not also be the loose one.
+#: **There are two currencies here now, and there were five.** The other three were
+#: removed from ``Currency`` itself when the one-wallet-per-currency rule landed -
+#: see ``currency.py`` - and this table is the column that proves the trim was a
+#: decision rather than a comment: six rows went with them, because a limits row
+#: for a currency no wallet can be opened in is a number nobody can reach.
+#:
+#: **USD's column is the conservative one, and the reason has moved.** It used to be
+#: a judgement about a foreign currency this system does not price. It is now a
+#: plainer fact: the payment rail collects NGN only, so a USD wallet's deposits are
+#: already refused at the door (``CurrencyNotCollectableError``), and the one route
+#: money has into it is ``WalletService.deposit``. A wallet that is not fundable by
+#: its owner should not also be the loose one. See ``### Still open`` in the README
+#: on the provider hard-coding ``NGN``.
 _LIMITS: dict[tuple[Tier, Currency], TierLimits] = {
     # The row that carries almost all the traffic, and the one worth arguing
     # about. Every existing account is here on rollout (there is no profile for
@@ -164,15 +170,6 @@ _LIMITS: dict[tuple[Tier, Currency], TierLimits] = {
     (Tier.UNVERIFIED, Currency.USD): _limits(
         "500.00", "2000.00", "3000.00", Currency.USD
     ),
-    (Tier.UNVERIFIED, Currency.GHS): _limits(
-        "5000.00", "20000.00", "30000.00", Currency.GHS
-    ),
-    (Tier.UNVERIFIED, Currency.KES): _limits(
-        "50000.00", "200000.00", "300000.00", Currency.KES
-    ),
-    (Tier.UNVERIFIED, Currency.EUR): _limits(
-        "500.00", "2000.00", "3000.00", Currency.EUR
-    ),
     # A complete profile. Roughly an order of magnitude up, which is the shape a
     # tiered programme has in practice: the step between "we have your name" and
     # "we have not checked your name" is worth more than any specific number, and
@@ -183,24 +180,15 @@ _LIMITS: dict[tuple[Tier, Currency], TierLimits] = {
     (Tier.IDENTIFIED, Currency.USD): _limits(
         "5000.00", "20000.00", "30000.00", Currency.USD
     ),
-    (Tier.IDENTIFIED, Currency.GHS): _limits(
-        "50000.00", "200000.00", "300000.00", Currency.GHS
-    ),
-    (Tier.IDENTIFIED, Currency.KES): _limits(
-        "500000.00", "2000000.00", "3000000.00", Currency.KES
-    ),
-    (Tier.IDENTIFIED, Currency.EUR): _limits(
-        "5000.00", "20000.00", "30000.00", Currency.EUR
-    ),
 }
 
 #: The table itself, so that a test can assert it covers every ``(Tier, Currency)``.
 #:
 #: Exposed rather than kept private behind ``limits_for`` because the test that
 #: matters most about it is a *completeness* one: the failure this prevents is a
-#: ``KeyError`` raised in production the day somebody adds a sixth ``Currency``
-#: member, and only an inspection of the whole table can catch that. The accessor
-#: below is for callers; this is for the assertion.
+#: ``KeyError`` raised in production the day somebody adds a ``Currency`` member,
+#: and only an inspection of the whole table can catch that. The accessor below is
+#: for callers; this is for the assertion.
 LIMITS = _LIMITS
 
 

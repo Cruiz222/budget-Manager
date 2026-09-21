@@ -9,10 +9,12 @@ commit() - or are all discarded by rollback().
 import sqlite3
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from app.application.unit_of_work import UnitOfWork
 from app.domain.money.currency import Currency
 from app.domain.money.fundKind import FundKind
+from app.domain.money.walletStatus import WalletStatus
 from app.infrastructure.persistence.serialization import (
     datetime_to_text,
     enum_to_text,
@@ -175,6 +177,13 @@ CREATE TABLE IF NOT EXISTS wallets (
     currency          TEXT NOT NULL,
     status            TEXT NOT NULL,
     available_balance TEXT NOT NULL    -- decimal as text, e.g. "10000.00"
+    -- One wallet per currency, per person, while a wallet is open - and it is not
+    -- written here, because SQLite has no partial table constraint and this rule
+    -- has to be partial. The ``CLOSED`` rows are excluded so that closing a wallet
+    -- frees its currency, and a rule that could not be expressed that way would be
+    -- a different rule. It is an index created by
+    -- ``_migrate_one_wallet_per_currency``, which every connection runs, so a
+    -- database that already exists gets it too. See decision 267.
 );
 
 CREATE TABLE IF NOT EXISTS funds (
@@ -1046,6 +1055,236 @@ def _migrate_add_fund_commitment_columns(connection: sqlite3.Connection) -> None
 _DROP_COLUMN_MINIMUM = (3, 35, 0)
 
 
+#: The currencies a wallet may be opened in, in the spelling the store writes.
+#:
+#: Derived from ``Currency`` rather than written out, and the direction matters:
+#: this is the set of rows the *current* build can read, so the enum is what
+#: defines it. A member removed from ``Currency`` tomorrow takes its rows out of
+#: this set, which is what lets the migration below keep working after the next
+#: trim without being edited.
+_SERVABLE_WALLET_CURRENCIES = frozenset(enum_to_text(member) for member in Currency)
+
+#: What a closed wallet's status looks like in the store - ``enum_to_text`` writes
+#: ``member.name``. Read from the enum rather than typed out, so the index's
+#: predicate and the aggregate's spelling cannot drift apart.
+_CLOSED_WALLET_STATUS = enum_to_text(WalletStatus.CLOSED)
+
+
+class UnservableWalletRowsError(RuntimeError):
+    """A wallet row this build cannot serve, holding something that cannot be thrown away.
+
+    **Not a domain exception, and the class it is not is the point.** Everything
+    under ``MoneyError`` is a sentence a caller reads about a request they made;
+    this one is a fact about the *database*, no request produces it, and no request
+    can fix it. It is raised while the connection is being opened, so the failure
+    arrives at startup rather than as a 500 on somebody's landing page an hour
+    later.
+
+    **It is raised only when the migration cannot do the right thing by itself.** A
+    wallet row in a currency this build no longer has, or a second wallet in a
+    currency its owner already holds one in, is either provably empty - in which
+    case the migration below deletes it and says so - or it holds money or history,
+    and then there is nothing this code can do to it that is not destroying
+    something. Re-denominating money is not a thing this system does, and merging
+    two wallets' ledgers is a money operation rather than a cleanup. So it stops,
+    names the rows, and leaves the decision to whoever can look inside them.
+    """
+
+
+def _wallet_holds_anything(
+    connection: sqlite3.Connection, wallet_id: str, available_balance: str
+) -> str | None:
+    """What this wallet still has, as a phrase, or ``None`` if it is provably empty.
+
+    **"Provably empty" is defined positively rather than as a default.** A row may
+    be deleted by the migration below only when every one of these is checked and
+    found absent, because the alternative - a rule like "nothing that looks
+    important" - deletes whatever nobody thought of.
+
+    The balance is compared as a ``Decimal`` and not with SQL's ``CAST``: ``CAST
+    ... AS NUMERIC`` is a float conversion, and a rule about whether money is
+    present is the last place in this codebase to introduce one. The four tables
+    named below are the ones carrying a ``wallet_id``; between them they are every
+    fact in the schema that removing the wallet would orphan.
+    """
+    if Decimal(available_balance) != 0:
+        return f"a balance of {available_balance}"
+    for table, noun in (
+        ("funds", "a pot"),
+        ("transactions", "a ledger row"),
+        ("savings_plans", "a savings plan"),
+        ("confirmations", "a confirmation request"),
+    ):
+        found = connection.execute(
+            f"SELECT 1 FROM {table} WHERE wallet_id = ? LIMIT 1", (wallet_id,)
+        ).fetchone()
+        if found is not None:
+            return noun
+    return None
+
+
+def _migrate_resolve_wallet_rows(connection: sqlite3.Connection) -> None:
+    """Remove wallet rows this build cannot serve, and stop if one holds something.
+
+    Two conditions, one idea: **both are states the code that wrote them could
+    reach and this build cannot.** Neither is hypothetical for an installation that
+    has been running.
+
+    * **A currency no longer on ``Currency``.** No row like this can be read at
+      all - ``text_to_enum`` raises ``KeyError`` - so it is not a wallet with an
+      odd currency, it is a row that breaks whatever touches it. That is why this
+      migration runs *first*: every later step in ``_connect`` reads
+      ``wallets.currency``, ``_migrate_locked_balance_into_funds`` included.
+    * **A second wallet in a currency the same person already holds one in.** The
+      rule the application now enforces at the door, applied to data written before
+      there was a door. It is here rather than left to the index because
+      ``CREATE UNIQUE INDEX`` over a table that violates it does not tidy anything:
+      it fails, and the database is exactly as unopenable as it was.
+
+    **Which member of a pair survives is decided by what is in it, not by its age.**
+    The oldest is kept by default - it is the row the landing page lists first and
+    the one an existing link points at - but if exactly one member of the group
+    holds anything, that one is kept instead, because an empty wallet and a funded
+    wallet are not a real choice between. Only when the group cannot be resolved
+    that way does this raise.
+
+    **It deletes rows, so it prints what it deleted.** One line per row, naming the
+    wallet and what was empty about it. Nothing is printed on a database that has
+    none of these, which is every fresh one and every test. A print rather than a
+    logger because this module has no logger and the statement is one line - and a
+    print rather than silence because a person who finds a wallet missing is owed
+    the story in their own logs.
+
+    **Nothing is written until the whole answer is known.** The plan is worked out
+    and every deletion verified empty before the first ``DELETE``, so a database
+    this raises on is a database this left alone.
+    """
+    rows = connection.execute(
+        """
+        SELECT wallet_id, user_id, currency, status, available_balance
+        FROM wallets
+        ORDER BY rowid
+        """
+    ).fetchall()
+    if not rows:
+        return
+
+    # Grouped in Python rather than in SQL: there are a handful of wallets in the
+    # whole database, and the rule below is a read of each row's contents, which
+    # is not a predicate SQL should be asked to express.
+    groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    doomed: list[tuple[sqlite3.Row, str]] = []
+    blocked: list[tuple[sqlite3.Row, str]] = []
+
+    for row in rows:
+        if row["currency"] not in _SERVABLE_WALLET_CURRENCIES:
+            doomed.append((row, "its currency is no longer served by this build"))
+        elif row["status"] != _CLOSED_WALLET_STATUS:
+            # A closed wallet holds no currency slot, so it is skipped rather than
+            # grouped: closing one frees its currency, which is the rule that makes
+            # a closed wallet a legitimate companion to a live one.
+            groups.setdefault((row["user_id"], row["currency"]), []).append(row)
+
+    for (_owner, currency), members in groups.items():
+        if len(members) == 1:
+            continue
+        holders = [
+            (row, _wallet_holds_anything(connection, row["wallet_id"], row["available_balance"]))
+            for row in members
+        ]
+        funded = [(row, held) for row, held in holders if held is not None]
+        if len(funded) > 1:
+            # Two wallets that both hold something, in one currency. There is no
+            # reading of this that says which one the person meant, and there is no
+            # merge here - see the class above.
+            blocked.extend(
+                (row, f"it is one of {len(members)} {currency} wallets, and holds {held}")
+                for row, held in funded
+            )
+            continue
+        survivor = funded[0][0] if funded else members[0]
+        why = (
+            f"a second {currency} wallet on one account"
+            if funded
+            else f"a second empty {currency} wallet on one account"
+        )
+        doomed.extend(
+            (row, why) for row in members if row["wallet_id"] != survivor["wallet_id"]
+        )
+
+    for row, why in doomed:
+        held = _wallet_holds_anything(
+            connection, row["wallet_id"], row["available_balance"]
+        )
+        # Unreachable for the duplicates above, which are empty by construction -
+        # and checked all the same, because this is the difference between a
+        # promise and an argument: nothing below deletes a row that holds anything.
+        if held is not None:
+            blocked.append((row, f"{why}, and holds {held}"))
+
+    if blocked:
+        raise UnservableWalletRowsError(
+            "this database holds wallet rows that cannot be served and cannot be "
+            "deleted, so it has been left exactly as it was: "
+            + "; ".join(
+                f"{row['wallet_id']} ({row['currency']}): {why}" for row, why in blocked
+            )
+            + ". Neither removing money nor merging two ledgers is something this "
+            "system does on its own - settle or move what is in these wallets, or "
+            "remove the rows by hand, and start again."
+        )
+
+    for row, why in doomed:
+        connection.execute(
+            "DELETE FROM wallets WHERE wallet_id = ?", (row["wallet_id"],)
+        )
+        print(
+            f"budget: removed wallet {row['wallet_id']} ({row['currency']}) - "
+            f"{why}; it held no money and no history"
+        )
+
+
+def _migrate_one_wallet_per_currency(connection: sqlite3.Connection) -> None:
+    """Enforce one wallet per currency in the store, for as long as a wallet is open.
+
+    **A partial unique index, because a table constraint cannot be partial.** SQLite
+    has no ``UNIQUE (user_id, currency) WHERE ...`` in a ``CREATE TABLE``, and the
+    ``WHERE`` here is not decoration: it is the difference between "one wallet per
+    currency" and "one wallet per currency forever". Closing a wallet is meant to
+    free its currency - see ``DuplicateWalletCurrencyError`` - so the index ignores
+    exactly the rows that are closed, and a person who closes a wallet and opens
+    another in the same currency is not in violation of anything.
+
+    **The predicate is the status as the store spells it**, which ``enum_to_text``
+    writes as the enum *member name*: ``'CLOSED'``, not the value and not a number.
+    It is read from ``WalletStatus`` rather than typed here so the two cannot
+    disagree.
+
+    **Where it belongs in the sequence, and why both halves are load-bearing.** It
+    runs after ``_migrate_resolve_wallet_rows``, because ``CREATE UNIQUE INDEX`` over
+    a table that already violates it fails rather than tidying - and the databases
+    that violate it are precisely the ones this change exists for. It runs before
+    everything else that reads ``wallets``, so the guarantee is in place for the
+    rest of the open rather than arriving halfway through it.
+
+    **This is the backstop, not the rule.** The rule is in ``WalletService.
+    open_wallet``, which refuses with a domain error before the write. This exists
+    for the gap between that check and this write - two requests can both read an
+    empty list - and it is the same arrangement as ``funds``' ``UNIQUE (wallet_id,
+    name)``: the aggregate refuses first, and the store refuses anything that got
+    past it. A caller that trips this sees a ``sqlite3.IntegrityError`` rather than
+    a sentence, which is the honest outcome for a race that should not have
+    happened.
+    """
+    connection.execute(
+        f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS one_wallet_per_currency
+        ON wallets(user_id, currency)
+        WHERE status <> '{_CLOSED_WALLET_STATUS}'
+        """
+    )
+
+
 def _migrate_locked_balance_into_funds(connection: sqlite3.Connection) -> None:
     """Move each wallet's locked balance into a pot, then drop the column.
 
@@ -1275,6 +1514,17 @@ def open_sqlite_connection(db_path: str) -> sqlite3.Connection:
     # It is a no-op on a fresh database, where ``executescript`` has just created
     # the table in its new form.
     _migrate_make_user_email_optional(connection)
+    # The first two steps that touch ``wallets``, and they are first on purpose.
+    # Every step below this line reads ``wallets.currency`` through the enum, so
+    # rows still carrying a currency this build no longer has must be gone before
+    # any of them run - ``_migrate_locked_balance_into_funds`` would raise
+    # ``KeyError`` on one. The index follows immediately, because it is the
+    # guarantee the rest of the sequence can then assume, and because it cannot be
+    # created over the duplicates the step above has just resolved. Both are
+    # no-ops on a fresh database, which has no such rows and gains the index from
+    # the same call. See each function for what it does and why it may delete.
+    _migrate_resolve_wallet_rows(connection)
+    _migrate_one_wallet_per_currency(connection)
     _migrate_add_destination_column(connection)
     _migrate_add_plan_name_column(connection)
     _migrate_plan_run_due_at_to_datetime(connection)

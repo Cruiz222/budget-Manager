@@ -153,14 +153,24 @@ def test_get_by_internal_reference_returns_none_when_absent(build_wallet):
 
 def test_get_by_wallet_id_returns_that_wallets_ledger_oldest_first(build_wallet):
     wallet = build_wallet()
-    other_wallet = build_wallet()
+    # In dollars, because decision 267 allows one live wallet per currency per
+    # owner and this test needs a second row for *this* owner: a ledger read
+    # scoped by wallet is only shown to be scoped by wallet if the wallet it must
+    # leave out belongs to somebody who could otherwise have been it. The stray
+    # transaction is in dollars with it, so the ledger it sits in is the ordinary
+    # single-currency shape rather than one this system could not have produced.
+    other_wallet = build_wallet(currency=Currency.USD)
     repository = build_repository(wallet)
     # Seed the second wallet so the foreign key resolves.
     SqliteWalletRepository(repository._connection).save(other_wallet)
 
     first = build_transaction(wallet, internal_reference=str(uuid4()))
     second = build_transaction(wallet, internal_reference=str(uuid4()))
-    stranger = build_transaction(other_wallet, internal_reference=str(uuid4()))
+    stranger = build_transaction(
+        other_wallet,
+        amount=Money(Decimal("5000"), Currency.USD),
+        internal_reference=str(uuid4()),
+    )
     for transaction in (first, second, stranger):
         transaction.mark_successful()
         repository.save(transaction)

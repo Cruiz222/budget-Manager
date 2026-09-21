@@ -23,6 +23,7 @@ from app.infrastructure.persistence.serialization import (
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
+    UnservableWalletRowsError,
     open_sqlite_connection,
 )
 
@@ -1383,3 +1384,210 @@ def test_the_write_lock_is_released_when_the_unit_ends(tmp_path):
     assert contender_gets_in() is False
     committed.commit()
     assert contender_gets_in() is True
+
+
+# --- one wallet per currency (decision 267) ----------------------------------
+
+
+def legacy_wallet_rows(*rows):
+    """Rows for ``build_legacy_database``, from ``(user_id, currency, status, available)``.
+
+    ``locked_balance`` is written as ``"0"`` for every row here: these tests are
+    about currencies and duplicates, and a locked balance would also drag
+    ``_migrate_locked_balance_into_funds`` into the picture - which one of them
+    *does* rely on, and says so where it does.
+    """
+    return [
+        (uuid_to_text(uuid4()), uuid_to_text(user_id), currency, status, available, "0")
+        for user_id, currency, status, available in rows
+    ]
+
+
+class TestResolvingWalletRowsOnOpen:
+    """``_migrate_resolve_wallet_rows``, and the two states it exists for.
+
+    **The database these tests build is one this code can no longer write**, which
+    is why they go through raw SQL rather than through a repository: a GHS wallet
+    cannot be saved by the current build, and two live NGN wallets for one person
+    are refused by the index. Both are still *readable* by an installation that
+    wrote them before this change, and an installation that cannot be opened is the
+    failure this migration is here to prevent.
+
+    The three outcomes, one test class: a row that holds nothing is removed and
+    said so; a row that holds something stops the open and is named; and a database
+    that is already clean gains its index and nothing else.
+    """
+
+    def test_an_empty_wallet_in_a_currency_that_is_gone_is_removed(
+        self, tmp_path, capsys
+    ):
+        """The ordinary case for a wallet somebody opened and never used. Nothing
+        is lost - and it is printed, because a person who finds a wallet gone is
+        owed the reason in their own logs.
+        """
+        db_path = str(tmp_path / "gone.db")
+        owner = uuid4()
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows((owner, "GHS", "ACTIVE", "0.00")),
+        )
+
+        connection = open_sqlite_connection(db_path)
+        remaining = connection.execute("SELECT wallet_id FROM wallets").fetchall()
+        connection.close()
+
+        assert remaining == []
+        printed = capsys.readouterr().out
+        assert "GHS" in printed
+
+    def test_a_wallet_in_a_currency_that_is_gone_and_holds_money_stops_the_open(
+        self, tmp_path
+    ):
+        """**And it stops it rather than emptying it.** The money in this wallet is
+        real and this system has no way to move it into a currency it still
+        serves - so the honest outcome is a database that refuses to open, naming
+        the wallet, rather than one that quietly loses it.
+        """
+        db_path = str(tmp_path / "unservable.db")
+        owner = uuid4()
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows((owner, "KES", "ACTIVE", "5000.00")),
+        )
+
+        with pytest.raises(UnservableWalletRowsError) as refused:
+            open_sqlite_connection(db_path)
+
+        assert "KES" in str(refused.value)
+        assert "5000.00" in str(refused.value)
+
+    def test_it_runs_before_the_migration_that_decodes_the_currency(
+        self, tmp_path
+    ):
+        """**The ordering, asserted rather than left as a comment.**
+
+        ``_migrate_locked_balance_into_funds`` reads every wallet's currency
+        through ``text_to_enum``, so on a database holding a GHS wallet it raises
+        ``KeyError`` - which is why the cleanup runs first. This test is the one
+        that can tell: the database it builds has the legacy ``locked_balance``
+        column, so both migrations are in play, and the error raised is the one
+        that means the currency was read *before* anything tried to decode it.
+        """
+        db_path = str(tmp_path / "ordering.db")
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows((uuid4(), "GHS", "ACTIVE", "0.00")),
+        )
+
+        with pytest.raises(UnservableWalletRowsError):
+            open_sqlite_connection(db_path)
+
+    def test_a_duplicate_pair_keeps_the_one_holding_money(self, tmp_path, capsys):
+        """Two live naira wallets, one funded - the state that prompted this change.
+
+        The funded one is kept, and not the older one, because those are not a real
+        choice: deleting a wallet with money in it is not something this migration
+        does, and keeping the empty one would leave the person unable to reach the
+        balance they can see.
+        """
+        db_path = str(tmp_path / "duplicates.db")
+        owner = uuid4()
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows(
+                (owner, "NGN", "ACTIVE", "0.00"),
+                (owner, "NGN", "ACTIVE", "7000.00"),
+            ),
+        )
+
+        connection = open_sqlite_connection(db_path)
+        remaining = connection.execute(
+            "SELECT available_balance FROM wallets"
+        ).fetchall()
+        connection.close()
+
+        assert [row["available_balance"] for row in remaining] == ["7000.00"]
+        assert "NGN" in capsys.readouterr().out
+
+    def test_a_duplicate_pair_with_money_in_both_stops_the_open(self, tmp_path):
+        """The state this migration cannot resolve. Two balances in one currency is
+        a question about which one the person meant, and no reading of the database
+        answers it - merging two ledgers is a money operation, not a cleanup.
+        """
+        db_path = str(tmp_path / "both.db")
+        owner = uuid4()
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows(
+                (owner, "NGN", "ACTIVE", "5000.00"),
+                (owner, "NGN", "ACTIVE", "7000.00"),
+            ),
+        )
+
+        with pytest.raises(UnservableWalletRowsError):
+            open_sqlite_connection(db_path)
+
+    def test_a_closed_duplicate_is_not_a_duplicate(self, tmp_path):
+        """Closing frees the currency, so a closed wallet beside a live one is a
+        legitimate pair and must survive both the cleanup and the index. A
+        migration that counted it would delete a wallet the application considers
+        perfectly ordinary.
+        """
+        db_path = str(tmp_path / "closed.db")
+        owner = uuid4()
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows(
+                (owner, "NGN", "CLOSED", "0.00"),
+                (owner, "NGN", "ACTIVE", "7000.00"),
+            ),
+        )
+
+        connection = open_sqlite_connection(db_path)
+        remaining = connection.execute("SELECT status FROM wallets").fetchall()
+        connection.close()
+
+        assert sorted(row["status"] for row in remaining) == ["ACTIVE", "CLOSED"]
+
+    def test_a_clean_database_gains_the_index_and_keeps_both_currencies(self, tmp_path):
+        """The fresh-database case, and the one that proves the index is created on
+        a path where nothing needed removing: one NGN wallet and one USD wallet for
+        one person is the arrangement the whole change is for.
+        """
+        db_path = str(tmp_path / "fresh.db")
+        owner = uuid4()
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows(
+                (owner, "NGN", "ACTIVE", "0.00"),
+                (owner, "USD", "ACTIVE", "0.00"),
+            ),
+        )
+
+        connection = open_sqlite_connection(db_path)
+        count = connection.execute("SELECT COUNT(*) AS n FROM wallets").fetchone()["n"]
+        indexes = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        connection.close()
+
+        assert count == 2
+        assert "one_wallet_per_currency" in indexes
+
+    def test_the_migration_is_idempotent(self, tmp_path):
+        """Opening a second time does nothing, which is the property that keeps the
+        print above from becoming noise on every start - and the reason the index is
+        created with ``IF NOT EXISTS``.
+        """
+        db_path = str(tmp_path / "twice.db")
+        build_legacy_database(
+            db_path,
+            legacy_wallet_rows((uuid4(), "GHS", "ACTIVE", "0.00")),
+        )
+
+        open_sqlite_connection(db_path).close()
+        connection = open_sqlite_connection(db_path)
+        connection.close()

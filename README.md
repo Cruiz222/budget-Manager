@@ -4774,8 +4774,9 @@ the wrong door, for three reasons, and the first is decisive:
   root `deposit` verb is exactly that door. Restricting creation would close a working
   door in order to close a broken one.
 - **"We cannot *hold* USD" and "we cannot *collect* USD" are different claims.** `Money`
-  accepts five currencies, `tier.py` carries a limits row for each, and pots and plans
-  work in each. Only the rail is naira-only.
+  accepts currencies other than naira - five of them when this was written, two since
+  decision 267 - `tier.py` carries a limits row for each, and pots and plans work in each.
+  Only the rail is naira-only.
 - **It would make a live property untestable.** `test_plans.py:327` and
   `test_cli_plans.py:364,1492` each open a USD wallet to prove that amounts are read in
   the *wallet's* currency rather than the request's, which is the only end-to-end way to
@@ -5717,6 +5718,19 @@ The `StarletteHTTPException` handler is the one that earns the wiring rather tha
 being tidiness: a mistyped or misused address under `/app` raises inside the
 router, not inside a route, and without it a 405 would answer JSON to a browser.
 
+**The status line was the half that was missing, and the first run of the web
+suite is what found it.** The page carried the number in its body while the
+response carried `200 OK`, so every refusal in this layer - a 403, a 404, a 405, a
+503 - was served as a success. `templating.render` had never passed a status to
+`TemplateResponse` at all, and `Browser.render` had put the grade in the context,
+where the template could print it and nothing else could read it: a 404 page
+answered `200 OK` tells a browser it may cache the miss, tells a search engine to
+index it, and tells every uptime check that the deployment is healthy - the body
+saying otherwise being invisible to all three. A page is not a replacement for the
+status line; it is a second rendering of the same answer, and the answer is the
+number. `render` now takes a `status_code` defaulting to 200, and the error
+renderer passes its grade twice, once for each reader.
+
 **262. `GET /wallets` is a new read rather than a client-side workaround.** The
 port gained `list_for_owner(user_id) -> list[Wallet]`, the SQLite adapter orders by
 `rowid` - the `wallets` table has no `created_at`, and insertion order is creation
@@ -5771,6 +5785,71 @@ state rather than an unconfigured one, and it strips a trailing slash - left in,
 base URL written with one, which is how most people write one, would give every
 payer a `//app/` in their address bar.
 
+**267. One wallet per currency, and two currencies.** A person may hold an NGN
+wallet and a USD wallet, and never two of either. The rule is four decisions, and
+the fourth is what makes the other three cheap.
+
+*The refusal is a refusal.* `WalletService.open_wallet` reads the actor's existing
+wallets first - through `list_for_owner`, the read `GET /wallets` already uses, so
+no new port method - and raises `DuplicateWalletCurrencyError`, graded **409**. It
+is deliberately not an idempotent redirect: a person asking for a second NGN wallet
+has asked for something that cannot be given, and handing them the wallet they
+already had answers a question they did not ask. The error's name is not
+`DuplicateFundNameError`'s one over, either, and the distinction is a remedy: that
+one says *use another name*, `CurrencyNotCollectableError` says *this rail cannot
+take it at all*, and this says *use the wallet you have*. Three sentences, three
+names.
+
+*Closing a wallet frees its currency.* Without this, a closed wallet would burn the
+currency for the account's lifetime and closing one by mistake would be unfixable
+through the product. So `CLOSED` is not a wallet **for this purpose**, and the rule
+is written that way in both places that enforce it: the filter in `open_wallet` and
+the predicate on the index below. The two must agree, and the index is the half
+that cannot be bypassed.
+
+*The currency list is `NGN` and `USD`.* `GHS`, `KES` and `EUR` were removed from
+`Currency` itself. This one was chosen against the narrower alternative - keep the
+five members and mark two of them "openable" - and the reason is what a policy
+subset costs: a second list to keep in step, a second place to look, and five
+members that `tier.py`'s completeness test then requires a row for. Trimming the
+enum makes the rule land in one place, because every door already derives from it:
+the web dropdown, the CLI's `choices`, and the `allowed` list in the 400's message
+all narrow without being edited. What it costs is stated in the module rather than
+left to be discovered: the money domain now knows something about a rail, and money
+in GHS is not a value this codebase can hold. `CurrencyNotCollectableError` keeps
+its name and comes down to one live case, a USD wallet at an NGN-only rail.
+
+*The store has a backstop, and the backstop is partial.* `open_wallet`'s check and
+its write are separate statements in one transaction, so two simultaneous requests
+can both read an empty list and both save. Underneath the door is a unique index on
+`wallets(user_id, currency) WHERE status <> 'CLOSED'` - an index and not a table
+constraint, because SQLite has no partial table constraint, which is also why it is
+created by a migration rather than declared in `SCHEMA`. The predicate spells the
+status as the store writes it, `member.name`, so it reads `'CLOSED'`. This is
+`funds`' `UNIQUE (wallet_id, name)` one level up: the aggregate refuses first, and
+the store refuses whatever got past it. A caller that trips it sees a store error
+rather than a sentence, which is right for a race that should not have happened.
+
+**Two migrations come with it, and one of them can delete rows.** The databases that
+violate the new rule are the ones this change exists for, so neither the index nor
+the trim can be shipped without dealing with what is already on disk.
+`_migrate_resolve_wallet_rows` runs **first**, before every other step that reads
+`wallets.currency` - `_migrate_locked_balance_into_funds` would raise `KeyError` on
+a GHS row - and it does two things that are one idea: a wallet in a currency this
+build no longer serves, and a second wallet in a currency its owner already holds
+one in. Each is *resolved* when it is provably empty and *refused* when it is not.
+Provably empty is defined positively - zero balance and no `funds`, `transactions`,
+`savings_plans` or `confirmations` row - and the balance is compared as a `Decimal`,
+not with SQL's `CAST ... AS NUMERIC`, which is a float conversion and the last place
+in this codebase to introduce one. A resolvable group keeps the member that holds
+something, or the oldest if none does, and every deletion is planned and verified
+before the first `DELETE`, so a database this raises on is one it left alone.
+Deletion prints a line naming the wallet; a refusal raises `UnservableWalletRowsError`
+naming every row and what is in it. It is a `RuntimeError` and not a `MoneyError`,
+because no request produces it and none can fix it - the failure belongs at startup,
+where it is a sentence, rather than at somebody's landing page an hour later, where
+it is a 500. Re-denominating money is not a thing this system does.
+
 #### What the tests assert, and the one place the plan could not be followed
 
 `tests/presentation/web/` drives a real application through `TestClient`, with two
@@ -5779,7 +5858,22 @@ departures from the API suite that are worth naming. It uses
 rather than switched off for convenience; and it does not follow redirects, so
 every 303 in the flow is assertable rather than invisible.
 
-Nine files, and what each is for:
+**The second of those was argued before it was true, and the same first run
+caught it.** The conftest docstring made the case at length - a client that
+followed a 303 would turn "the form redirected to the confirmation page" into "the
+confirmation page rendered", which is a weaker claim - while `TestClient`'s
+default, `follow_redirects=True`, was in force everywhere, because the line that
+would have changed it was never written. Every test written against that
+paragraph had been silently asserting on the page at the far end of a redirect,
+and the failures read as templates rendering where a status was expected.
+`follow_redirects=False` is now spelled at all five construction sites, including
+the two fixtures in other modules that build their own client.
+
+Two production defects, then, and both were found by the first full run rather
+than by reading - which is the outcome the plan's verification section exists for,
+and the reason it is written down here rather than quietly fixed.
+
+Ten files, and what each is for - the last added with decision 267:
 
 - **`conftest.py`** - a `Browser` class rather than fixtures for each action, so a
   test reads as a sequence of things a person did. It funds a wallet by calling
@@ -5801,6 +5895,11 @@ Nine files, and what each is for:
   to either presentation later cannot collide quietly.
 - **`test_google.py`** - both directions, against the recording stub verifier.
 - **`test_deposit_return.py`** - decision 263, end to end, plus the absent case.
+- **`test_wallets.py`** - decision 267 at the page: the dropdown offers exactly the
+  currencies the enum names and not the one already held, the empty case is a
+  sentence rather than a form with nothing in it, and the refusal a stale tab still
+  meets is asserted by posting it directly, because the rendered form is what was
+  narrowed and the request is what was not.
 
 **The eighth of the plan's verification items could not be written as it was
 stated, and the difference is worth recording.** It asked for "with
@@ -5913,11 +6012,17 @@ decision.
 
     The audit's own closing claim stands and is worth keeping: "A wallet in any of
     the other four currencies is creatable today, and its deposits are wrong at the
-    far end in a way nobody is told about." The first half is still true, and
-    deliberately so - what changed is that the deposits are now refused rather than
-    wrong. The one place the wallet's currency met anything was
-    `initiate_deposit.py:164`, and that compared the amount to the *wallet*; the
-    second place is the line added beside it.
+    far end in a way nobody is told about." **Its first half has since stopped being
+    true, and it took two decisions to stop it.** Decision 234 left currency
+    creation open and put the guard at the deposit door instead; decision 267 then
+    took `GHS`, `KES` and `EUR` out of `Currency` altogether, so a wallet in any of
+    "the other four" is neither creatable nor *representable*. The second half's
+    shape survives the trim, which is the part worth keeping: a wallet whose
+    currency the rail cannot collect has its deposits refused rather than wrong,
+    and `USD` is now the only currency that can be in that position. The one place
+    the wallet's currency met anything was `initiate_deposit.py:164`, and that
+    compared the amount to the *wallet*; the second place is the line added beside
+    it.
   - **The payout rail has no later refusal because it has no earlier or later
     anything.** `Destination` requires `bank_code` for a `BANK_ACCOUNT`
     (`destination.py:18`), which is a floor and not a ceiling, and the identifier

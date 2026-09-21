@@ -105,8 +105,21 @@ class Browser:
 
     # --- reading ---------------------------------------------------------
 
-    def get(self, path: str):
-        return self.client.get(path)
+    def get(self, path: str, **kwargs):
+        """GET a path, with the same passthrough ``post`` below has.
+
+        **``**kwargs`` is here for exactly one caller**, and it is worth the
+        exception being named rather than discovered: ``test_credential``'s
+        sign-out test asks the *JSON API* - with an ``Authorization`` header -
+        whether the token the cookie used to hold is still a session. That is not
+        something a page does, and it is the point of the test: a browser cannot
+        see the difference between a cookie that was deleted and a session that
+        was ended, so the claim has to be made to something that can.
+
+        Everything else in this suite passes no keyword, which is what keeps
+        ``Browser`` an honest stand-in - in a browser there is no way to pass one.
+        """
+        return self.client.get(path, **kwargs)
 
     def post(self, path: str, **kwargs):
         return self.client.post(path, **kwargs)
