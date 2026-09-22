@@ -1,31 +1,12 @@
-"""Errors raised by the payments side of the domain.
-
-Deriving from ``MoneyError`` rather than from ``Exception`` continues the rule
-``app.domain.planning.exception`` states: **a new exception belongs under the
-existing root, or every catch site in the codebase has to be revisited.** The
-CLI catches ``MoneyError`` once, at the top of ``main``, and turns it into
-``error: ...`` with exit code 1; the API's handlers do the same. A payments root
-outside that tree would mean every refusal escaped as a traceback instead.
-
-There is deliberately very little here, and the absence is the design. A
-webhook that names a reference nobody has heard of, an event that arrives twice,
-an amount that disagrees with the row - none of those is an error, because none
-of them is a failure of anything. They are *reports* that the system handles and
-answers with a 200, and they are modelled as values (``SettlePayment``'s result)
-rather than as exceptions. What is left for this module is the three things that
-genuinely cannot proceed: the provider refusing a call, the provider not being
-askable at all, and this side refusing to make one. The first and the second were
-a single class until a real-money audit separated them - see
-``PaymentProviderUnavailableError``, where the argument for the split is written
-out.
-"""
-
 from app.domain.money.exception import MoneyError
 
 
 class PaymentError(MoneyError):
     """Base for every rejection the payments domain makes."""
 
+
+class InvalidTransferIntentError(PaymentError):
+    pass
 
 class PaymentProviderError(PaymentError):
     """The provider refused a call.

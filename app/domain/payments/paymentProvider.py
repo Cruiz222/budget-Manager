@@ -1,8 +1,10 @@
 from abc import ABC, abstractmethod
 
 from app.domain.money.currency import Currency
+from app.domain.money.destination import Destination
 from app.domain.money.money import Money
 from app.domain.payments.paymentIntent import PaymentIntent
+from app.domain.payments.transferIntent import TransferIntent
 from app.domain.payments.providerAnswer import ProviderAnswer
 
 
@@ -204,4 +206,15 @@ class PaymentProvider(ABC):
         something this signature can enforce, which is exactly why it is written
         here where an implementer will read it.
         """
+        pass
+
+    @abstractmethod
+    def initiate_transfer(
+        self,
+        *,
+        reference: str,
+        amount: Money,
+        destination: Destination,
+    ) -> TransferIntent:
+        """Ask the provider to initiate an external money transfer."""
         pass

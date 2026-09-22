@@ -1,38 +1,9 @@
-"""The Paystack adapter: two calls out, and one thing checked coming in.
-
-Two halves, and they are tested differently because they *are* different. The
-outbound half is JSON over HTTP and is tested against a recording double, the way
-``SmtpNotificationChannel`` is - what matters is not that HTTP works but that the
-right method, the right URL, the right bearer token and the right *number* go
-out. Verifying is pure HMAC over bytes with no I/O anywhere in it, so it is tested
-against the real thing with nothing replaced at all.
-
-**The outbound half is two methods and one double, and the double knows it.**
-Opening a collection and looking one up share ``_request``, so they share the
-recorder too - which is why it records the verb. The difference between the two
-calls is mostly *that* difference: the same host, the same bearer token, the same
-JSON handling, and a POST that creates a charge where a GET asks about one. A
-double built for the first would have let the second leave as a POST and never
-noticed.
-
-**The recording double is here rather than in ``tests/conftest.py``**, and that
-is the opposite of where ``FakePaymentProvider`` lives. The distinction is who
-needs it: the fake provider is used by the API suite, which must never open a
-socket, and this double is used by one file that is specifically about what goes
-on the wire. Putting it in the shared place would invite a second module to
-depend on the shape of an HTTP call it does not make.
-
-The one thing neither half of this file does is reach the network. There is no
-skip marker, no ``pytest.mark.network``, and no test that only runs when a key is
-set - which is the property ``requirements.txt``'s comment claims for the
-inbound half and the injection seam claims for the outbound one.
-"""
-
 from decimal import Decimal
 
 import httpx
 import pytest
-
+from app.domain.money.destination import Destination
+from app.domain.money.destinationKind import DestinationKind
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.payments.exception import (
@@ -42,6 +13,7 @@ from app.domain.payments.exception import (
     PaymentProviderError,
     PaymentProviderUnavailableError,
 )
+from app.domain.payments.exception import InvalidTransferIntentError
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
 from app.domain.payments.providerEvent import ProviderEvent
 from app.infrastructure.payments import paystack_payment_provider
@@ -1397,3 +1369,109 @@ class TestWhereThePayerIsSentBack:
         assert requesting.call["method"] == "GET"
         assert requesting.call["json"] is None
 
+
+
+class TestInitiatingATransfer:
+    def test_it_creates_the_recipient_before_initiating_the_transfer(
+        self, provider, monkeypatch
+    ):
+        calls = []
+
+        responses = [
+            {
+                "status": True,
+                "message": "Transfer recipient created successfully",
+                "data": {"recipient_code": "RCP_recipient_123"},
+            },
+            {
+                "status": True,
+                "message": "Transfer has been queued",
+                "data": {
+                    "status": "pending",
+                    "reference": "payout_ref_1",
+                    "transfer_code": "TRF_transfer_123",
+                },
+            },
+        ]
+
+        def request(method, url, **kwargs):
+            calls.append({"method": method, "url": url, **kwargs})
+            return httpx.Response(200, json=responses[len(calls) - 1])
+
+        monkeypatch.setattr(
+            paystack_payment_provider.httpx,
+            "request",
+            request,
+        )
+
+        destination = Destination(
+            kind=DestinationKind.BANK_ACCOUNT,
+            identifier="0123456789",
+            name="Chinedu Okafor",
+            details={"bank_code": "058"},
+        )
+
+        intent = provider.initiate_transfer(
+            reference="payout_ref_1",
+            amount=an_amount("5000"),
+            destination=destination,
+        )
+
+        assert len(calls) == 2
+
+        assert calls[0]["method"] == "POST"
+        assert calls[0]["url"] == f"{BASE_URL}/transferrecipient"
+        assert calls[0]["json"] == {
+            "type": "nuban",
+            "name": "Chinedu Okafor",
+            "account_number": "0123456789",
+            "bank_code": "058",
+            "currency": "NGN",
+        }
+
+        assert calls[1]["method"] == "POST"
+        assert calls[1]["url"] == f"{BASE_URL}/transfer"
+        assert calls[1]["json"] == {
+            "source": "balance",
+            "amount": 500000,
+            "recipient": "RCP_recipient_123",
+            "reference": "payout_ref_1",
+            "currency": "NGN",
+        }
+
+        assert intent.provider_reference == "TRF_transfer_123"
+
+
+class TestMalformedTransferAnswers:
+    def test_a_recipient_answer_without_a_recipient_code_is_rejected(
+        self, provider, monkeypatch
+    ):
+        def request(method, url, **kwargs):
+            return httpx.Response(
+                200,
+                json={
+                    "status": True,
+                    "message": "Recipient created",
+                    "data": {},
+                },
+            )
+
+        monkeypatch.setattr(
+            paystack_payment_provider.httpx,
+            "request",
+            request,
+        )
+
+        destination = Destination(
+            kind=DestinationKind.BANK_ACCOUNT,
+            identifier="0123456789",
+            name="Chinedu Okafor",
+            details={"bank_code": "058"},
+        )
+
+        with pytest.raises(InvalidTransferIntentError):
+            provider.initiate_transfer(
+                reference="payout_ref_1",
+                amount=an_amount("5000"),
+                destination=destination,
+            )

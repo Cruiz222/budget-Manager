@@ -42,15 +42,18 @@ from urllib.parse import quote
 import httpx
 
 from app.domain.money.currency import Currency
+from app.domain.money.destination import Destination
 from app.domain.money.money import Money
 from app.domain.payments.exception import (
     InvalidPaymentIntentError,
+    InvalidTransferIntentError,
     InvalidProviderAnswerError,
     PayerEmailRefusedError,
     PaymentProviderError,
     PaymentProviderUnavailableError,
 )
 from app.domain.payments.paymentIntent import PaymentIntent
+from app.domain.payments.transferIntent import TransferIntent
 from app.domain.payments.paymentProvider import PaymentProvider
 from app.domain.payments.providerAnswer import ProviderAnswer
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
@@ -688,6 +691,53 @@ class PaystackPaymentProvider(PaymentProvider):
             raise PaymentProviderUnavailableError(
                 "the payment provider returned a body that is not JSON"
             ) from failure
+
+
+    def initiate_transfer(
+        self,
+        *,
+        reference: str,
+        amount: Money,
+        destination: Destination,
+    ) -> TransferIntent:
+        """Ask Paystack to initiate an external transfer."""
+        recipient_payload = {
+            "type": "nuban",
+            "name": destination.name,
+            "account_number": destination.identifier,
+            "bank_code": destination.detail("bank_code"),
+            "currency": amount.currency.value,
+        }
+
+        _, recipient_response = self._request(
+            "POST",
+            "/transferrecipient",
+            payload=recipient_payload,
+            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
+        )
+
+        recipient_data = recipient_response.get("data")
+        recipient_code = recipient_data["recipient_code"]
+
+        transfer_payload = {
+            "source": "balance",
+            "amount": _subunit(amount),
+            "recipient": recipient_code,
+            "reference": reference,
+            "currency": amount.currency.value,
+        }
+
+        _, transfer_response = self._request(
+            "POST",
+            "/transfer",
+            payload=transfer_payload,
+            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
+        )
+
+        transfer_data = transfer_response.get("data")
+        transfer_code = transfer_data["transfer_code"]
+
+        return TransferIntent(provider_reference=transfer_code)
 
 
 def _json_or_none(response: httpx.Response) -> object:

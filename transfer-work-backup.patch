@@ -1,0 +1,721 @@
+diff --git a/.gitignore b/.gitignore
+index 5c620ac..af84ae7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,5 +1,5 @@
+ # Virtual environment (recreate from requirements.txt)
+-#.venv/
++.venv/
+ 
+ # Python bytecode
+ __pycache__/
+diff --git a/app/domain/payments/exception.py b/app/domain/payments/exception.py
+index c8b46ff..24aeb50 100644
+--- a/app/domain/payments/exception.py
++++ b/app/domain/payments/exception.py
+@@ -1,230 +1,35 @@
+-"""Errors raised by the payments side of the domain.
+-
+-Deriving from ``MoneyError`` rather than from ``Exception`` continues the rule
+-``app.domain.planning.exception`` states: **a new exception belongs under the
+-existing root, or every catch site in the codebase has to be revisited.** The
+-CLI catches ``MoneyError`` once, at the top of ``main``, and turns it into
+-``error: ...`` with exit code 1; the API's handlers do the same. A payments root
+-outside that tree would mean every refusal escaped as a traceback instead.
+-
+-There is deliberately very little here, and the absence is the design. A
+-webhook that names a reference nobody has heard of, an event that arrives twice,
+-an amount that disagrees with the row - none of those is an error, because none
+-of them is a failure of anything. They are *reports* that the system handles and
+-answers with a 200, and they are modelled as values (``SettlePayment``'s result)
+-rather than as exceptions. What is left for this module is the three things that
+-genuinely cannot proceed: the provider refusing a call, the provider not being
+-askable at all, and this side refusing to make one. The first and the second were
+-a single class until a real-money audit separated them - see
+-``PaymentProviderUnavailableError``, where the argument for the split is written
+-out.
+-"""
+-
+ from app.domain.money.exception import MoneyError
+ 
+ 
+ class PaymentError(MoneyError):
+-    """Base for every rejection the payments domain makes."""
+-
++    pass
+ 
+ class PaymentProviderError(PaymentError):
+-    """The provider refused a call.
+-
+-    Raised by an adapter and never by a use case, exactly as
+-    ``NotificationChannel.send`` raises rather than returning a status - see the
+-    port's docstring, where the reasoning is the same one and is written out.
+-
+-    **A refusal, and the word is doing work that "or could not be reached" used
+-    to blur.** A provider that answers ``400`` has read the request and said no,
+-    and what is wrong is something in the request the caller can correct; that is
+-    a 400 here by falling through ``errors._grade``, and it is right. A provider
+-    that answers ``500``, or that does not answer at all, has said nothing about
+-    the request - and that is ``PaymentProviderUnavailableError`` below. The two
+-    were one class until a real-money audit, and the deposit door was the place
+-    it showed: a timeout was telling a payer their request was malformed while a
+-    collection may well have been created on the far end.
+-    """
+-
++    pass
+ 
+ class PaymentProviderUnavailableError(PaymentError):
+-    """The provider could not be asked, or answered as a broken thing.
+-
+-    **The distinction from ``PaymentProviderError`` is the whole of this class,
+-    and it is a distinction about the caller's remedy rather than about
+-    severity.** A refusal is a fact about the request: it will be refused again,
+-    and the caller has something to change. This is a fact about the *rail*: the
+-    request may be perfectly good, the same request may work in a minute, and
+-    there is nothing for the caller to correct. Telling a payer "your deposit
+-    request is unacceptable" when Paystack is down sends them to edit a form, and
+-    a client that believed the grade would not retry.
+-
+-    Raised from three places in ``PaystackPaymentProvider._request``, and they are
+-    one thing wearing three faces: a transport failure (which includes a
+-    **timeout**, and therefore includes the case where the far end is healthy and
+-    slow - so this error does *not* mean nothing happened), any ``5xx`` from the
+-    far end, and a ``200`` whose body is not JSON. A `4xx` the caller did not ask
+-    to interpret stays a ``PaymentProviderError``.
+-
+-    **Graded a 503, and the precedent is already in the table**:
+-    ``errors.UNAVAILABLE`` holds ``GoogleProviderError`` for exactly this shape -
+-    a call to an outside service that failed, on an installation configured
+-    correctly. It is not a 502: this codebase's 503 is "this installation cannot
+-    serve *this* right now", which is what a dead provider means here, and adding
+-    a second upstream-shaped grade would be a distinction no caller acts on
+-    differently.
+-
+-    **What it does not claim is that nothing was created.** A timeout on
+-    ``/transaction/initialize`` may leave a collection open. That is why the
+-    deposit route's client is expected to send its own idempotency key: a retry
+-    under the same key is the same collection rather than a second one, and
+-    ``DepositAlreadyInitiatedError`` is what makes it visible when it is.
+-    """
+-
++   pass
+ 
+ class InvalidPaymentIntentError(PaymentError):
+-    """A provider answered with something that is not a usable intent.
+-
+-    Nearly always a wrong secret key: Paystack answers ``401`` with
+-    ``{"message": "Invalid key"}`` and no ``data`` at all, so the adapter's parse
+-    is where that becomes legible rather than a ``KeyError`` three frames later.
+-    """
+-
++   pass
+ 
+ class InvalidProviderOutcomeError(PaymentError):
+-    """A set of facts about a provider event that cannot describe one.
+-
+-    The amount, the reference and the event are each checked by
+-    ``ProviderOutcome``, so an event that reaches ``SettlePayment`` is a
+-    well-formed thing whatever else is true of it.
+-    """
+-
++    pass
+ 
+ class InvalidProviderAnswerError(PaymentError):
+-    """A set of facts about a provider's answer that cannot describe one.
+-
+-    The sibling of ``InvalidProviderOutcomeError``, and it exists for the same
+-    reason one level up. An outcome is refused when the three things a provider
+-    told us cannot all be true at once; an answer is refused when the status and
+-    the outcome disagree about whether anything happened at all.
+-
+-    Nearly always an adapter bug rather than a provider's doing - a provider
+-    answers in its own vocabulary and the adapter is what translates - which is
+-    why this is a distinct name rather than reusing the outcome's error. A
+-    traceback saying "invalid provider answer" points at the lookup call; one
+-    saying "invalid provider outcome" points at the webhook parse, and the two
+-    are different methods in a different file.
+-    """
+-
++    pass
+ 
+ class PayerEmailRefusedError(PaymentError):
+-    """The address this account would be billed under is not one a provider takes.
+-
+-    Raised from two places, and the pair is the design rather than a duplication.
+-    ``app.domain.payments.payerEmail`` refuses an address that plainly cannot work
+-    *before* a request is built, and the adapter raises this same error when
+-    Paystack answers ``invalid_email_address`` - so a client is told one thing
+-    whichever caught it, and correctness never rests on this codebase's reading of
+-    the provider's rule. The local check makes the common case cheap; the provider
+-    remains the authority.
+-
+-    It is not an identity error, and deliberately not raised by ``User``. The
+-    account is a perfectly good account; what is unusable is the address, in the
+-    one role that needs a domain a provider will bill. That asymmetry is why the
+-    rule could not simply be tightened at signup - it would refuse people this
+-    system has no complaint about.
+-
+-    Graded a 400 by falling through ``errors._grade``, like every other refusal
+-    this domain makes.
+-    """
+-
++    pass
+ 
+ class PayerEmailMissingError(PaymentError):
+-    """The account holds no address, so there is nothing to be billed under.
+-
+-    **Not a refusal about a *value*, which is why it is not
+-    ``PayerEmailRefusedError``.** That one says the address an account holds is
+-    not one a provider will take; this one says there is no address at all. The
+-    two read alike from a distance and their sentences are not interchangeable:
+-    one person has something to correct, the other has a field to fill in, and an
+-    error name that conflated them would make the API tell half its callers the
+-    wrong thing.
+-
+-    **It exists because an address became optional on an account**, which is what
+-    lets somebody sign up with a phone number alone. Such an account is complete
+-    and functional - a wallet, a password, a session, a number it can be reached
+-    at - right up to the point it has to be *billed*, and a provider is handed the
+-    payer's address. So this is not the account being half-built; it is one
+-    operation needing one field that another does not.
+-
+-    The remedy is named in the sentence rather than left to be discovered, and it
+-    is the email-change request - which for an account holding no address *sets*
+-    one rather than moving one, and is the only route by which such an account
+-    becomes able to take money. See ``RequestEmailChange``.
+-
+-    A 400 by falling through ``errors._grade``, like every other refusal this
+-    domain makes: what is wrong is the account the caller is asking on behalf of,
+-    and it is theirs to change.
+-    """
+-
++    pass
+ 
+ class CurrencyNotCollectableError(PaymentError):
+-    """This wallet holds a currency the payment rail cannot collect in.
+-
+-    **The first refusal here that is ours rather than the provider's, and the
+-    distinction is the whole of why it is a name instead of a
+-    ``PaymentProviderError``.** That one reports something the far end did; the
+-    other names in this module are facts about the account this side holds. This
+-    one is this side reading a fact the *rail* supplied - ``supported_currencies``
+-    - and refusing on it, so nothing has been sent and no payer has been anywhere.
+-    The remedy belongs to whoever holds the wallet rather than to whoever answers
+-    the phone at Paystack.
+-
+-    **It belongs to the payments tree rather than beside ``WalletClosedError``**,
+-    which is the other refusal shaped like it. A closed wallet is the money
+-    domain's own statement about a wallet; this is a statement about the meeting
+-    of a wallet and a *rail*, and the money domain has no opinion about what a
+-    rail can collect - it holds every currency ``Currency`` names, and after
+-    decision 267 that is ``NGN`` and ``USD``. Filing this beside
+-    ``CurrencyMismatchError`` would say the domain knew, and it does not. See
+-    ``PaymentProvider.supported_currencies``.
+-
+-    **Since the trim, ``USD`` is the only currency that can reach here**, and that
+-    is what makes this a *live* refusal rather than a defensive one: the currency
+-    list no longer contains anything the rail's account has never heard of, so the
+-    one remaining case is the one that was always the point - a currency this
+-    system holds happily and this account cannot collect.
+-
+-    **A 409, and the two neighbours it is worth ruling out.** Not a 400: the
+-    request is well formed, the wallet is the caller's, and there is nothing in
+-    it to correct - telling a client to fix a good request is the mistake
+-    ``errors`` already argues against for a wallet that does not exist. Not a
+-    503: this installation serves deposits perfectly well, and a client that read
+-    one here would take the whole installation offline over a single wallet. 409
+-    because the wallet exists and *its own state* refuses this, which is exactly
+-    the row ``WalletClosedError`` sits on.
+-
+-    **And it is deliberately not a refusal at wallet creation.** A wallet in a
+-    currency this rail cannot collect is still a wallet - it can be funded
+-    directly, it can hold pots and plans, and a second rail or an account enabled
+-    for a second currency changes nothing about it. What cannot happen is a
+-    *collection* for it, which is a fact about one door rather than about the
+-    wallet, so it is refused at that door.
+-    """
+-
++    pass
+ 
+ class DepositAlreadyInitiatedError(PaymentError):
+-    """A deposit is already open under this idempotency key.
+-
+-    Raised rather than answered with the original, and that is a decision worth
+-    stating because the opposite looks friendlier. What the client would want
+-    back is the ``authorization_url`` from the first call - but nothing stores
+-    it, and the reason nothing stores it is that it would be a link the provider
+-    has very likely already retired: a checkout URL is single-use, so replaying
+-    one that has been paid leaves the client holding a page that will not take
+-    money. The honest answer is that a collection is already open under this key,
+-    which is a fact the client can act on by using a different key or by
+-    reconciling against their own records.
++   pass
+ 
+-    The refusal is a 409 like every other "this exists and its state refuses
+-    you", and like them it names the row rather than blaming the request.
+-    """
++class InvalidTransferIntentError(PaymentError):
++    pass   
+\ No newline at end of file
+diff --git a/app/domain/payments/paymentProvider.py b/app/domain/payments/paymentProvider.py
+index ff42afe..8bee62b 100644
+--- a/app/domain/payments/paymentProvider.py
++++ b/app/domain/payments/paymentProvider.py
+@@ -4,6 +4,8 @@ from app.domain.money.currency import Currency
+ from app.domain.money.money import Money
+ from app.domain.payments.paymentIntent import PaymentIntent
+ from app.domain.payments.providerAnswer import ProviderAnswer
++from app.domain.money.destination import Destination
++from app.domain.payments.transferIntent import TransferIntent
+ 
+ 
+ class PaymentProvider(ABC):
+@@ -205,3 +207,19 @@ class PaymentProvider(ABC):
+         here where an implementer will read it.
+         """
+         pass
++
++
++class PaymentProvider(ABC):
++
++    # Other methods...
++
++    @abstractmethod
++    def initiate_transfer(
++        self,
++        *,
++        reference: str,
++        amount: Money,
++        destination: Destination,
++    ) -> TransferIntent:
++        """Ask the provider to send money."""
++        pass
+\ No newline at end of file
+diff --git a/app/infrastructure/payments/paystack_payment_provider.py b/app/infrastructure/payments/paystack_payment_provider.py
+index 8f49bbd..8156438 100644
+--- a/app/infrastructure/payments/paystack_payment_provider.py
++++ b/app/infrastructure/payments/paystack_payment_provider.py
+@@ -1,38 +1,3 @@
+-"""Paystack: the one adapter that talks to a payment provider.
+-
+-The interesting thing about this module is how little of it is money. Opening a
+-collection is one HTTP call with a JSON body and a bearer token; asking what
+-became of one is the same call with a different method and a reference in the
+-path; proving a webhook is an HMAC over the bytes that arrived. None of the three
+-is complicated, and all three are things the rest of the codebase must never
+-learn - which is the whole reason this file exists behind a port rather than
+-being written at the call site.
+-
+-**``httpx`` is the only third-party dependency the calls need, and the signature
+-needs none.** ``hmac`` and ``hashlib`` are standard library, so verification
+-could have been written without adding a package - and it is worth noticing that
+-the *inbound* direction, the one that decides whether money is credited, is the
+-one with no dependency at all.
+-
+-**Four methods, one transport.** The two that call out share ``_request``, so
+-the failure handling, the bearer token and the timeout are written once - and
+-each of them names the statuses it will interpret, which is the one thing about a
+-call that only its caller knows. See ``_request``. The other two cost nothing:
+-proving a webhook is standard-library HMAC over bytes, and answering what this
+-account will collect is a field this class was constructed with.
+-
+-**This module logs, and it is the first in ``app/`` that does.** A real deposit
+-leaves a trail at the far end - a transaction in the Paystack dashboard with a
+-reference on it - and until this, nothing on this side produced a line an
+-operator could put beside it. The rule is narrow on purpose: **the reference and
+-the outcome, never the payload and never the payer.** Payloads are a third
+-party's text (see ``_request``), and the payer's address is the one field of
+-theirs this system holds in the clear. Structured logging, a level policy and
+-somewhere to ship these lines are checklist item i17 and remain open; what is
+-here is the front edge of it, configures nothing, and inherits whatever the
+-process configured - uvicorn in a deployment, the root logger in a test.
+-"""
+-
+ import hashlib
+ import hmac
+ import logging
+@@ -40,7 +5,7 @@ from decimal import Decimal
+ from urllib.parse import quote
+ 
+ import httpx
+-
++from app.domain.payments.transferIntent import TransferIntent
+ from app.domain.money.currency import Currency
+ from app.domain.money.money import Money
+ from app.domain.payments.exception import (
+@@ -56,6 +21,7 @@ from app.domain.payments.providerAnswer import ProviderAnswer
+ from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
+ from app.domain.payments.providerEvent import ProviderEvent
+ from app.domain.payments.providerOutcome import ProviderOutcome
++from app.domain.money.destination import Destination
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -194,21 +160,50 @@ SUPPORTED_CURRENCIES: frozenset[Currency] = frozenset({Currency.NGN})
+ 
+ 
+ class PaystackPaymentProvider(PaymentProvider):
+-    """The Paystack implementation of the payment port.
+-
+-    Raises ``PaymentProviderError`` on every failure rather than returning a
+-    status, because that is the contract the port states: the caller records the
+-    exception and refuses the request, so the exception *is* the error report.
+-    There is no partially-successful initialization to model - a collection was
+-    either opened or it was not.
+-
+-    Holds a secret key and where a payer comes back to, and nothing else. No
+-    client, no connection, no session: each call opens what it needs and closes it
+-    again, the same choice ``SmtpNotificationChannel`` makes and for the same
+-    reason - a long-lived connection is state that outlives the request, and state
+-    that outlives the request is what has to be thought about at shutdown. The
+-    cost is a handshake per call, and this endpoint is human-paced.
+-    """
++    def initiate_transfer(
++        self,
++        *,
++        reference: str,
++        amount: Money,
++        destination: Destination,
++    ) -> TransferIntent:
++        recipient_payload = {
++            "type": "nuban",
++            "name": destination.name,
++            "account_number": destination.identifier,
++            "bank_code": destination.detail("bank_code"),
++            "currency": amount.currency.value,
++        }
++
++        _, recipient_response = self._request(
++            "POST",
++            "/transferrecipient",
++            payload=recipient_payload,
++            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
++        )
++
++        recipient_data = recipient_response.get("data")
++        recipient_code = recipient_data["recipient_code"]
++
++        transfer_payload = {
++            "source": "balance",
++            "amount": _subunit(amount),
++            "recipient": recipient_code,
++            "reference": reference,
++            "currency": amount.currency.value,
++        }
++
++        _, transfer_response = self._request(
++            "POST",
++            "/transfer",
++            payload=transfer_payload,
++            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
++        )
++
++        transfer_data = transfer_response.get("data")
++        transfer_code = transfer_data["transfer_code"]
++
++        return TransferIntent(provider_reference=transfer_code)
+ 
+     def __init__(
+         self,
+@@ -220,28 +215,10 @@ class PaystackPaymentProvider(PaymentProvider):
+     ):
+         self._secret_key = secret_key
+         self._timeout = timeout
+-        # The currencies this *account* is enabled for, which is why it is a
+-        # parameter and not just the constant above. ``timeout`` is the precedent:
+-        # a per-deployment fact that has a sane default and that a test needs to
+-        # vary. Varying this one is how a test proves the label follows the amount
+-        # rather than a constant - which is the bug this file used to have, and it
+-        # is not provable against a provider that only ever collects one currency.
+         self._currencies = currencies
+-        # Where the payer is sent once they have paid, or ``None`` for nowhere in
+-        # particular - which is what every installation did before the setting
+-        # existed. ``currencies`` and ``timeout`` are the precedent: a
+-        # per-deployment fact, keyword-only, with a default that keeps every
+-        # existing construction working.
+-        #
+-        # **It is an absolute address rather than a path**, because Paystack is
+-        # the one that will send a browser to it: a relative path would be
+-        # resolved against *their* origin, and the payer would land on
+-        # paystack.co. So the absolute form is not a preference a caller may get
+-        # wrong, and it is why this is a wiring concern rather than one this file
+-        # could fix up - the composition root is the only frame that knows the
+-        # public origin, and this parameter is how that fact arrives.
+         self._callback_url = callback_url
+ 
++
+     def supported_currencies(self) -> frozenset[Currency]:
+         """What this account will collect in. See the port for the contract.
+ 
+@@ -256,62 +233,7 @@ class PaystackPaymentProvider(PaymentProvider):
+     def initialize_deposit(
+         self, *, reference: str, amount: Money, email: str
+     ) -> PaymentIntent:
+-        """Open a collection, and return where the payer is sent.
+-
+-        **The amount goes over the wire in the subunit**, which is the one piece
+-        of arithmetic in this file and the one most worth stating. Paystack takes
+-        an integer number of kobo, not a decimal number of naira, and a factor of
+-        a hundred applied in the wrong direction is a deposit of 1 NGN where
+-        10,000 was meant. ``Money`` guarantees at most two decimal places and
+-        stores a ``Decimal``, so the multiplication is exact and the conversion to
+-        ``int`` cannot round - there is no float anywhere on this path, which is
+-        the same reason ``Money`` refuses them.
+-
+-        **Both refusals are interpreted here rather than reported**, and both are
+-        cases where the status alone is not the answer. A ``401``/``403`` means the
+-        key is wrong, which only this frame can say because only this frame knows a
+-        collection was being opened; a ``400`` carrying
+-        ``INVALID_PAYER_EMAIL_CODE`` means the address will never be billed, which
+-        earns a better sentence than "the provider refused the call". Everything
+-        else a provider refuses leaves through ``_refusal_sentence`` with its own
+-        words attached. That a 400 is *allowed* to reach this method at all is the
+-        ``answers`` argument in one line: a refusal is the whole of what is
+-        knowable to the transport, and not the whole of what is knowable here.
+-
+-        **The currency sent is the amount's own, and that is a repair rather than a
+-        detail.** This method used to send ``_subunit(amount)`` beside a constant
+-        ``"currency"``, which is two decisions about one payload: the number came
+-        from the ``Money`` and the label came from a module constant, and nothing
+-        connected them. For a wallet holding USD the result was a collection for
+-        one hundred *naira* filed against a ledger row of one hundred *dollars* -
+-        and because ``SettlePayment`` compares the two, the row could never
+-        settle: the payer's money was taken and nothing was ever credited. Sending
+-        ``amount.currency.value`` makes the disagreement unrepresentable, because
+-        there is now one object deciding both.
+-
+-        **A payer is sent back somewhere, when this installation has said where.**
+-        ``callback_url`` is added to the payload only when one was given at
+-        construction, and the conditional is the point rather than a guard: an
+-        installation with no public address must send byte-for-byte the payload it
+-        sent before this field existed, because ``"callback_url": null`` is a third
+-        thing - not "nowhere in particular" but "here is a field whose value is
+-        nothing" - and a provider is free to refuse that for reasons it will not
+-        explain. So the absent case is an absent key.
+-
+-        **What this buys is a browser, not a settlement.** Paystack sends the payer
+-        to this address once they have finished paying; whether the deposit is
+-        credited is decided by ``/webhooks/paystack`` and by nothing else, so a
+-        person who lands back here may well see their balance unchanged for a few
+-        seconds. That is the honest reading of the return and it is why the setting
+-        is optional: an installation without it loses a courtesy, not a payment.
+-
+-        **The check above the request is a backstop, not the door.** The door is
+-        ``InitiateDeposit``, which asks ``supported_currencies`` and refuses before
+-        a payer is sent anywhere - and that is the refusal a client sees. This one
+-        is unreachable from that path, and it exists so that a caller which skips
+-        the door cannot relabel a collection silently, which is precisely how the
+-        bug above survived: no single frame was wrong, and the two halves were.
+-        """
++        
+         if amount.currency not in self._currencies:
+             raise PaymentProviderError(
+                 f"this account is not enabled to collect {amount.currency.value}; "
+@@ -850,14 +772,7 @@ def _currency_of(data: dict) -> Currency:
+ 
+ 
+ def _currency_names(currencies: frozenset[Currency]) -> str:
+-    """A set of currencies as a readable list, for a sentence a person reads.
+-
+-    Sorted, and that is the whole of why it is a function rather than an f-string
+-    at the raise site. A ``frozenset`` has no order, so a message built by
+-    iterating one names the same currencies in a different order on different
+-    runs - and a sentence that changes while nothing has changed is one a reader
+-    learns to distrust, which is the last thing a refusal wants. Sorted by the
+-    currency's own code rather than by insertion, so it does not depend on how
+-    the set was built either.
+-    """
++    
+     return ", ".join(sorted(currency.value for currency in currencies))
++
++
+diff --git a/tests/infrastructure/payments/test_paystack_payment_provider.py b/tests/infrastructure/payments/test_paystack_payment_provider.py
+index 69c65c6..0b2118f 100644
+--- a/tests/infrastructure/payments/test_paystack_payment_provider.py
++++ b/tests/infrastructure/payments/test_paystack_payment_provider.py
+@@ -1,35 +1,6 @@
+-"""The Paystack adapter: two calls out, and one thing checked coming in.
+-
+-Two halves, and they are tested differently because they *are* different. The
+-outbound half is JSON over HTTP and is tested against a recording double, the way
+-``SmtpNotificationChannel`` is - what matters is not that HTTP works but that the
+-right method, the right URL, the right bearer token and the right *number* go
+-out. Verifying is pure HMAC over bytes with no I/O anywhere in it, so it is tested
+-against the real thing with nothing replaced at all.
+-
+-**The outbound half is two methods and one double, and the double knows it.**
+-Opening a collection and looking one up share ``_request``, so they share the
+-recorder too - which is why it records the verb. The difference between the two
+-calls is mostly *that* difference: the same host, the same bearer token, the same
+-JSON handling, and a POST that creates a charge where a GET asks about one. A
+-double built for the first would have let the second leave as a POST and never
+-noticed.
+-
+-**The recording double is here rather than in ``tests/conftest.py``**, and that
+-is the opposite of where ``FakePaymentProvider`` lives. The distinction is who
+-needs it: the fake provider is used by the API suite, which must never open a
+-socket, and this double is used by one file that is specifically about what goes
+-on the wire. Putting it in the shared place would invite a second module to
+-depend on the shape of an HTTP call it does not make.
+-
+-The one thing neither half of this file does is reach the network. There is no
+-skip marker, no ``pytest.mark.network``, and no test that only runs when a key is
+-set - which is the property ``requirements.txt``'s comment claims for the
+-inbound half and the injection seam claims for the outbound one.
+-"""
+-
+ from decimal import Decimal
+-
++from app.domain.money.destination import Destination
++from app.domain.money.destinationKind import DestinationKind
+ import httpx
+ import pytest
+ 
+@@ -62,10 +33,7 @@ USD = Currency.USD
+ #: ``TEST_PAYSTACK_SECRET`` so the two are recognisable as a pair.
+ OTHER_SECRET = "sk_test_" + "f" * 32
+ 
+-#: What Paystack actually answers a successful initialize with, trimmed to the
+-#: two fields this adapter reads and keeping their real spellings. Trimmed rather
+-#: than invented: a double that answered with ``authorizationUrl`` would let a
+-#: typo in the adapter pass, which is the one thing a recorded response is for.
++
+ A_TRANSACTION = {
+     "status": True,
+     "message": "Authorization URL created",
+@@ -76,6 +44,25 @@ A_TRANSACTION = {
+     },
+ }
+ 
++A_TRANSFER_RECIPIENT = {
++    "status": True,
++    "message": "Transfer recipient created successfully",
++    "data": {
++        "recipient_code": "RCP_recipient_123",
++    },
++}
++
++
++A_TRANSFER = {
++    "status": True,
++    "message": "Transfer has been queued",
++    "data": {
++        "status": "pending",
++        "reference": "payout_ref_1",
++        "transfer_code": "TRF_transfer_123",
++    },
++}
++
+ 
+ def a_charge(status: str, amount: int = 500000, currency: Currency = NGN) -> dict:
+     """What ``/transaction/verify/:reference`` answers, in Paystack's own words.
+@@ -136,12 +123,17 @@ class RecordingRequest:
+     def __init__(self):
+         self.calls: list[dict] = []
+         self.response = httpx.Response(200, json=A_TRANSACTION)
++        self.responses: list[httpx.Response] = []
+         self.raises: Exception | None = None
+ 
+     def __call__(self, method, url, **kwargs):
+         self.calls.append({"method": method, "url": url, **kwargs})
+         if self.raises is not None:
+             raise self.raises
++
++        if self.responses:
++            return self.responses.pop(0)
++
+         return self.response
+ 
+     @property
+@@ -178,17 +170,17 @@ def provider():
+ def an_amount(text) -> Money:
+     return Money(Decimal(text), NGN)
+ 
++def a_bank_destination() -> Destination:
++    return Destination(
++        kind=DestinationKind.BANK_ACCOUNT,
++        identifier="0123456789",
++        name="Chinedu Okafor",
++        details={"bank_code": "058"},
++    )    
++
+ 
+ class TestOpeningACollection:
+     def test_it_posts_to_the_initialize_endpoint(self, provider, requesting):
+-        """**The verb as well as the URL, now that one double records both.**
+-
+-        Opening a collection is a POST because it *creates* a charge; the lookup
+-        below is a GET to the same host with the same token because it asks about
+-        one. Asserting only the URL would leave the two calls distinguishable by
+-        nothing this file can see, and a lookup sent as a POST would be a second
+-        charge rather than a question.
+-        """
+         provider.initialize_deposit(
+             reference="ps_ref_1", amount=an_amount("5000"), email="payer@localhost"
+         )
+@@ -196,6 +188,18 @@ class TestOpeningACollection:
+         assert requesting.call["method"] == "POST"
+         assert requesting.call["url"] == f"{BASE_URL}/transaction/initialize"
+ 
++
++class TestInitiatingATransfer:
++    def test_it_creates_a_bank_recipient_first(self, provider, requesting):
++        provider.initiate_transfer(
++            reference="payout_ref_1",
++            amount=an_amount("5000"),
++            destination=a_bank_destination(),
++        )
++
++        assert requesting.calls[0]["method"] == "POST"
++        assert requesting.calls[0]["url"] == f"{BASE_URL}/transferrecipient"
++
+     def test_it_authenticates_with_the_secret_key_as_a_bearer_token(
+         self, provider, requesting
+     ):
+@@ -1397,3 +1401,46 @@ class TestWhereThePayerIsSentBack:
+         assert requesting.call["method"] == "GET"
+         assert requesting.call["json"] is None
+ 
++
++class TestInitiatingATransfer:
++    def test_it_creates_the_recipient_before_initiating_the_transfer(
++        self, provider, requesting
++    ):
++        requesting.responses = [
++            httpx.Response(200, json=A_TRANSFER_RECIPIENT),
++            httpx.Response(200, json=A_TRANSFER),
++        ]
++
++        intent = provider.initiate_transfer(
++            reference="payout_ref_1",
++            amount=an_amount("5000"),
++            destination=a_bank_destination(),
++        )
++
++        assert len(requesting.calls) == 2
++
++        recipient_call = requesting.calls[0]
++        transfer_call = requesting.calls[1]
++
++        assert recipient_call["method"] == "POST"
++        assert recipient_call["url"] == f"{BASE_URL}/transferrecipient"
++        assert recipient_call["json"] == {
++            "type": "nuban",
++            "name": "Chinedu Okafor",
++            "account_number": "0123456789",
++            "bank_code": "058",
++            "currency": "NGN",
++        }
++
++        assert transfer_call["method"] == "POST"
++        assert transfer_call["url"] == f"{BASE_URL}/transfer"
++        assert transfer_call["json"] == {
++            "source": "balance",
++            "amount": 500000,
++            "recipient": "RCP_recipient_123",
++            "reference": "payout_ref_1",
++            "currency": "NGN",
++        }
++
++        assert intent.provider_reference == "TRF_transfer_123"        
++
