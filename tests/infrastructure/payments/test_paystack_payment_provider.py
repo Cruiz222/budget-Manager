@@ -1475,3 +1475,48 @@ class TestMalformedTransferAnswers:
                 amount=an_amount("5000"),
                 destination=destination,
             )
+
+    
+    def test_a_transfer_answer_without_a_transfer_code_is_rejected(
+        self, provider, monkeypatch
+    ):
+        responses = [
+            {
+                "status": True,
+                "message": "Recipient created",
+                "data": {"recipient_code": "RCP_recipient_123"},
+            },
+            {
+                "status": True,
+                "message": "Transfer queued",
+                "data": {},
+            },
+        ]
+        call_count = 0
+
+        def request(method, url, **kwargs):
+            nonlocal call_count
+
+            response = responses[call_count]
+            call_count += 1
+            return httpx.Response(200, json=response)
+
+        monkeypatch.setattr(
+            paystack_payment_provider.httpx,
+            "request",
+            request,
+        )
+
+        destination = Destination(
+            kind=DestinationKind.BANK_ACCOUNT,
+            identifier="0123456789",
+            name="Chinedu Okafor",
+            details={"bank_code": "058"},
+        )
+
+        with pytest.raises(InvalidTransferIntentError):
+            provider.initiate_transfer(
+                reference="payout_ref_1",
+                amount=an_amount("5000"),
+                destination=destination,
+            )

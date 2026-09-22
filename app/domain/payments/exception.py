@@ -9,58 +9,10 @@ class InvalidTransferIntentError(PaymentError):
     pass
 
 class PaymentProviderError(PaymentError):
-    """The provider refused a call.
-
-    Raised by an adapter and never by a use case, exactly as
-    ``NotificationChannel.send`` raises rather than returning a status - see the
-    port's docstring, where the reasoning is the same one and is written out.
-
-    **A refusal, and the word is doing work that "or could not be reached" used
-    to blur.** A provider that answers ``400`` has read the request and said no,
-    and what is wrong is something in the request the caller can correct; that is
-    a 400 here by falling through ``errors._grade``, and it is right. A provider
-    that answers ``500``, or that does not answer at all, has said nothing about
-    the request - and that is ``PaymentProviderUnavailableError`` below. The two
-    were one class until a real-money audit, and the deposit door was the place
-    it showed: a timeout was telling a payer their request was malformed while a
-    collection may well have been created on the far end.
-    """
-
+    pass
 
 class PaymentProviderUnavailableError(PaymentError):
-    """The provider could not be asked, or answered as a broken thing.
-
-    **The distinction from ``PaymentProviderError`` is the whole of this class,
-    and it is a distinction about the caller's remedy rather than about
-    severity.** A refusal is a fact about the request: it will be refused again,
-    and the caller has something to change. This is a fact about the *rail*: the
-    request may be perfectly good, the same request may work in a minute, and
-    there is nothing for the caller to correct. Telling a payer "your deposit
-    request is unacceptable" when Paystack is down sends them to edit a form, and
-    a client that believed the grade would not retry.
-
-    Raised from three places in ``PaystackPaymentProvider._request``, and they are
-    one thing wearing three faces: a transport failure (which includes a
-    **timeout**, and therefore includes the case where the far end is healthy and
-    slow - so this error does *not* mean nothing happened), any ``5xx`` from the
-    far end, and a ``200`` whose body is not JSON. A `4xx` the caller did not ask
-    to interpret stays a ``PaymentProviderError``.
-
-    **Graded a 503, and the precedent is already in the table**:
-    ``errors.UNAVAILABLE`` holds ``GoogleProviderError`` for exactly this shape -
-    a call to an outside service that failed, on an installation configured
-    correctly. It is not a 502: this codebase's 503 is "this installation cannot
-    serve *this* right now", which is what a dead provider means here, and adding
-    a second upstream-shaped grade would be a distinction no caller acts on
-    differently.
-
-    **What it does not claim is that nothing was created.** A timeout on
-    ``/transaction/initialize`` may leave a collection open. That is why the
-    deposit route's client is expected to send its own idempotency key: a retry
-    under the same key is the same collection rather than a second one, and
-    ``DepositAlreadyInitiatedError`` is what makes it visible when it is.
-    """
-
+    pass
 
 class InvalidPaymentIntentError(PaymentError):
     """A provider answered with something that is not a usable intent.
@@ -194,18 +146,7 @@ class CurrencyNotCollectableError(PaymentError):
 
 
 class DepositAlreadyInitiatedError(PaymentError):
-    """A deposit is already open under this idempotency key.
+    pass
 
-    Raised rather than answered with the original, and that is a decision worth
-    stating because the opposite looks friendlier. What the client would want
-    back is the ``authorization_url`` from the first call - but nothing stores
-    it, and the reason nothing stores it is that it would be a link the provider
-    has very likely already retired: a checkout URL is single-use, so replaying
-    one that has been paid leaves the client holding a page that will not take
-    money. The honest answer is that a collection is already open under this key,
-    which is a fact the client can act on by using a different key or by
-    reconciling against their own records.
-
-    The refusal is a 409 like every other "this exists and its state refuses
-    you", and like them it names the row rather than blaming the request.
-    """
+class InvalidVirtualAccountError(PaymentError):
+    pass

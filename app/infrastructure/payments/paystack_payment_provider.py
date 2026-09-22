@@ -1,38 +1,3 @@
-"""Paystack: the one adapter that talks to a payment provider.
-
-The interesting thing about this module is how little of it is money. Opening a
-collection is one HTTP call with a JSON body and a bearer token; asking what
-became of one is the same call with a different method and a reference in the
-path; proving a webhook is an HMAC over the bytes that arrived. None of the three
-is complicated, and all three are things the rest of the codebase must never
-learn - which is the whole reason this file exists behind a port rather than
-being written at the call site.
-
-**``httpx`` is the only third-party dependency the calls need, and the signature
-needs none.** ``hmac`` and ``hashlib`` are standard library, so verification
-could have been written without adding a package - and it is worth noticing that
-the *inbound* direction, the one that decides whether money is credited, is the
-one with no dependency at all.
-
-**Four methods, one transport.** The two that call out share ``_request``, so
-the failure handling, the bearer token and the timeout are written once - and
-each of them names the statuses it will interpret, which is the one thing about a
-call that only its caller knows. See ``_request``. The other two cost nothing:
-proving a webhook is standard-library HMAC over bytes, and answering what this
-account will collect is a field this class was constructed with.
-
-**This module logs, and it is the first in ``app/`` that does.** A real deposit
-leaves a trail at the far end - a transaction in the Paystack dashboard with a
-reference on it - and until this, nothing on this side produced a line an
-operator could put beside it. The rule is narrow on purpose: **the reference and
-the outcome, never the payload and never the payer.** Payloads are a third
-party's text (see ``_request``), and the payer's address is the one field of
-theirs this system holds in the clear. Structured logging, a level policy and
-somewhere to ship these lines are checklist item i17 and remain open; what is
-here is the front edge of it, configures nothing, and inherits whatever the
-process configured - uvicorn in a deployment, the root logger in a test.
-"""
-
 import hashlib
 import hmac
 import logging
@@ -40,25 +5,24 @@ from decimal import Decimal
 from urllib.parse import quote
 
 import httpx
-
+from app.domain.payments.transferIntent import TransferIntent
 from app.domain.money.currency import Currency
-from app.domain.money.destination import Destination
 from app.domain.money.money import Money
 from app.domain.payments.exception import (
     InvalidPaymentIntentError,
-    InvalidTransferIntentError,
     InvalidProviderAnswerError,
     PayerEmailRefusedError,
     PaymentProviderError,
     PaymentProviderUnavailableError,
+    InvalidTransferIntentError
 )
 from app.domain.payments.paymentIntent import PaymentIntent
-from app.domain.payments.transferIntent import TransferIntent
 from app.domain.payments.paymentProvider import PaymentProvider
 from app.domain.payments.providerAnswer import ProviderAnswer
 from app.domain.payments.providerAnswerStatus import ProviderAnswerStatus
 from app.domain.payments.providerEvent import ProviderEvent
 from app.domain.payments.providerOutcome import ProviderOutcome
+from app.domain.money.destination import Destination
 
 logger = logging.getLogger(__name__)
 
@@ -197,21 +161,67 @@ SUPPORTED_CURRENCIES: frozenset[Currency] = frozenset({Currency.NGN})
 
 
 class PaystackPaymentProvider(PaymentProvider):
-    """The Paystack implementation of the payment port.
+    def initiate_transfer(
+        self,
+        *,
+        reference: str,
+        amount: Money,
+        destination: Destination,
+    ) -> TransferIntent:
+        recipient_payload = {
+            "type": "nuban",
+            "name": destination.name,
+            "account_number": destination.identifier,
+            "bank_code": destination.detail("bank_code"),
+            "currency": amount.currency.value,
+        }
 
-    Raises ``PaymentProviderError`` on every failure rather than returning a
-    status, because that is the contract the port states: the caller records the
-    exception and refuses the request, so the exception *is* the error report.
-    There is no partially-successful initialization to model - a collection was
-    either opened or it was not.
+        _, recipient_response = self._request(
+            "POST",
+            "/transferrecipient",
+            payload=recipient_payload,
+            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
+        )
 
-    Holds a secret key and where a payer comes back to, and nothing else. No
-    client, no connection, no session: each call opens what it needs and closes it
-    again, the same choice ``SmtpNotificationChannel`` makes and for the same
-    reason - a long-lived connection is state that outlives the request, and state
-    that outlives the request is what has to be thought about at shutdown. The
-    cost is a handshake per call, and this endpoint is human-paced.
-    """
+        recipient_data = recipient_response.get("data")
+        if not isinstance(recipient_data, dict):
+            raise InvalidTransferIntentError(
+                "the payment provider return no transfer recipient")
+        
+        recipient_code = recipient_data.get("recipient_code")
+        if not isinstance(recipient_code, str) or recipient_code.strip() == " ":
+            raise InvalidTransferIntentError(
+                "the payment provider returned a transfer recipient without a recipient code"
+            )
+
+        transfer_payload = {
+            "source": "balance",
+            "amount": _subunit(amount),
+            "recipient": recipient_code,
+            "reference": reference,
+            "currency": amount.currency.value,
+        }
+
+        _, transfer_response = self._request(
+            "POST",
+            "/transfer",
+            payload=transfer_payload,
+            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
+        )
+
+        transfer_data = transfer_response.get("data")
+        if not isinstance(transfer_data, dict):
+            raise InvalidTransferIntentError(
+        "the payment provider returned no transfer"
+    )
+
+        transfer_code = transfer_data.get("transfer_code")
+        if not isinstance(transfer_code, str) or transfer_code.strip() == "":
+            raise InvalidTransferIntentError(
+        "the payment provider returned a transfer without a transfer code"
+    )
+
+        return TransferIntent(provider_reference=transfer_code)
 
     def __init__(
         self,
@@ -223,26 +233,7 @@ class PaystackPaymentProvider(PaymentProvider):
     ):
         self._secret_key = secret_key
         self._timeout = timeout
-        # The currencies this *account* is enabled for, which is why it is a
-        # parameter and not just the constant above. ``timeout`` is the precedent:
-        # a per-deployment fact that has a sane default and that a test needs to
-        # vary. Varying this one is how a test proves the label follows the amount
-        # rather than a constant - which is the bug this file used to have, and it
-        # is not provable against a provider that only ever collects one currency.
         self._currencies = currencies
-        # Where the payer is sent once they have paid, or ``None`` for nowhere in
-        # particular - which is what every installation did before the setting
-        # existed. ``currencies`` and ``timeout`` are the precedent: a
-        # per-deployment fact, keyword-only, with a default that keeps every
-        # existing construction working.
-        #
-        # **It is an absolute address rather than a path**, because Paystack is
-        # the one that will send a browser to it: a relative path would be
-        # resolved against *their* origin, and the payer would land on
-        # paystack.co. So the absolute form is not a preference a caller may get
-        # wrong, and it is why this is a wiring concern rather than one this file
-        # could fix up - the composition root is the only frame that knows the
-        # public origin, and this parameter is how that fact arrives.
         self._callback_url = callback_url
 
     def supported_currencies(self) -> frozenset[Currency]:
@@ -259,62 +250,7 @@ class PaystackPaymentProvider(PaymentProvider):
     def initialize_deposit(
         self, *, reference: str, amount: Money, email: str
     ) -> PaymentIntent:
-        """Open a collection, and return where the payer is sent.
-
-        **The amount goes over the wire in the subunit**, which is the one piece
-        of arithmetic in this file and the one most worth stating. Paystack takes
-        an integer number of kobo, not a decimal number of naira, and a factor of
-        a hundred applied in the wrong direction is a deposit of 1 NGN where
-        10,000 was meant. ``Money`` guarantees at most two decimal places and
-        stores a ``Decimal``, so the multiplication is exact and the conversion to
-        ``int`` cannot round - there is no float anywhere on this path, which is
-        the same reason ``Money`` refuses them.
-
-        **Both refusals are interpreted here rather than reported**, and both are
-        cases where the status alone is not the answer. A ``401``/``403`` means the
-        key is wrong, which only this frame can say because only this frame knows a
-        collection was being opened; a ``400`` carrying
-        ``INVALID_PAYER_EMAIL_CODE`` means the address will never be billed, which
-        earns a better sentence than "the provider refused the call". Everything
-        else a provider refuses leaves through ``_refusal_sentence`` with its own
-        words attached. That a 400 is *allowed* to reach this method at all is the
-        ``answers`` argument in one line: a refusal is the whole of what is
-        knowable to the transport, and not the whole of what is knowable here.
-
-        **The currency sent is the amount's own, and that is a repair rather than a
-        detail.** This method used to send ``_subunit(amount)`` beside a constant
-        ``"currency"``, which is two decisions about one payload: the number came
-        from the ``Money`` and the label came from a module constant, and nothing
-        connected them. For a wallet holding USD the result was a collection for
-        one hundred *naira* filed against a ledger row of one hundred *dollars* -
-        and because ``SettlePayment`` compares the two, the row could never
-        settle: the payer's money was taken and nothing was ever credited. Sending
-        ``amount.currency.value`` makes the disagreement unrepresentable, because
-        there is now one object deciding both.
-
-        **A payer is sent back somewhere, when this installation has said where.**
-        ``callback_url`` is added to the payload only when one was given at
-        construction, and the conditional is the point rather than a guard: an
-        installation with no public address must send byte-for-byte the payload it
-        sent before this field existed, because ``"callback_url": null`` is a third
-        thing - not "nowhere in particular" but "here is a field whose value is
-        nothing" - and a provider is free to refuse that for reasons it will not
-        explain. So the absent case is an absent key.
-
-        **What this buys is a browser, not a settlement.** Paystack sends the payer
-        to this address once they have finished paying; whether the deposit is
-        credited is decided by ``/webhooks/paystack`` and by nothing else, so a
-        person who lands back here may well see their balance unchanged for a few
-        seconds. That is the honest reading of the return and it is why the setting
-        is optional: an installation without it loses a courtesy, not a payment.
-
-        **The check above the request is a backstop, not the door.** The door is
-        ``InitiateDeposit``, which asks ``supported_currencies`` and refuses before
-        a payer is sent anywhere - and that is the refusal a client sees. This one
-        is unreachable from that path, and it exists so that a caller which skips
-        the door cannot relabel a collection silently, which is precisely how the
-        bug above survived: no single frame was wrong, and the two halves were.
-        """
+        
         if amount.currency not in self._currencies:
             raise PaymentProviderError(
                 f"this account is not enabled to collect {amount.currency.value}; "
@@ -693,53 +629,6 @@ class PaystackPaymentProvider(PaymentProvider):
             ) from failure
 
 
-    def initiate_transfer(
-        self,
-        *,
-        reference: str,
-        amount: Money,
-        destination: Destination,
-    ) -> TransferIntent:
-        """Ask Paystack to initiate an external transfer."""
-        recipient_payload = {
-            "type": "nuban",
-            "name": destination.name,
-            "account_number": destination.identifier,
-            "bank_code": destination.detail("bank_code"),
-            "currency": amount.currency.value,
-        }
-
-        _, recipient_response = self._request(
-            "POST",
-            "/transferrecipient",
-            payload=recipient_payload,
-            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
-        )
-
-        recipient_data = recipient_response.get("data")
-        recipient_code = recipient_data["recipient_code"]
-
-        transfer_payload = {
-            "source": "balance",
-            "amount": _subunit(amount),
-            "recipient": recipient_code,
-            "reference": reference,
-            "currency": amount.currency.value,
-        }
-
-        _, transfer_response = self._request(
-            "POST",
-            "/transfer",
-            payload=transfer_payload,
-            answers=AUTHENTICATION_FAILURES | BAD_REQUEST_STATUSES,
-        )
-
-        transfer_data = transfer_response.get("data")
-        transfer_code = transfer_data["transfer_code"]
-
-        return TransferIntent(provider_reference=transfer_code)
-
-
 def _json_or_none(response: httpx.Response) -> object:
     """The response's JSON body, or ``None`` when there is not a usable one.
 
@@ -900,14 +789,7 @@ def _currency_of(data: dict) -> Currency:
 
 
 def _currency_names(currencies: frozenset[Currency]) -> str:
-    """A set of currencies as a readable list, for a sentence a person reads.
-
-    Sorted, and that is the whole of why it is a function rather than an f-string
-    at the raise site. A ``frozenset`` has no order, so a message built by
-    iterating one names the same currencies in a different order on different
-    runs - and a sentence that changes while nothing has changed is one a reader
-    learns to distrust, which is the last thing a refusal wants. Sorted by the
-    currency's own code rather than by insertion, so it does not depend on how
-    the set was built either.
-    """
+    
     return ", ".join(sorted(currency.value for currency in currencies))
+
+
