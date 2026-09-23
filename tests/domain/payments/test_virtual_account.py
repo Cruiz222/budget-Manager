@@ -88,3 +88,76 @@ def test_pending_virtual_account_rejects_bank_details(bank_field):
             provider_customer_code="CUS_123",
             **values,
         )
+
+
+def test_pending_virtual_account_can_be_activated():
+    pending = VirtualAccount(
+        wallet_id=uuid.uuid4(),
+        status=VirtualAccountStatus.PENDING,
+        provider="paystack",
+    )
+
+    active = pending.activate(
+        provider_customer_code="CUS_123",
+        account_number="1234567890",
+        account_name="JOHNNY SUCCESSFUL",
+        bank_name="Wema Bank",
+    )
+
+    assert pending.status is VirtualAccountStatus.PENDING
+    assert pending.account_number is None
+
+    assert active.status is VirtualAccountStatus.ACTIVE
+    assert active.provider_customer_code == "CUS_123"
+    assert active.account_number == "1234567890"
+    assert active.account_name == "JOHNNY SUCCESSFUL"
+    assert active.bank_name == "Wema Bank"
+    
+
+def test_active_virtual_account_cannot_be_activated_again():
+    active = VirtualAccount(
+        wallet_id=uuid.uuid4(),
+        status=VirtualAccountStatus.ACTIVE,
+        provider="paystack",
+        provider_customer_code="CUS_123",
+        account_number="1234567890",
+        account_name="JOHNNY SUCCESSFUL",
+        bank_name="Wema Bank",
+    )
+
+    with pytest.raises(InvalidVirtualAccountError):
+        active.activate(
+            provider_customer_code="CUS_456",
+            account_number="0987654321",
+            account_name="ANOTHER NAME",
+            bank_name="Another Bank",
+        )    
+
+
+def test_virtual_account_requires_a_uuid_wallet_id():
+    with pytest.raises(InvalidVirtualAccountError):
+        VirtualAccount(
+            wallet_id="not-a-uuid",
+            status=VirtualAccountStatus.PENDING,
+            provider="paystack",
+        )
+
+
+def test_virtual_account_requires_a_valid_status():
+    with pytest.raises(InvalidVirtualAccountError):
+        VirtualAccount(
+            wallet_id=uuid.uuid4(),
+            status="pending",
+            provider="paystack",
+        )
+
+
+@pytest.mark.parametrize("provider", [None, "", "   "])
+def test_virtual_account_requires_a_provider(provider):
+    with pytest.raises(InvalidVirtualAccountError):
+        VirtualAccount(
+            wallet_id=uuid.uuid4(),
+            status=VirtualAccountStatus.PENDING,
+            provider=provider,
+        )        
+        
