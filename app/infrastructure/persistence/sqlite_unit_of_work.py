@@ -68,6 +68,9 @@ from app.infrastructure.repositories.sqlite_session_repository import (
 from app.infrastructure.repositories.sqlite_user_repository import (
     SqliteUserRepository,
 )
+from app.infrastructure.repositories.sqlite_virtual_account_repository import (
+    SqliteVirtualAccountRepository,
+)
 from app.infrastructure.repositories.sqlite_wallet_repository import (
     SqliteWalletRepository,
 )
@@ -184,6 +187,17 @@ CREATE TABLE IF NOT EXISTS wallets (
     -- a different rule. It is an index created by
     -- ``_migrate_one_wallet_per_currency``, which every connection runs, so a
     -- database that already exists gets it too. See decision 267.
+);
+
+CREATE TABLE IF NOT EXISTS virtual_accounts (
+    wallet_id             TEXT PRIMARY KEY
+                              REFERENCES wallets(wallet_id),
+    status                TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    provider_customer_code TEXT,
+    account_number        TEXT UNIQUE,
+    account_name          TEXT,
+    bank_name             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS funds (
@@ -1555,6 +1569,7 @@ class SqliteUnitOfWork(UnitOfWork):
     def __init__(self, connection: sqlite3.Connection):
         self._connection = connection
         self.wallets = SqliteWalletRepository(connection)
+        self.virtual_accounts = SqliteVirtualAccountRepository(connection)
         self.transactions = SqliteTransactionRepository(connection)
         self.plans = SqliteSavingsPlanRepository(connection)
         self.plan_runs = SqlitePlanRunRepository(connection)

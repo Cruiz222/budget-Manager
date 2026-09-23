@@ -6,7 +6,7 @@ from app.domain.payments.virtualAccount import VirtualAccount
 
 class VirtualAccountRepository(ABC):
     @abstractmethod
-    def save(self, account: VirtualAccount) -> None:
+    def save(self, account: VirtualAccount) -> VirtualAccount:
         pass
 
     @abstractmethod
