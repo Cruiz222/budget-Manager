@@ -26,6 +26,7 @@ from app.domain.money.exception import (
     WalletHasActivePlansError,
     WalletNotEmptyError,
     WalletNotFoundError,
+    CurrencyNotOfferedError,
 )
 from app.domain.money.fundKind import FundKind
 from app.domain.money.money import Money
@@ -514,9 +515,9 @@ class TestOneWalletPerCurrency:
     the checking itself - and the CLI and the browser would each then be a door
     with its own copy of the rule. There is one copy, and it is this one.
 
-    The four claims: a duplicate is refused; a different currency is not; the
-    refusal persists nothing; and a closed wallet does not count as holding its
-    currency.
+    The four claims: a duplicate is refused; a currency outside the MVP offer is
+    refused; either refusal persists nothing; and a closed wallet does not count
+    as holding its currency.
     """
 
     def test_a_second_wallet_in_a_held_currency_is_refused(self, tmp_path):
@@ -528,20 +529,23 @@ class TestOneWalletPerCurrency:
 
         assert str(first.wallet_id) in str(refused.value)
 
-    def test_the_two_currencies_are_two_wallets(self, tmp_path):
-        """Without this, a rule that refused every second wallet would pass the
-        test above and make USD unreachable.
+    def test_a_currency_not_offered_by_the_mvp_is_refused(self, tmp_path):
+        """USD remains a known currency, but this MVP opens only NGN wallets.
+
+        Knowing how to represent a currency is different from offering a new wallet
+        in that currency. Refusing USD here keeps every presentation layer on the
+        same product rule.
         """
-        service, factory = build_service(tmp_path)
+        service, _ = build_service(tmp_path)
 
-        naira = service.open_wallet(NGN)
-        dollars = service.open_wallet(Currency.USD)
+        with pytest.raises(CurrencyNotOfferedError) as refused:
+            service.open_wallet(Currency.USD)
 
-        held = [one.currency for one in service.wallets_for_actor()]
-        assert held == [NGN, Currency.USD]
-        assert get_wallet(factory, naira.wallet_id).currency is NGN
-        assert get_wallet(factory, dollars.wallet_id).currency is Currency.USD
-
+        assert "NGN" in str(refused.value)
+        assert "USD" in str(refused.value)
+        assert service.wallets_for_actor() == []
+    
+    
     def test_the_refusal_writes_nothing(self, tmp_path):
         """**The check runs before the save, and this is the assertion that it
         still does.** A refusal that had already written a row would leave a wallet
@@ -577,21 +581,6 @@ class TestOneWalletPerCurrency:
             WalletStatus.ACTIVE,
         ]
 
-    def test_a_closed_wallet_of_another_currency_changes_nothing(self, tmp_path):
-        """**The filter is on the currency asked for and not on wallets in
-        general.** A closed USD wallet must not stop an NGN wallet being opened,
-        and a live NGN wallet must not be freed by a closed USD one - which is the
-        shape a test written only from the happy path would miss.
-        """
-        service, _ = build_service(tmp_path)
-        dollars = service.open_wallet(Currency.USD)
-        close(service, dollars.wallet_id)
-
-        naira = service.open_wallet(NGN)
-
-        assert naira.currency is NGN
-        with pytest.raises(DuplicateWalletCurrencyError):
-            service.open_wallet(NGN)
 
     def test_another_person_wallet_does_not_count(self, tmp_path):
         """A wallet is held by one person, and the rule is per account. Two people

@@ -51,29 +51,46 @@ class TestOpeningAWallet:
         be special-cased by a client that assumes a fresh wallet is the one case
         where a number would do.
         """
-        wallet = client.post(
-            "/wallets", json={"currency": "USD"}, headers=as_user()
-        ).json()
+        response = client.post(
+            "/wallets",
+            json={"currency": "NGN"},
+            headers=as_user(),
+        )
 
-        assert wallet["currency"] == "USD"
-        assert wallet["available_balance"] == {"amount": "0.00", "currency": "USD"}
-        assert wallet["locked_balance"] == {"amount": "0.00", "currency": "USD"}
+        assert response.status_code == 201
+        wallet = response.json()
+
+        assert wallet["currency"] == "NGN"
+        assert wallet["available_balance"] == {
+            "amount": "0.00",
+            "currency": "NGN",
+    }
+        assert wallet["locked_balance"] == {
+            "amount": "0.00",
+            "currency": "NGN",
+    }
         assert wallet["funds"] == []
 
-    def test_opening_two_currencies_gives_two_wallets(self, client, as_user, open_wallet):
-        """Two wallets, one currency each - and they are different wallets.
+    def test_a_known_currency_outside_the_mvp_offer_is_refused(
+    self,
+    client,
+    as_user,
+):
+    """USD is understood by the domain but is not offered by this MVP."""
+    response = client.post(
+        "/wallets",
+        json={"currency": "USD"},
+        headers=as_user(),
+    )
 
-        Said out loud because the rule this used to document has been reversed:
-        this test was ``test_opening_two_gives_two_wallets`` and opened two NGN
-        wallets, because nothing deduplicated them. Decision 267 made that a
-        refusal, so the same claim - *two wallets are two rows* - is now made about
-        two currencies, and the refusal it replaced is asserted in
-        ``TestOneWalletPerCurrency`` below.
-        """
-        first = open_wallet(as_user(), currency="NGN")
-        second = open_wallet(as_user(), currency="USD")
+    assert response.status_code == 400
+    assert response.json()["error"] == "CurrencyNotOfferedError"
+    assert "NGN" in response.json()["detail"]
+    assert "USD" in response.json()["detail"]
 
-        assert first != second
+    listed = client.get("/wallets", headers=as_user()).json()
+    assert listed == []
+    
 
     def test_the_caller_and_nobody_else_can_read_it_back(self, client, as_user, open_wallet):
         wallet_id = open_wallet(as_user(ALICE))

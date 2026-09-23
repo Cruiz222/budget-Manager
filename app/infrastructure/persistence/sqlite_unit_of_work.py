@@ -10,7 +10,6 @@ import sqlite3
 import uuid
 from datetime import datetime
 from decimal import Decimal
-
 from app.application.unit_of_work import UnitOfWork
 from app.domain.money.currency import Currency
 from app.domain.money.fundKind import FundKind
@@ -1691,3 +1690,5 @@ class SqliteUnitOfWorkFactory:
         connection = open_sqlite_connection(self.db_path)
         connection.execute("BEGIN IMMEDIATE")
         return SqliteUnitOfWork(connection)
+    
+    

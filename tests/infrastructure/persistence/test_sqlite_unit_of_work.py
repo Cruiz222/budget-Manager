@@ -14,6 +14,8 @@ from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import TransactionType
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
+from app.domain.payments.virtualAccount import VirtualAccount
+from app.domain.payments.virtualAccountStatus import VirtualAccountStatus
 from app.infrastructure.persistence.serialization import (
     datetime_to_text,
     enum_to_text,
@@ -444,6 +446,66 @@ def test_commit_persists_wallet_and_transaction_together(tmp_path, build_wallet)
     assert stored_transaction is not None
     assert stored_transaction.status is TransactionStatus.SUCCESSFUL
     fresh.rollback()
+    
+    
+def test_rollback_discards_a_wallet_and_its_virtual_account(
+    tmp_path,
+    build_wallet,
+):
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "virtual-account-atomic.db"))
+    wallet = build_wallet()
+
+    account = VirtualAccount(
+        wallet_id=wallet.wallet_id,
+        status=VirtualAccountStatus.PENDING,
+        provider="paystack",
+    )
+
+    uow = factory.start()
+    uow.wallets.save(wallet)
+    uow.virtual_accounts.save(account)
+    uow.rollback()
+
+    fresh = factory.start()
+
+    with pytest.raises(WalletNotFoundError):
+        fresh.wallets.get_owned(wallet.wallet_id, wallet.user_id)
+
+    assert fresh.virtual_accounts.get_by_wallet_id(wallet.wallet_id) is None
+    fresh.rollback()
+    
+    
+def test_commit_persists_wallet_and_virtual_account_together(
+    tmp_path,
+    build_wallet,
+):
+    factory = SqliteUnitOfWorkFactory(str(tmp_path / "virtual-account-atomic.db"))
+    wallet = build_wallet()
+
+    account = VirtualAccount(
+        wallet_id=wallet.wallet_id,
+        status=VirtualAccountStatus.PENDING,
+        provider="paystack",
+    )
+
+    uow = factory.start()
+    uow.wallets.save(wallet)
+    uow.virtual_accounts.save(account)
+    uow.commit()
+
+    fresh = factory.start()
+
+    stored_wallet = fresh.wallets.get_owned(
+        wallet.wallet_id,
+        wallet.user_id,
+    )
+    stored_account = fresh.virtual_accounts.get_by_wallet_id(
+        wallet.wallet_id,
+    )
+
+    assert stored_wallet == wallet
+    assert stored_account == account
+    fresh.rollback()        
 
 
 def test_rollback_keeps_the_prior_committed_balance(tmp_path, build_wallet):
@@ -488,8 +550,13 @@ USER_ID = "33333333-3333-3333-3333-333333333333"
 LEGACY_USER_ID = UUID(USER_ID)
 
 
-def legacy_wallet_row(wallet_id, locked, available="10000.00"):
-    return (wallet_id, USER_ID, "NGN", "ACTIVE", available, locked)
+def legacy_wallet_row(
+    wallet_id,
+    locked,
+    available="10000.00",
+    user_id=USER_ID,
+):
+    return (wallet_id, user_id, "NGN", "ACTIVE", available, locked)
 
 
 def test_a_locked_balance_is_migrated_into_a_pot(tmp_path):
@@ -566,11 +633,17 @@ def test_each_wallet_gets_its_own_pot(tmp_path):
     belong to whichever wallet the query returned first.
     """
     db_path = str(tmp_path / "legacy_two.db")
+    other_user_id = uuid4()
+
     build_legacy_database(
         db_path,
         [
             legacy_wallet_row(WALLET_ID, "4000.00"),
-            legacy_wallet_row(OTHER_WALLET_ID, "1750.50"),
+            legacy_wallet_row(
+                OTHER_WALLET_ID,
+                "1750.50",
+                user_id=uuid_to_text(other_user_id),
+            ),
         ],
     )
 
@@ -579,14 +652,15 @@ def test_each_wallet_gets_its_own_pot(tmp_path):
     stored = SqliteUnitOfWorkFactory(db_path).start()
     try:
         first = stored.wallets.get_owned(WALLET_ID, LEGACY_USER_ID)
-        second = stored.wallets.get_owned(OTHER_WALLET_ID, LEGACY_USER_ID)
+        second = stored.wallets.get_owned(OTHER_WALLET_ID, other_user_id)
+
         assert first.locked_balance == Money(Decimal("4000.00"), NGN)
         assert second.locked_balance == Money(Decimal("1750.50"), NGN)
         assert first.funds[0].fund_id != second.funds[0].fund_id
     finally:
         stored.rollback()
-
-
+        
+        
 def test_running_the_migration_twice_changes_nothing(tmp_path):
     """Idempotence, and the crash it is there to survive.
 
@@ -1476,7 +1550,7 @@ class TestResolvingWalletRowsOnOpen:
         db_path = str(tmp_path / "ordering.db")
         build_legacy_database(
             db_path,
-            legacy_wallet_rows((uuid4(), "GHS", "ACTIVE", "0.00")),
+            legacy_wallet_rows((uuid4(), "GHS", "ACTIVE", "1.00")),
         )
 
         with pytest.raises(UnservableWalletRowsError):
