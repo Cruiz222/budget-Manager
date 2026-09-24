@@ -32,6 +32,12 @@ another message.
 
 from datetime import datetime, timedelta
 from uuid import uuid4
+from decimal import Decimal
+
+from app.domain.money.currency import Currency
+from app.domain.money.money import Money
+from app.domain.money.walletStatus import WalletStatus
+from app.domain.payments.virtualAccountStatus import VirtualAccountStatus
 
 import pytest
 
@@ -180,6 +186,40 @@ class TestTheAccountItCreates:
 
         assert user.phone == FOLDED
         assert rows_in(db_path, "users") == 1
+
+
+    def test_it_opens_an_ngn_wallet_with_a_pending_virtual_account(
+        self,
+        confirm,
+        pending,
+        factory,
+    ):
+        user = confirm.execute(pending(), PASSWORD, NOW)
+
+        uow = factory.start()
+        try:
+            wallets = uow.wallets.list_for_owner(user.user_id)
+            assert len(wallets) == 1
+
+            wallet = wallets[0]
+            account = uow.virtual_accounts.get_by_wallet_id(wallet.wallet_id)
+        finally:
+            uow.rollback()
+
+        assert wallet.user_id == user.user_id
+        assert wallet.status is WalletStatus.ACTIVE
+        assert wallet.currency is Currency.NGN
+        assert wallet.available_balance == Money(Decimal("0"), Currency.NGN)
+        assert wallet.locked_balance == Money(Decimal("0"), Currency.NGN)
+
+        assert account is not None
+        assert account.wallet_id == wallet.wallet_id
+        assert account.status is VirtualAccountStatus.PENDING
+        assert account.provider == "paystack"
+        assert account.provider_customer_code is None
+        assert account.account_number is None
+        assert account.account_name is None
+        assert account.bank_name is None    
 
     def test_the_account_has_no_address(self, confirm, pending):
         """**The whole point of this path, and the constraint it creates.**

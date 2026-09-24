@@ -371,18 +371,83 @@ def as_phone_user(client, legacy_account):
 
 @pytest.fixture
 def open_wallet(client, as_user):
-    """Open a wallet and return its id.
+    """Return an existing live wallet, or open one when none exists.
 
-    Asserts its own success, so a test that is really about plans does not fail
-    with "KeyError: wallet_id" three lines later when the thing that actually
-    broke was the wallet.
+    Signup now creates the user's NGN wallet automatically. Most tests only need
+    a wallet as setup, so this fixture first reuses that wallet. If the previous
+    wallet was closed, it opens a replacement.
+    """    """Return an existing live wallet, or open one when none exists.
+
+    Signup now creates the user's NGN wallet automatically. Most tests only need
+    a wallet as setup, so this fixture first reuses that wallet. If the previous
+    wallet was closed, it opens a replacement.
     """
 
     def _open(headers=None, currency="NGN") -> str:
+        own_headers = as_user() if headers is None else headers
+
+        response = client.get("/wallets", headers=own_headers)
+        assert response.status_code == 200, response.text    
+        """Return an existing live wallet, or open one when none exists.
+
+        Signup now creates the user's NGN wallet automatically. Most tests only need
+        a wallet as setup, so this fixture first reuses that wallet. If the previous
+        wallet was closed, it opens a replacement.
+        """
+
+    def _open(headers=None, currency="NGN") -> str:
+        own_headers = as_user() if headers is None else headers
+
+        response = client.get("/wallets", headers=own_headers)
+        assert response.status_code == 200, response.text
+
+        for wallet in response.json():
+            if (
+                wallet["currency"] == currency
+                and wallet["status"] != "closed"
+            ):
+                return wallet["wallet_id"]
+
         response = client.post(
             "/wallets",
             json={"currency": currency},
-            headers=as_user() if headers is None else headers,
+            headers=own_headers,
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["wallet_id"]
+
+        for wallet in response.json():
+            if (
+                wallet["currency"] == currency
+                and wallet["status"] != "closed"
+            ):
+                return wallet["wallet_id"]
+
+        response = client.post(
+            "/wallets",
+            json={"currency": currency},
+            headers=own_headers,
+        )
+        assert response.status_code == 201, response.text
+        return response.json()["wallet_id"]
+
+    def _open(headers=None, currency="NGN") -> str:
+        own_headers = as_user() if headers is None else headers
+
+        response = client.get("/wallets", headers=own_headers)
+        assert response.status_code == 200, response.text
+
+        for wallet in response.json():
+            if (
+                wallet["currency"] == currency
+                and wallet["status"] != "closed"
+            ):
+                return wallet["wallet_id"]
+
+        response = client.post(
+            "/wallets",
+            json={"currency": currency},
+            headers=own_headers,
         )
         assert response.status_code == 201, response.text
         return response.json()["wallet_id"]

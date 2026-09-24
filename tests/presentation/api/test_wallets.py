@@ -14,90 +14,97 @@ from tests.presentation.api.conftest import ALICE, BOB
 
 
 class TestOpeningAWallet:
-    def test_it_is_created_and_says_so(self, client, as_user):
-        """201, not 200, and the body is the new resource.
+    def test_signup_provides_an_active_wallet(self, client, as_user):
+        """A newly created account immediately owns an active NGN wallet."""
+        headers = as_user()
 
-        A ``POST`` that creates something and answers 200 leaves the client to
-        guess whether it just made a wallet or found an existing one - and this
-        endpoint does not look for an existing one, so the guess would be wrong
-        every time.
-        """
-        response = client.post("/wallets", json={"currency": "NGN"}, headers=as_user())
+        response = client.get("/wallets", headers=headers)
 
-        assert response.status_code == 201
-        assert response.json()["status"] == "active"
+        assert response.status_code == 200
+        wallets = response.json()
+        assert len(wallets) == 1
+        assert wallets[0]["status"] == "active"
 
     def test_it_belongs_to_the_caller(self, client, as_user):
-        """The owner is the actor, and there is nowhere in the request to say otherwise.
+        """The starter wallet belongs to the account created during signup."""
+        headers = as_user(ALICE)
+        me = client.get("/users/me", headers=headers).json()
 
-        Compared against ``/users/me`` rather than against a constant, because the
-        claim being tested is "these are the same account", not "this is a known
-        UUID". A wallet opened by a stranger's header would satisfy the second
-        claim and fail this one.
-        """
-        me = client.get("/users/me", headers=as_user(ALICE)).json()
+        wallets = client.get("/wallets", headers=headers).json()
 
-        wallet = client.post(
-            "/wallets", json={"currency": "NGN"}, headers=as_user(ALICE)
-        ).json()
+        assert len(wallets) == 1
+        assert wallets[0]["user_id"] == me["user_id"]
 
-        assert wallet["user_id"] == me["user_id"]
+    def test_it_starts_empty_in_ngn(self, client, as_user):
+        """The automatically created wallet starts empty and uses NGN."""
+        headers = as_user()
 
-    def test_it_starts_empty_in_the_currency_that_was_asked_for(self, client, as_user):
-        """Zero, as strings, in the requested currency.
+        response = client.get("/wallets", headers=headers)
 
-        ``"0.00"`` rather than ``0`` is the wire format doing its job on the very
-        first response a client ever sees - and it is the response most likely to
-        be special-cased by a client that assumes a fresh wallet is the one case
-        where a number would do.
-        """
-        response = client.post(
-            "/wallets",
-            json={"currency": "NGN"},
-            headers=as_user(),
-        )
-
-        assert response.status_code == 201
-        wallet = response.json()
+        assert response.status_code == 200
+        wallets = response.json()
+        assert len(wallets) == 1
+        wallet = wallets[0]
 
         assert wallet["currency"] == "NGN"
         assert wallet["available_balance"] == {
             "amount": "0.00",
             "currency": "NGN",
-    }
+        }
         assert wallet["locked_balance"] == {
             "amount": "0.00",
             "currency": "NGN",
-    }
+        }
         assert wallet["funds"] == []
 
     def test_a_known_currency_outside_the_mvp_offer_is_refused(
-    self,
-    client,
-    as_user,
-):
+        self,
+        client,
+        as_user,
+    ):
         """USD is understood by the domain but is not offered by this MVP."""
+        headers = as_user()
+
         response = client.post(
             "/wallets",
             json={"currency": "USD"},
-            headers=as_user(),
-    )
+            headers=headers,
+        )
 
         assert response.status_code == 400
         assert response.json()["error"] == "CurrencyNotOfferedError"
         assert "NGN" in response.json()["detail"]
         assert "USD" in response.json()["detail"]
 
-        listed = client.get("/wallets", headers=as_user()).json()
-        assert listed == []
-    
+        # The refused request creates nothing. The only wallet remaining is the
+        # NGN wallet that signup created.
+        listed = client.get("/wallets", headers=headers).json()
+        assert len(listed) == 1
+        assert listed[0]["currency"] == "NGN"
+        assert listed[0]["status"] == "active"
 
-    def test_the_caller_and_nobody_else_can_read_it_back(self, client, as_user, open_wallet):
+    def test_the_caller_and_nobody_else_can_read_it_back(
+        self,
+        client,
+        as_user,
+        open_wallet,
+    ):
         wallet_id = open_wallet(as_user(ALICE))
 
-        assert client.get(f"/wallets/{wallet_id}", headers=as_user(ALICE)).status_code == 200
-        assert client.get(f"/wallets/{wallet_id}", headers=as_user(BOB)).status_code == 404
-
+        assert (
+            client.get(
+                f"/wallets/{wallet_id}",
+                headers=as_user(ALICE),
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                f"/wallets/{wallet_id}",
+                headers=as_user(BOB),
+            ).status_code
+            == 404
+        )
 
 class TestOneWalletPerCurrency:
     """Decision 267, at the layer that decides it.

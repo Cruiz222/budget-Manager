@@ -34,6 +34,36 @@ from app.application.unit_of_work import UnitOfWork
 from app.domain.identity.exception import InvalidUserGoogleSubjectError
 from app.domain.identity.password_credential import PasswordCredential
 from app.domain.identity.user import User
+from decimal import Decimal
+from uuid import uuid4
+
+from app.domain.money.currency import Currency
+from app.domain.money.money import Money
+from app.domain.money.wallet import Wallet
+from app.domain.money.walletStatus import WalletStatus
+from app.domain.payments.virtualAccount import VirtualAccount
+from app.domain.payments.virtualAccountStatus import VirtualAccountStatus
+
+VIRTUAL_ACCOUNT_PROVIDER = "paystack"
+
+def _record_starter_wallet(uow: UnitOfWork, user: User) -> None:
+    """Write the empty NGN wallet every new account starts with."""
+    wallet = Wallet(
+        wallet_id=uuid4(),
+        user_id=user.user_id,
+        status=WalletStatus.ACTIVE,
+        _available_balance=Money(Decimal("0"), Currency.NGN),
+        currency=Currency.NGN,
+    )
+
+    uow.wallets.save(wallet)
+    uow.virtual_accounts.save(
+        VirtualAccount(
+            wallet_id=wallet.wallet_id,
+            status=VirtualAccountStatus.PENDING,
+            provider=VIRTUAL_ACCOUNT_PROVIDER,
+        )
+    )
 
 
 def record_new_account(
@@ -72,10 +102,13 @@ def record_new_account(
     """
     uow.users.save(user)
     uow.password_credentials.save(
-        PasswordCredential(
-            user_id=user.user_id, password_hash=password_hash, updated_at=now
+    PasswordCredential(
+            user_id=user.user_id,
+            password_hash=password_hash,
+            updated_at=now,
         )
     )
+    _record_starter_wallet(uow, user)
 
 
 def record_new_google_account(uow: UnitOfWork, *, user: User) -> None:
@@ -118,3 +151,5 @@ def record_new_google_account(uow: UnitOfWork, *, user: User) -> None:
         )
 
     uow.users.save(user)
+
+    _record_starter_wallet(uow, user)
