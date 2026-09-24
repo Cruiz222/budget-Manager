@@ -41,6 +41,7 @@ from app.presentation.api.schemas import (
 )
 from app.presentation.cli import main
 from tests.conftest import log_in_as
+from tests.presentation.api.conftest import ALICE, BOB
 
 
 def money_amounts_in(body):
@@ -127,39 +128,48 @@ class TestMoneyIsAString:
         assert wallet["available_balance"]["amount"] == "0.00"
 
     def test_an_amount_the_api_returns_can_be_sent_straight_back(
-        self, client, as_user, open_wallet, create_plan
+        self,
+        client,
+        as_user,
+        open_wallet,
+        create_plan,
     ):
-        """The round trip is closed in both directions.
+        """An amount returned by the API is valid input for another request.
 
-        A client that reads a total and uses it as the amount of the next plan
-        must not have to reformat it - and if it had to, it would be reimplementing
-        ``translate.money_out``'s format spec, which is the thing having one
-        function for it exists to prevent.
-
-        **The second wallet is in dollars, and decision 267 is why.** Two wallets
-        of one currency are refused now, and this test's second plan needs a wallet
-        of its own - one that has not already been drawn on by the first - so the
-        second currency is exactly what the rule leaves available. It also makes
-        the round trip a stronger claim than it was: the amount crosses currencies
-        and is still read back unchanged.
+        The first user creates a plan and receives its total as a decimal string.
+        A second user sends that exact string while creating a plan of their own.
+        No client-side reformatting should be necessary.
         """
-        headers = as_user()
-        first = create_plan(open_wallet(headers), headers).json()
+        first_headers = as_user(ALICE)
+        first_wallet = open_wallet(first_headers)
+        first = create_plan(
+            first_wallet,
+            first_headers,
+        ).json()
+
         quoted = first["total_to_move"]["amount"]
         assert quoted == "2500.00"
 
+        second_headers = as_user(BOB)
+        second_wallet = open_wallet(second_headers)
+
         again = create_plan(
-            open_wallet(headers, currency="USD"),
-            headers,
+            second_wallet,
+            second_headers,
             instructions=[
-                {"action": "payout", "amount": quoted, "label": "Same as before",
-                 "destination": first["instructions"][0]["destination"]}
+                {
+                    "action": "payout",
+                    "amount": quoted,
+                    "label": "Same as before",
+                    "destination": first["instructions"][0]["destination"],
+                }
             ],
         )
 
-        assert again.status_code == 201
+        assert again.status_code == 201, again.text
         assert again.json()["total_to_move"]["amount"] == quoted
-
+        
+        
     def test_an_amount_is_read_as_a_string_and_not_as_a_float(
         self, client, as_user, open_wallet, create_plan, payout_line
     ):

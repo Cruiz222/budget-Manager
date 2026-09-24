@@ -1,21 +1,13 @@
-"""Opening a wallet in a browser, and the currency that is not on offer.
+"""Opening an NGN wallet in a browser, and currencies that are not on offer.
 
-Decision 267 is two rules with one shape, and this file is where they meet the
-page. **A person may hold one wallet per currency**, and the form offers only the
-currencies they do not already hold - which makes the *dropdown*, rather than a
-refusal page, the ordinary way this rule is met. The refusal is still reachable and
-still correct: a page left open in a tab, or a form posted twice, carries a currency
-that is taken by the time it arrives.
+The form displays only currencies in the product's current offer that the user
+does not already hold in an active wallet. For this MVP that offer is NGN only:
+a new account sees NGN, an account with an active NGN wallet sees no option, and
+closing that wallet makes NGN available again.
 
-**Why the form is narrowed at all, since the refusal would cover it.** The dropdown
-is not decoration - the first option is what a person gets by clicking the button
-without reading it - so leaving a currency on the list that cannot be had would make
-the form's default choice an error page. Hiding the option is courtesy. Refusing it
-is the rule, and both are asserted below.
-
-The empty case is real rather than theoretical: with two currencies, a person who
-holds both has no wallet left to open, and the page has to say so instead of
-rendering a form with nothing in it.
+The backend refusal remains necessary for stale pages, repeated submissions and
+hand-written requests, so the tests cover both the friendly dropdown and the
+authoritative application rule.
 """
 
 import re
@@ -66,14 +58,14 @@ def close_through_the_service(browser, wallet_id: str) -> None:
 
 
 class TestTheCurrenciesOnOffer:
-    def test_a_new_account_is_offered_every_currency_the_system_serves(self, browser):
-        """Two, and they come from the domain's enum rather than from a list kept
-        in the template - so a currency added to ``Currency`` appears here without
-        an edit, and the three that were removed are not here at all.
-        """
+    def test_a_new_account_is_offered_every_currency_the_mvp_serves(
+        self,
+        browser,
+    ):
+        """The current MVP offers one wallet currency: NGN."""
         browser.sign_up()
 
-        assert offered(browser.page(urls.LANDING_PATH)) == ["NGN", "USD"]
+        assert offered(browser.page(urls.LANDING_PATH)) == ["NGN"]
 
     def test_the_page_offers_the_naira_first(self, browser):
         """**The order is part of the interface**, because the first option is what
@@ -95,58 +87,66 @@ class TestTheCurrenciesOnOffer:
 
         page = browser.page(urls.LANDING_PATH)
 
-        assert offered(page) == ["USD"]
+        assert offered(page) == []
         assert len(browser.wallet_ids()) == 1
 
-    def test_holding_both_currencies_leaves_nothing_to_open(self, browser):
-        """**A real state and not an edge case**: with two currencies in the
-        system, holding both is holding everything. The page says so rather than
-        rendering a form with an empty dropdown - a form with nothing in it reads
-        as a bug and gives a person nothing to do.
+    def test_holding_the_only_offered_currency_leaves_nothing_to_open(
+        self,
+        browser,
+    ):
+        """An active NGN wallet exhausts the MVP's wallet offer.
+
+        The page explains that there is nothing else to open rather than
+        rendering an empty select element.
         """
         browser.sign_up()
         browser.open_wallet(currency="NGN")
-        browser.open_wallet(currency="USD")
 
         page = browser.page(urls.LANDING_PATH)
 
         assert offered(page) == []
         assert "every currency this system serves" in page
-
+        
+        
     def test_a_closed_wallet_gives_its_currency_back(self, browser):
-        """**The other half of the rule, from the page's side.** Closing frees the
-        currency, so the option comes back - and the closed wallet is still listed,
-        because closing a wallet does not erase it.
-        """
+        """Closing the NGN wallet makes NGN available to open again."""
         browser.sign_up()
         wallet_id = browser.open_wallet(currency="NGN")
-        assert offered(browser.page(urls.LANDING_PATH)) == ["USD"]
+
+        assert offered(browser.page(urls.LANDING_PATH)) == []
 
         close_through_the_service(browser, wallet_id)
 
         page = browser.page(urls.LANDING_PATH)
-        assert offered(page) == ["NGN", "USD"]
+
+        assert offered(page) == ["NGN"]
         assert browser.wallet_ids() == [wallet_id]
 
 
 class TestOpeningASecondWallet:
-    def test_a_second_currency_adds_a_wallet_and_leaves_the_first_alone(
-        self, browser
+    def test_a_known_currency_outside_the_mvp_offer_is_refused(
+        self,
+        browser,
     ):
-        """The feature the rule is built around: two currencies, two wallets, both
-        listed, each with its own balance and its own pots.
+        """A direct USD form submission is refused and changes nothing.
+
+        USD is a currency the domain understands, but it is not a wallet
+        currency offered by this MVP. The direct POST represents a stale or
+        hand-written form submission.
         """
         browser.sign_up()
         naira = browser.open_wallet(currency="NGN")
-        dollars = browser.open_wallet(currency="USD")
 
-        page = browser.page(urls.LANDING_PATH)
+        response = browser.post(
+            f"{urls.PREFIX}/wallets",
+            data={"currency": "USD"},
+        )
 
-        assert browser.wallet_ids() == [naira, dollars]
-        # A USD wallet is a wallet like any other at this level: it opens, it is
-        # listed and it renders. What cannot be done with it is *collect* into it,
-        # which is the deposit door's refusal and a different test.
-        assert dollars in page
+        assert response.status_code == 400
+        assert "CurrencyNotOfferedError" in response.text
+        assert "NGN" in response.text
+        assert "USD" in response.text
+        assert browser.wallet_ids() == [naira]
 
     def test_a_form_that_arrives_with_a_currency_already_taken_is_refused(
         self, browser

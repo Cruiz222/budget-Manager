@@ -39,7 +39,6 @@ from app.application.wallet_service import OFFERED_CURRENCIES, WalletService
 from app.domain.identity.phoneNumber import fold_phone
 from app.domain.identity.user import User, fold_email
 from app.domain.money.confirmationKind import ConfirmationKind
-from app.domain.money.currency import Currency
 from app.domain.money.walletStatus import WalletStatus
 from app.presentation.api import rate_limits, translate
 from app.presentation.api.dependencies import (
@@ -332,14 +331,14 @@ def wallets(request: Request, user: User = Depends(web_actor)):
     the currency form is on this page rather than on one of its own because
     opening the first wallet is the only thing a new account can do.
 
-    ``currencies`` is passed as the values of the domain enum, so the form offers
-    exactly what the domain accepts - a currency added to the enum appears here
-    without an edit, and one removed disappears from it. **It is then narrowed to
-    the ones this person can actually open**, which is decision 267 arriving at the
-    page: a currency they already hold a wallet in is not offered, because offering
-    it would put the refusal at the end of the form's only path and make the
-    default choice an error. A closed wallet does not narrow anything - closing
-    frees the currency, which is the same rule as everywhere else.
+    ``currencies`` comes from ``OFFERED_CURRENCIES``, which is the product's
+    current menu rather than every currency the domain can represent. The domain
+    may still understand a legacy USD wallet without offering new USD wallets.
+
+    The menu is then narrowed to currencies this person can actually open. A
+    currency already held in a wallet that is not closed is omitted, because
+    presenting it would make the form's normal path end in a refusal. A closed
+    wallet does not remove the option: closing frees its currency.
 
     The refusal is still reachable and still correct: a page left open in a tab, or
     a form posted twice, carries a currency that is taken by the time it arrives,
@@ -356,7 +355,11 @@ def wallets(request: Request, user: User = Depends(web_actor)):
         "wallets.html",
         user=user,
         wallets=[translate.wallet_out(one) for one in wallets],
-        currencies=[currency.value for currency in Currency if currency not in held],
+                currencies=[
+            currency.value
+            for currency in OFFERED_CURRENCIES
+            if currency not in held
+        ],
     )
 
 

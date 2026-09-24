@@ -19,6 +19,15 @@ from app.application.notifications.deliver_pending_messages import (
 from app.presentation import cli
 from app.presentation.cli import main
 from tests.conftest import session_path_for, signed_in
+from app.domain.money.currency import Currency
+from app.infrastructure.persistence.sqlite_unit_of_work import (
+    SqliteUnitOfWorkFactory,
+)
+from tests.conftest import (
+    TEST_USER_EMAIL,
+    session_path_for,
+    signed_in,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +117,29 @@ def opened_wallet_id(db_path, capsys, currency="NGN"):
     match = re.search(r"opened wallet (\S+)", out)
     assert match, out
     return match.group(1)
+
+
+def legacy_usd_wallet_id(db_path, build_wallet):
+    """Seed a USD wallet owned by the CLI's already signed-in test account."""
+    factory = SqliteUnitOfWorkFactory(db_path)
+    uow = factory.start()
+
+    try:
+        user = uow.users.find_by_email(TEST_USER_EMAIL)
+        assert user is not None
+
+        wallet = build_wallet(
+            available="0",
+            currency=Currency.USD,
+            user_id=user.user_id,
+        )
+
+        uow.wallets.save(wallet)
+        uow.commit()
+        return str(wallet.wallet_id)
+    except Exception:
+        uow.rollback()
+        raise
 
 
 def opened_wallet_with_pot(db_path, capsys, name="Savings", kind="personal"):
@@ -354,14 +386,14 @@ class TestCreating:
         assert run(db, "plan", "list", wallet_id) == 0
         assert "Salary 2026" in capsys.readouterr().out
 
-    def test_amounts_are_read_in_the_wallets_currency(self, tmp_path, capsys):
+    def test_amounts_are_read_in_the_wallets_currency(self, tmp_path, capsys, build_wallet,):
         """A currency mismatch is unrepresentable from here, and that is a
         feature rather than an accident: bare numbers on this CLI carry no
         currency, so they are read in the wallet's, which is the currency the
         plan is then required to be in. The rule can still be broken - the
         service test proves it - but it cannot be broken by typing."""
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys, currency="USD")
+        wallet_id = legacy_usd_wallet_id(db, build_wallet)
         run(db, "plan", "create", "--wallet", wallet_id, "--name", "USD plan",
             "--source", "available", "--every", "monthly", "--from", "2026-01-01",
             *salary_lines())
@@ -1487,9 +1519,9 @@ class TestEditing:
         assert run(db, "plan", "list", wallet_id) == 0
         assert "25000.00 NGN" in capsys.readouterr().out
 
-    def test_edit_reads_amounts_in_the_plans_currency(self, tmp_path, capsys):
+    def test_edit_reads_amounts_in_the_plans_currency(self, tmp_path, capsys,build_wallet):
         db = str(tmp_path / "cli.db")
-        wallet_id = opened_wallet_id(db, capsys, currency="USD")
+        wallet_id = legacy_usd_wallet_id(db, build_wallet)
         run(db, "plan", "create", "--wallet", wallet_id, "--name", "USD plan",
             "--source", "available", "--every", "monthly", "--from", "2026-01-01",
             *salary_lines())
