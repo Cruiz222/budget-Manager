@@ -73,6 +73,9 @@ assert that a *client* would do the right thing with each.
 """
 
 import pytest
+from uuid import UUID
+
+from app.domain.money.currency import Currency
 
 from app.domain.payments.exception import (
     PaymentProviderError,
@@ -263,17 +266,19 @@ class TestTheRefusals:
         assert balance_of(wallet_id, headers) == "0.00"
 
     def test_a_wallet_the_rail_cannot_collect_is_a_409_and_nothing_is_sent(
-        self, client, a_wallet, balance_of, payment_provider
+    self,
+    client,
+    app,
+    as_user,
+    build_wallet,
+    balance_of,
+    payment_provider,
     ):
-        """**The refusal that stands between a payer and money nobody can credit.**
+        """A legacy USD wallet cannot open a collection on the NGN rail.
 
-        A wallet can be opened in any of five currencies and the rail is enabled
-        for particular ones, so a collection opened for the others would go out
-        carrying a naira label against a ledger row that says dollars. The far end
-        takes the payer's money in naira, the webhook says naira, the row says
-        dollars, and ``SettlePayment`` - which compares what arrived against what
-        was asked for - refuses for ever. Nothing is credited and the money has
-        already left the payer.
+        The MVP now opens only NGN wallets, but an older database may still contain a
+        valid USD wallet. It remains readable; what must not happen is sending its
+        deposit to a provider rail that can collect only NGN.
 
         So the assertions are three, and the middle one is the point: a 409 rather
         than a 400 because the request is well formed and there is nothing in it
@@ -285,7 +290,26 @@ class TestTheRefusals:
         this installation *does* collect is what turns the sentence into one
         somebody can act on.
         """
-        headers, wallet_id = a_wallet(currency="USD")
+        headers = as_user()
+        owner = UUID(
+        client.get("/users/me", headers=headers).json()["user_id"]
+    )
+
+        wallet = build_wallet(
+        available="0",
+        currency=Currency.USD,
+        user_id=owner,
+    )
+
+        uow = app.state.unit_of_work_factory.start()
+        try:
+            uow.wallets.save(wallet)
+            uow.commit()
+        except Exception:
+            uow.rollback()
+            raise
+
+        wallet_id = str(wallet.wallet_id)
 
         response = client.post(
             deposits_url(wallet_id), json={"amount": "5000.00"}, headers=headers

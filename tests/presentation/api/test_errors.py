@@ -26,6 +26,10 @@ reported as a bug, with none of the bug in the response.
 
 from fastapi.testclient import TestClient
 
+from uuid import UUID
+
+from app.domain.money.currency import Currency
+
 from app.presentation.api.app import create_app
 from app.presentation.api.rate_limits import POLICIES
 from tests.conftest import TEST_USER_PASSWORD
@@ -154,34 +158,45 @@ class TestConflict:
         assert response.json()["error"] == "PlanNotPausedError"
 
     def test_a_wallet_in_a_currency_this_rail_cannot_collect(
-        self, client, as_user, open_wallet
+        self,
+        client,
+        app,
+        as_user,
+        build_wallet,
     ):
-        """The newest row, and the grade that is least obvious of the three here.
+        """A legacy USD wallet's deposit refusal is translated to HTTP 409.
 
-        A 400 is ruled out because the request is well formed and there is nothing
-        in it for the caller to fix; a 503 is ruled out because this installation
-        serves deposits perfectly well against a wallet in the currency it
-        collects. What refuses *this* request is the wallet's own state - it is
-        held in a currency the rail cannot collect - which is the shape the module
-        docstring describes for 409 and the row ``WalletClosedError`` already sits
-        on.
-
-        ``open_wallet`` is asked for dollars rather than a wallet being written
-        into the store, and that is worth noting: creating one is still allowed,
-        deliberately. What is refused is the collection, not the container.
+        The current MVP no longer opens new USD wallets, but an older database
+        may still contain one. The wallet is seeded through the repository so
+        this test can exercise the current deposit endpoint against legacy data.
         """
         headers = as_user()
-        wallet_id = open_wallet(headers, currency="USD")
+        owner = UUID(
+            client.get("/users/me", headers=headers).json()["user_id"]
+        )
+
+        wallet = build_wallet(
+            available="0",
+            currency=Currency.USD,
+            user_id=owner,
+        )
+
+        uow = app.state.unit_of_work_factory.start()
+        try:
+            uow.wallets.save(wallet)
+            uow.commit()
+        except Exception:
+            uow.rollback()
+            raise
 
         response = client.post(
-            f"/wallets/{wallet_id}/deposits",
+            f"/wallets/{wallet.wallet_id}/deposits",
             json={"amount": "5000.00"},
             headers=headers,
         )
 
         assert response.status_code == 409
         assert response.json()["error"] == "CurrencyNotCollectableError"
-
 
 class TestBadRequest:
     """400 - a value in the request is not acceptable.

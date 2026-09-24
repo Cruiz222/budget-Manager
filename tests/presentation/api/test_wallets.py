@@ -76,20 +76,20 @@ class TestOpeningAWallet:
     client,
     as_user,
 ):
-    """USD is understood by the domain but is not offered by this MVP."""
-    response = client.post(
-        "/wallets",
-        json={"currency": "USD"},
-        headers=as_user(),
+        """USD is understood by the domain but is not offered by this MVP."""
+        response = client.post(
+            "/wallets",
+            json={"currency": "USD"},
+            headers=as_user(),
     )
 
-    assert response.status_code == 400
-    assert response.json()["error"] == "CurrencyNotOfferedError"
-    assert "NGN" in response.json()["detail"]
-    assert "USD" in response.json()["detail"]
+        assert response.status_code == 400
+        assert response.json()["error"] == "CurrencyNotOfferedError"
+        assert "NGN" in response.json()["detail"]
+        assert "USD" in response.json()["detail"]
 
-    listed = client.get("/wallets", headers=as_user()).json()
-    assert listed == []
+        listed = client.get("/wallets", headers=as_user()).json()
+        assert listed == []
     
 
     def test_the_caller_and_nobody_else_can_read_it_back(self, client, as_user, open_wallet):
@@ -100,18 +100,17 @@ class TestOpeningAWallet:
 
 
 class TestOneWalletPerCurrency:
-    """Decision 267: a second wallet in a currency already held is refused.
+    """Decision 267, at the layer that decides it.
 
-    **Three claims, and the third is the one that keeps the rule from being a
-    one-way door.** A duplicate is refused; the refusal is the domain's, named for
-    the reason; and a *closed* wallet does not count as holding its currency, so
-    the same currency can be opened again.
+    **The rule is asserted here and not only over HTTP**, because this is where it
+    lives: the route calls ``open_wallet`` and translates whatever comes back, so a
+    test that only ever posts to ``/wallets`` would pass against a route that did
+    the checking itself - and the CLI and the browser would each then be a door
+    with its own copy of the rule. There is one copy, and it is this one.
 
-    The refusal is 409 and not a redirect to the wallet they already had. The two
-    are both defensible and they answer different questions - "you already have
-    this" against "here it is" - and the one chosen is the one that tells a caller
-    their request could not be honoured. A client that wants the first behaviour
-    can read the listing.
+    The four claims: a duplicate is refused; a currency outside the MVP offer is
+    refused; either refusal persists nothing; and a closed wallet does not count
+    as holding its currency.
     """
 
     def test_a_second_wallet_in_a_currency_already_held_is_refused(
@@ -141,18 +140,7 @@ class TestOneWalletPerCurrency:
         listed = client.get("/wallets", headers=as_user()).json()
         assert [one["wallet_id"] for one in listed] == [opened]
 
-    def test_two_currencies_are_two_wallets(self, client, as_user, open_wallet):
-        """The rule is one wallet *per currency*, not one wallet. A test that
-        refused the second wallet of any kind would pass the two above and make
-        the USD wallet unreachable.
-        """
-        first = open_wallet(as_user())
-        second = open_wallet(as_user(), currency="USD")
-
-        listed = client.get("/wallets", headers=as_user()).json()
-
-        assert [one["wallet_id"] for one in listed] == [first, second]
-        assert [one["currency"] for one in listed] == ["NGN", "USD"]
+    
 
     def test_a_closed_wallet_does_not_hold_its_currency(self, client, as_user, open_wallet):
         """**Closing frees the currency, and this is where that is visible.**
@@ -267,38 +255,34 @@ class TestListingWallets:
         assert listed == [single]
 
     def test_it_is_oldest_first(self, client, as_user, open_wallet):
-        """The order the port promises and the page draws, so a listing that came
-        back in whatever order the store chose would shuffle somebody's wallets
-        between reloads.
+        """The older closed wallet remains before its active replacement.
 
-        **Three wallets, and reaching three now costs a close.** Decision 267
-        allows one wallet per currency, so the third cannot be a second ``NGN``
-        until the first has been closed - and that is the more valuable shape
-        anyway, because it also asserts where a *reopened* currency lands. It
-        lands at the end: the rule is about which rows exist, not about which
-        currency they hold, so closing does not send a wallet back to a place it
-        once had.
-
-        **The closed wallet keeps the position it was opened in**, which is what
-        "oldest first" has to mean for a listing that shows closed wallets at all.
-        A close updates its row rather than replacing it, so ``rowid`` - the thing
-        the port actually orders by - does not move.
+        Closing updates the existing row rather than deleting or recreating it.
+        The replacement wallet is a new row, so it belongs at the end of the
+        listing. This proves that changing status does not change creation order.
         """
         first = open_wallet(as_user())
-        second = open_wallet(as_user(), currency="USD")
 
-        closing = client.post(f"/wallets/{first}/close", headers=as_user())
-        client.post(
+        closing = client.post(
+            f"/wallets/{first}/close",
+            headers=as_user(),
+        )
+        assert closing.status_code == 201, closing.text
+
+        confirmed = client.post(
             f"/confirmations/{closing.json()['confirmation_id']}/confirm",
             headers=as_user(),
         )
-        third = open_wallet(as_user())
+        assert confirmed.status_code == 201, confirmed.text
+
+        second = open_wallet(as_user())
 
         listed = client.get("/wallets", headers=as_user()).json()
 
-        assert [one["wallet_id"] for one in listed] == [first, second, third]
-        assert [one["status"] for one in listed] == ["closed", "active", "active"]
-
+        assert [one["wallet_id"] for one in listed] == [first, second]
+        assert [one["status"] for one in listed] == ["closed", "active"]
+        
+        
     def test_it_does_not_show_a_strangers_wallet(self, client, as_user, open_wallet):
         """**Ownership is not a parameter and cannot be.** The service was built
         for one actor before the function ran, so there is no query string, no

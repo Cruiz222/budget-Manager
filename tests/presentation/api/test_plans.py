@@ -12,6 +12,9 @@ releases locked money is created against a pot holding nothing at all.
 """
 
 from tests.presentation.api.conftest import ALICE
+from uuid import UUID
+
+from app.domain.money.currency import Currency
 
 
 class TestCreatingAPlan:
@@ -313,31 +316,67 @@ class TestEditingAPlansInstructions:
         assert response.json()["total_to_move"] == {"amount": "3000.00", "currency": "NGN"}
 
     def test_the_currency_comes_from_the_plan_not_from_the_request(
-        self, client, as_user, open_wallet, create_plan, payout_line
+        self,
+        client,
+        app,
+        as_user,
+        build_wallet,
+        create_plan,
+        payout_line,
     ):
-        """A bare amount in a different wallet's currency is a different amount.
+        """A bare amount is interpreted in the plan's wallet currency.
 
-        The request body has no currency in it anywhere, so there is no way for a
-        caller to name one - the plan's own currency is what the numbers are read
-        in. Checked by editing a plan in a USD wallet and watching the answer come
-        back in USD: the same string ``"3000.00"`` means two different sums, and
-        only the plan can say which one this is.
+        The request body contains no currency, so the plan must obtain it from
+        its wallet. A legacy USD wallet makes this test capable of catching code
+        that silently hard-codes NGN even though this MVP no longer opens new
+        USD wallets.
         """
         headers = as_user()
-        wallet_id = open_wallet(headers, currency="USD")
-        plan_id = create_plan(wallet_id, headers).json()["plan_id"]
+        owner = UUID(
+            client.get(
+                "/users/me",
+                headers=headers,
+            ).json()["user_id"]
+        )
+
+        wallet = build_wallet(
+            available="0",
+            currency=Currency.USD,
+            user_id=owner,
+        )
+
+        uow = app.state.unit_of_work_factory.start()
+        try:
+            uow.wallets.save(wallet)
+            uow.commit()
+        except Exception:
+            uow.rollback()
+            raise
+
+        plan = create_plan(
+            str(wallet.wallet_id),
+            headers,
+        )
+        assert plan.status_code == 201, plan.text
+        plan_id = plan.json()["plan_id"]
 
         response = client.put(
             f"/plans/{plan_id}/instructions",
-            json={"instructions": [payout_line("3000.00", "April rent")]},
+            json={
+                "instructions": [
+                    payout_line("3000.00", "April rent")
+                ]
+            },
             headers=headers,
         )
 
+        assert response.status_code == 200, response.text
         assert response.json()["instructions"][0]["amount"] == {
             "amount": "3000.00",
             "currency": "USD",
         }
-
+        
+        
     def test_a_plan_that_releases_locked_money_refuses_it(self, client, as_user, open_wallet, open_pot, create_plan):
         """The same rule as ``cancel``, and the same 409.
 
