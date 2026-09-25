@@ -150,3 +150,9 @@ class DepositAlreadyInitiatedError(PaymentError):
 
 class InvalidVirtualAccountError(PaymentError):
     pass
+
+class VirtualAccountNotFoundError(PaymentError):
+    pass
+
+class VirtualAccountNotReadyError(PaymentError):
+    pass    
