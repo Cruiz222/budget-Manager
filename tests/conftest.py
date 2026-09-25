@@ -263,6 +263,34 @@ def signed_in(
 #: compare against anything.
 OTHER_USER_ID = UUID("00000000-0000-4000-8000-000000000002")
 
+def starter_wallet_id(
+    db_path: str,
+    email: str = TEST_USER_EMAIL,
+) -> str:
+    """Return the live NGN wallet automatically created during signup."""
+    factory = SqliteUnitOfWorkFactory(db_path)
+    uow = factory.start()
+
+    try:
+        user = uow.users.find_by_email(email)
+        assert user is not None, f"no test account exists for {email}"
+
+        wallets = [
+            wallet
+            for wallet in uow.wallets.list_for_owner(user.user_id)
+            if (
+                wallet.currency is Currency.NGN
+                and wallet.status is not WalletStatus.CLOSED
+            )
+        ]
+
+        assert len(wallets) == 1, (
+            f"expected one live NGN starter wallet, found {len(wallets)}"
+        )
+        return str(wallets[0].wallet_id)
+    finally:
+        uow.rollback()
+
 
 @pytest.fixture
 def actor():

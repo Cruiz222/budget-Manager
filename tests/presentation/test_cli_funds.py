@@ -20,7 +20,7 @@ from uuid import uuid4
 import pytest
 
 from app.presentation.cli import main
-from tests.conftest import session_path_for, signed_in
+from tests.conftest import session_path_for, signed_in, starter_wallet_id
 
 
 @pytest.fixture(autouse=True)
@@ -51,11 +51,9 @@ def days_from_now(days: int) -> str:
 
 
 def opened_wallet_id(db_path, capsys):
-    assert run(db_path, "open", "--currency", "NGN") == 0
-    out = capsys.readouterr().out
-    match = re.search(r"opened wallet (\S+)", out)
-    assert match, out
-    return match.group(1)
+    """Return the NGN wallet that signup opened for the test account."""
+    capsys.readouterr()
+    return starter_wallet_id(db_path)
 
 
 def opened_pot(db_path, capsys, wallet_id, name="Vacation", kind="personal", matures=None):

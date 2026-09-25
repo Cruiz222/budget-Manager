@@ -542,13 +542,16 @@ class TestTheRefusals:
         )
         assert signed_in.status_code == 201, signed_in.text
         headers = {"Authorization": f"Bearer {signed_in.json()['token']}"}
-        wallet = unconfigured_client.post(
-            "/wallets", json={"currency": "NGN"}, headers=headers
+        wallets = unconfigured_client.get(
+            "/wallets",
+            headers=headers,
         )
-        assert wallet.status_code == 201, wallet.text
+        assert wallets.status_code == 200, wallets.text
+        assert len(wallets.json()) == 1
+        wallet_id = wallets.json()[0]["wallet_id"]
 
         response = unconfigured_client.post(
-            deposits_url(wallet.json()["wallet_id"]),
+            deposits_url(wallet_id),
             json={"amount": "5000.00"},
             headers=headers,
         )

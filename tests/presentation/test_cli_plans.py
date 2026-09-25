@@ -27,6 +27,7 @@ from tests.conftest import (
     TEST_USER_EMAIL,
     session_path_for,
     signed_in,
+    starter_wallet_id
 )
 
 
@@ -112,11 +113,12 @@ def receipts_go_somewhere_else(monkeypatch, build_channel):
 
 
 def opened_wallet_id(db_path, capsys, currency="NGN"):
-    assert run(db_path, "open", "--currency", currency) == 0
-    out = capsys.readouterr().out
-    match = re.search(r"opened wallet (\S+)", out)
-    assert match, out
-    return match.group(1)
+    """Return the NGN wallet that signup opened for the test account."""
+    assert currency == "NGN", (
+        "legacy non-NGN wallets must be seeded with legacy_usd_wallet_id"
+    )
+    capsys.readouterr()
+    return starter_wallet_id(db_path)
 
 
 def legacy_usd_wallet_id(db_path, build_wallet):

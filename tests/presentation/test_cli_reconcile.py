@@ -42,7 +42,7 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
 from app.presentation.cli import main
-from tests.conftest import TEST_PAYSTACK_SECRET, session_path_for, signed_in
+from tests.conftest import TEST_PAYSTACK_SECRET, session_path_for, signed_in, starter_wallet_id
 
 #: Where a seeded deposit was made, and the moment the runs below are run at.
 #: Both are fixed rather than read from a clock for the reason the use case takes
@@ -108,22 +108,10 @@ def run(db_path, *argv):
     return main(["--db", db_path, "--session", session_path_for(db_path), *argv])
 
 
-def opened_wallet_id(db_path, capsys) -> str:
-    """Create a wallet through the CLI, and return the id it printed.
-
-    Through the command rather than by handing this file a fixture-built wallet,
-    and that is not a preference. ``signed_in`` registers an account and signup
-    mints its own user id, so a wallet built by ``build_wallet`` would belong to
-    ``TEST_USER_ID`` - an owner no command in this file can act as, since every
-    one of them resolves the actor from the session. The first version of this
-    file seeded the wallet directly and the ``balance`` read failed with "no such
-    wallet" for exactly that reason.
-    """
-    assert run(db_path, "open", "--currency", "NGN") == 0
-    out = capsys.readouterr().out
-    match = re.search(r"opened wallet (\S+)", out)
-    assert match, out
-    return match.group(1)
+def opened_wallet_id(db_path, capsys):
+    """Return the NGN wallet that signup opened for the test account."""
+    capsys.readouterr()
+    return starter_wallet_id(db_path)
 
 
 def seed_deposit(db_path, wallet_id, reference="dep-1"):

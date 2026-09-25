@@ -223,18 +223,15 @@ class TestListingWallets:
     client invented; it is one it was the first client to run into.
     """
 
-    def test_a_person_who_has_opened_nothing_gets_an_empty_list(self, client, as_user):
-        """**A list and not a 404**, which is the one place this differs from the
-        read beside it. ``GET /wallets/{id}`` is asked about a wallet the caller
-        named, so finding nothing is a contradiction; this is asked by somebody
-        who does not know what they hold, so "nothing" is merely true - and
-        answering it with an error would make the first page a new person sees an
-        error page.
-        """
+    def test_a_new_account_gets_its_starter_wallet(self, client, as_user):
+        """Signup creates one active NGN wallet before the account is returned."""
         response = client.get("/wallets", headers=as_user())
 
         assert response.status_code == 200
-        assert response.json() == []
+        wallets = response.json()
+        assert len(wallets) == 1
+        assert wallets[0]["currency"] == "NGN"
+        assert wallets[0]["status"] == "active"
 
     def test_it_gives_back_what_they_opened(self, client, as_user, open_wallet):
         opened = open_wallet(as_user())
@@ -336,18 +333,20 @@ class TestListingWallets:
 
 
 class TestReadingAWallet:
-    def test_reading_it_back_gives_the_same_wallet(self, client, as_user):
-        """The round trip is closed, which is the least a client can expect.
-
-        ``POST`` returns a wallet and ``GET`` returns a wallet, and if the two
-        disagreed then one of them would be rendering something the other does not
-        store - the kind of difference that shows up as a client that "sometimes"
-        shows a stale balance.
-        """
+    def test_reading_it_back_gives_the_same_wallet(self, client, as_user, open_wallet):
+        """The single-wallet route agrees with the wallet-list route."""
         headers = as_user()
-        created = client.post("/wallets", json={"currency": "NGN"}, headers=headers).json()
+        wallet_id = open_wallet(headers)
 
-        read = client.get(f"/wallets/{created['wallet_id']}", headers=headers).json()
+        listed = client.get("/wallets", headers=headers).json()
+        created = next(
+            wallet for wallet in listed if wallet["wallet_id"] == wallet_id
+        )
+
+        read = client.get(
+            f"/wallets/{wallet_id}",
+            headers=headers,
+        ).json()
 
         assert read == created
 

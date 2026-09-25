@@ -188,23 +188,42 @@ class Browser:
     # --- money ------------------------------------------------------------
 
     def open_wallet(self, currency: str = "NGN", email: str = ALICE) -> str:
-        """Become ``email`` if nobody is signed in, open a wallet, return its id.
+        """Return an existing live wallet, or open one when none exists.
 
-        The id comes off the landing page after the POST, because a link is how a
-        browser learns one - see ``WALLET_LINK``. It is found by *difference*
-        rather than by position, so a browser opening its second wallet returns
-        the second one: ``wallet_ids()[0]`` would silently hand back the first,
-        and a test about two wallets would then be about one.
+        Signup creates the first NGN wallet automatically. If NGN is absent from
+        the form but a wallet is listed, that existing wallet is the live starter
+        wallet. After it is closed, NGN returns to the form and this helper opens
+        its replacement.
         """
         if self.token is None:
             self.sign_up(email)
 
-        before = set(self.wallet_ids())
-        response = self.post(f"{urls.PREFIX}/wallets", data={"currency": currency})
+        before = self.wallet_ids()
+        landing_page = self.page(urls.LANDING_PATH)
+        currency_option = f'value="{currency}"'
+
+        if (
+            currency == "NGN"
+            and before
+            and currency_option not in landing_page
+        ):
+            return before[-1]
+
+        response = self.post(
+            f"{urls.PREFIX}/wallets",
+            data={"currency": currency},
+        )
         assert response.status_code == 303, response.text
 
-        fresh = [one for one in self.wallet_ids() if one not in before]
-        assert len(fresh) == 1, f"opening a wallet added {len(fresh)} of them"
+        previous_ids = set(before)
+        fresh = [
+            wallet_id
+            for wallet_id in self.wallet_ids()
+            if wallet_id not in previous_ids
+        ]
+        assert len(fresh) == 1, (
+            f"opening a wallet added {len(fresh)} of them"
+        )
         return fresh[0]
 
     def request_withdrawal(

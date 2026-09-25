@@ -58,24 +58,16 @@ def close_through_the_service(browser, wallet_id: str) -> None:
 
 
 class TestTheCurrenciesOnOffer:
-    def test_a_new_account_is_offered_every_currency_the_mvp_serves(
+    def test_a_new_account_already_holds_the_mvp_currency(
         self,
         browser,
     ):
-        """The current MVP offers one wallet currency: NGN."""
+        """Signup creates NGN, so there is no remaining currency to offer."""
         browser.sign_up()
 
-        assert offered(browser.page(urls.LANDING_PATH)) == ["NGN"]
+        assert offered(browser.page(urls.LANDING_PATH)) == []
+        assert len(browser.wallet_ids()) == 1
 
-    def test_the_page_offers_the_naira_first(self, browser):
-        """**The order is part of the interface**, because the first option is what
-        a person gets by clicking the button without opening the dropdown. NGN is
-        the currency this installation can actually collect in - the rail is
-        naira-only - so it is the one that should be reached by accident.
-        """
-        browser.sign_up()
-
-        assert offered(browser.page(urls.LANDING_PATH))[0] == "NGN"
 
     def test_a_currency_already_held_is_no_longer_offered(self, browser):
         """The rule as a person meets it: not a refusal, an absence. The wallet
