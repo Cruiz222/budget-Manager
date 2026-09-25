@@ -32,7 +32,18 @@ class VirtualAccount:
             raise InvalidVirtualAccountError(
                 "virtual account provider must be a non-empty string"
         )
-    
+
+        if (
+            self.provider_customer_code is not None
+            and (
+                not isinstance(self.provider_customer_code, str)
+                or self.provider_customer_code.strip() == ""
+            )
+        ):
+            raise InvalidVirtualAccountError(
+                "provider customer code must be a non-empty string"
+            )
+
         if self.status is VirtualAccountStatus.ACTIVE:
             required_fields = {
                 "provider_customer_code": self.provider_customer_code,
@@ -84,3 +95,31 @@ class VirtualAccount:
             account_name=account_name,
             bank_name=bank_name,
     )                
+
+
+    def record_provider_customer_code(
+        self,
+        provider_customer_code: str,
+    ) -> "VirtualAccount":
+        """Return the pending account linked to its provider customer.
+
+        The original account remains unchanged because this dataclass is frozen.
+        A customer code can be recorded once: replacing it could disconnect this
+        wallet from the provider customer that already owns its bank account.
+        """
+        if self.status is not VirtualAccountStatus.PENDING:
+            raise InvalidVirtualAccountError(
+                "only a pending virtual account can record a customer code"
+            )
+
+        if self.provider_customer_code is not None:
+            raise InvalidVirtualAccountError(
+                "virtual account already has a provider customer code"
+            )
+
+        return VirtualAccount(
+            wallet_id=self.wallet_id,
+            status=self.status,
+            provider=self.provider,
+            provider_customer_code=provider_customer_code,
+        )    

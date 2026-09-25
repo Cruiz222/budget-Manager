@@ -160,4 +160,62 @@ def test_virtual_account_requires_a_provider(provider):
             status=VirtualAccountStatus.PENDING,
             provider=provider,
         )        
-        
+
+
+def test_pending_virtual_account_can_record_its_provider_customer_code():
+    pending = VirtualAccount(
+        wallet_id=uuid.uuid4(),
+        status=VirtualAccountStatus.PENDING,
+        provider="paystack",
+    )
+
+    recorded = pending.record_provider_customer_code("CUS_123")
+
+    # VirtualAccount is frozen, so the original value object is unchanged.
+    assert pending.provider_customer_code is None
+
+    assert recorded.wallet_id == pending.wallet_id
+    assert recorded.status is VirtualAccountStatus.PENDING
+    assert recorded.provider == "paystack"
+    assert recorded.provider_customer_code == "CUS_123"
+    assert recorded.account_number is None
+    assert recorded.account_name is None
+    assert recorded.bank_name is None
+
+
+@pytest.mark.parametrize("customer_code", ["", "   ", 123])
+def test_provider_customer_code_must_be_a_non_empty_string(customer_code):
+    with pytest.raises(InvalidVirtualAccountError):
+        VirtualAccount(
+            wallet_id=uuid.uuid4(),
+            status=VirtualAccountStatus.PENDING,
+            provider="paystack",
+            provider_customer_code=customer_code,
+        )
+
+
+def test_an_active_virtual_account_cannot_record_another_customer_code():
+    active = VirtualAccount(
+        wallet_id=uuid.uuid4(),
+        status=VirtualAccountStatus.ACTIVE,
+        provider="paystack",
+        provider_customer_code="CUS_123",
+        account_number="1234567890",
+        account_name="JOHNNY SUCCESSFUL",
+        bank_name="Wema Bank",
+    )
+
+    with pytest.raises(InvalidVirtualAccountError):
+        active.record_provider_customer_code("CUS_456")
+
+
+def test_a_recorded_customer_code_cannot_be_replaced():
+    pending = VirtualAccount(
+        wallet_id=uuid.uuid4(),
+        status=VirtualAccountStatus.PENDING,
+        provider="paystack",
+        provider_customer_code="CUS_123",
+    )
+
+    with pytest.raises(InvalidVirtualAccountError):
+        pending.record_provider_customer_code("CUS_456")

@@ -117,4 +117,44 @@ def test_save_updates_a_pending_account_to_active(build_wallet):
     ).fetchone()[0]
 
     assert row_count == 1    
+
+
+
+def test_save_updates_pending_account_with_provider_customer_code(build_wallet):
+    connection = open_sqlite_connection(":memory:")
+    wallet_repository = SqliteWalletRepository(connection)
+    repository = SqliteVirtualAccountRepository(connection)
+
+    wallet = build_wallet()
+    wallet_repository.save(wallet)
+
+    pending = VirtualAccount(
+        wallet_id=wallet.wallet_id,
+        status=VirtualAccountStatus.PENDING,
+        provider="paystack",
+    )
+    repository.save(pending)
+
+    linked = pending.record_provider_customer_code("CUS_123")
+    repository.save(linked)
+
+    stored = repository.get_by_wallet_id(wallet.wallet_id)
+
+    assert stored == linked
+    assert stored.status is VirtualAccountStatus.PENDING
+    assert stored.provider_customer_code == "CUS_123"
+    assert stored.account_number is None
+    assert stored.account_name is None
+    assert stored.bank_name is None
+
+    row_count = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM virtual_accounts
+        WHERE wallet_id = ?
+        """,
+        (str(wallet.wallet_id),),
+    ).fetchone()[0]
+
+    assert row_count == 1    
        
