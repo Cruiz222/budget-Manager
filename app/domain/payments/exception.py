@@ -156,3 +156,6 @@ class VirtualAccountNotFoundError(PaymentError):
 
 class VirtualAccountNotReadyError(PaymentError):
     pass    
+
+class PaymentProviderError(PaymentError):
+    pass    

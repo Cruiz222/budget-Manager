@@ -1,19 +1,8 @@
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
-
+from app.composition_root import build_provision_virtual_account
 from app import composition_root
-from app.composition_root import (
-    build_deliverer,
-    build_initiate_deposit,
-    build_notification_deliverer,
-    build_notifier,
-    build_reconciler,
-    build_scheduler,
-    build_settler,
-    build_wallet_service,
-    provider_for,
-)
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.domain.money.currency import Currency
 from app.domain.money.money import Money
@@ -32,6 +21,19 @@ from app.infrastructure.persistence.sqlite_unit_of_work import (
 )
 from app.infrastructure.settings import EmailSettings, PaystackSettings
 from tests.conftest import TEST_USER_ID
+
+from app.composition_root import (
+    build_deliverer,
+    build_initiate_deposit,
+    build_notification_deliverer,
+    build_notifier,
+    build_reconciler,
+    build_scheduler,
+    build_settler,
+    build_wallet_service,
+    provider_for,
+    virtual_account_provider_for,
+)
 
 NGN = Currency.NGN
 
@@ -857,3 +859,102 @@ def test_build_reconciler_without_settings_still_recovers_and_says_nothing(
         read.rollback()
     assert stored.available_balance == Money(Decimal("5000"), NGN)
 
+
+
+def test_virtual_account_provider_without_settings_is_none():
+    assert virtual_account_provider_for(None) is None
+
+
+def test_virtual_account_provider_turns_settings_into_paystack(
+    monkeypatch,
+):
+    captured = {}
+
+    class RecordingProvider:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        composition_root,
+        "PaystackVirtualAccountProvider",
+        RecordingProvider,
+    )
+
+    virtual_account_provider_for(
+        PaystackSettings(secret_key=SECRET)
+    )
+
+    assert captured == {
+        "secret_key": SECRET,
+    }
+
+
+def test_an_injected_virtual_account_provider_beats_settings(
+    monkeypatch,
+):
+    class NeverBuilt:
+        def __init__(self, **kwargs):
+            raise AssertionError(
+                "settings must not be used when a provider is injected"
+            )
+
+    monkeypatch.setattr(
+        composition_root,
+        "PaystackVirtualAccountProvider",
+        NeverBuilt,
+        raising=False,
+    )
+    injected = object()
+
+    chosen = virtual_account_provider_for(
+        PaystackSettings(secret_key=SECRET),
+        injected,
+    )
+
+    assert chosen is injected
+
+
+
+def test_build_provision_virtual_account_joins_its_three_dependencies(
+    monkeypatch,
+):
+    captured = {}
+
+    class RecordingProvisioner:
+        def __init__(
+            self,
+            unit_of_work_factory,
+            provider,
+            *,
+            actor,
+        ):
+            captured.update(
+                {
+                    "unit_of_work_factory": unit_of_work_factory,
+                    "provider": provider,
+                    "actor": actor,
+                }
+            )
+
+    monkeypatch.setattr(
+        composition_root,
+        "ProvisionVirtualAccount",
+        RecordingProvisioner,
+        raising=False,
+    )
+
+    factory = object()
+    provider = object()
+
+    build_provision_virtual_account(
+        unit_of_work_factory=factory,
+        settings=PaystackSettings(secret_key=SECRET),
+        actor=ACTOR,
+        provider=provider,
+    )
+
+    assert captured == {
+        "unit_of_work_factory": factory,
+        "provider": provider,
+        "actor": ACTOR,
+    }

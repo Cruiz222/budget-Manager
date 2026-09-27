@@ -1,5 +1,7 @@
 from uuid import UUID
-
+from app.application.payments.provision_virtual_account import (
+    ProvisionVirtualAccount,
+)
 from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.confirm_password_reset import ConfirmPasswordReset
 from app.application.identity.confirm_phone_sign_up import ConfirmPhoneSignUp
@@ -19,6 +21,9 @@ from app.application.notifications.deliver_pending_messages import (
     DeliverPendingMessages,
 )
 from app.application.payments.initiate_deposit import InitiateDeposit
+from app.application.payments.provision_virtual_account import (
+    ProvisionVirtualAccount,
+)
 from app.application.payments.reconcile_payments import ReconcilePayments
 from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
@@ -49,6 +54,9 @@ from app.infrastructure.notifications.smtp_notification_channel import (
 from app.infrastructure.notifications.termii_sms_channel import TermiiSmsChannel
 from app.infrastructure.payments.paystack_payment_provider import (
     PaystackPaymentProvider,
+)
+from app.infrastructure.payments.paystack_virtual_account_provider import (
+    PaystackVirtualAccountProvider,
 )
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
@@ -135,6 +143,27 @@ def provider_for(
         secret_key=settings.secret_key, callback_url=callback_url
     )
 
+
+def virtual_account_provider_for(
+    settings: PaystackSettings | None,
+    provider=None,
+):
+    """Choose the injected virtual-account provider or build Paystack's.
+
+    An injected provider wins so tests and other installations can replace the
+    external service. ``None`` means Paystack is not configured, matching
+    ``provider_for``. Otherwise both payment adapters receive the same secret
+    key because they belong to the same Paystack integration.
+    """
+    if provider is not None:
+        return provider
+
+    if settings is None:
+        return None
+
+    return PaystackVirtualAccountProvider(
+        secret_key=settings.secret_key,
+    )
 
 def google_verifier_for(
     settings: GoogleSettings | None, verifier=None
@@ -231,6 +260,22 @@ def build_initiate_deposit(
         provider=provider_for(settings, provider),
         actor=actor,
     )
+
+
+def build_provision_virtual_account(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    settings: PaystackSettings | None = None,
+    *,
+    actor: UUID,
+    provider=None,
+) -> ProvisionVirtualAccount:
+    """Wire virtual-account provisioning for one authenticated actor."""
+    return ProvisionVirtualAccount(
+        unit_of_work_factory
+        or SqliteUnitOfWorkFactory(),
+        virtual_account_provider_for(settings, provider),
+        actor=actor,
+    )    
 
 
 def build_settler(

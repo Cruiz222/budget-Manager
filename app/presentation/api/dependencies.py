@@ -119,6 +119,9 @@ from app.application.identity.resolve_actor import ResolveActorFromSession
 from app.application.identity.sign_up import SignUp
 from app.application.identity.sign_up_with_google import SignUpWithGoogle
 from app.application.payments.initiate_deposit import InitiateDeposit
+from app.application.payments.provision_virtual_account import (
+    ProvisionVirtualAccount,
+)
 from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
 from app.application.profile_service import ProfileService
@@ -128,6 +131,7 @@ from app.composition_root import (
     build_confirm_password_reset,
     build_confirm_phone_sign_up,
     build_initiate_deposit,
+    build_provision_virtual_account,
     build_log_in,
     build_log_in_with_google,
     build_log_out,
@@ -145,6 +149,14 @@ from app.composition_root import (
 from app.domain.identity.phoneNumber import fold_phone
 from app.domain.identity.user import User, fold_email
 from app.domain.payments.paymentProvider import PaymentProvider
+from app.domain.payments.virtualAccountProvider import (
+    VirtualAccountProvider,
+)
+from app.application.payments.initiate_deposit import InitiateDeposit
+from app.application.payments.provision_virtual_account import (
+    ProvisionVirtualAccount,
+)
+from app.application.payments.settle_payment import SettlePayment
 from app.presentation.api import rate_limits, schemas
 from app.presentation.api.errors import (
     MissingCredentialsError,

@@ -2,6 +2,14 @@ import httpx
 import pytest
 
 from app.domain.payments.exception import (
+    PaymentProviderError,
+    PaymentProviderUnavailableError,
+
+)
+
+from app.domain.payments.exception import (
+    InvalidProviderAnswerError,
+    PaymentProviderError,
     PaymentProviderUnavailableError,
 )
 
@@ -139,7 +147,7 @@ def test_create_virtual_account_returns_the_issued_bank_details(
             "Content-Type": "application/json",
         },
         "timeout": DEFAULT_TIMEOUT,
-    }    
+    }
 
 
 def test_a_network_failure_is_reported_as_provider_unavailable(
@@ -165,3 +173,149 @@ def test_a_network_failure_is_reported_as_provider_unavailable(
             first_name="Johnny",
             last_name="Successful",
         )    
+
+
+def test_a_server_error_is_reported_as_provider_unavailable(
+    monkeypatch,
+):
+    requesting = RecordingRequest()
+    requesting.response = httpx.Response(
+        503,
+        json={
+            "status": False,
+            "message": "Service unavailable",
+        },
+    )
+    monkeypatch.setattr(
+        paystack_virtual_account_provider.httpx,
+        "request",
+        requesting,
+    )
+    provider = PaystackVirtualAccountProvider(
+        secret_key=TEST_PAYSTACK_SECRET
+    )
+
+    with pytest.raises(PaymentProviderUnavailableError):
+        provider.create_customer(
+            email="johnny@example.com",
+            phone="2348012345678",
+            first_name="Johnny",
+            last_name="Successful",
+        )        
+
+
+def test_a_refused_request_is_reported_as_a_provider_error(
+    monkeypatch,
+):
+    requesting = RecordingRequest()
+    requesting.response = httpx.Response(
+        400,
+        json={
+            "status": False,
+            "message": "Customer information is invalid",
+        },
+    )
+    monkeypatch.setattr(
+        paystack_virtual_account_provider.httpx,
+        "request",
+        requesting,
+    )
+    provider = PaystackVirtualAccountProvider(
+        secret_key=TEST_PAYSTACK_SECRET
+    )
+
+    with pytest.raises(PaymentProviderError):
+        provider.create_customer(
+            email="johnny@example.com",
+            phone="2348012345678",
+            first_name="Johnny",
+            last_name="Successful",
+        )        
+
+
+
+def test_a_non_json_success_is_reported_as_provider_unavailable(
+    monkeypatch,
+):
+    requesting = RecordingRequest()
+    requesting.response = httpx.Response(
+        200,
+        text="<html>unexpected provider response</html>",
+    )
+    monkeypatch.setattr(
+        paystack_virtual_account_provider.httpx,
+        "request",
+        requesting,
+    )
+    provider = PaystackVirtualAccountProvider(
+        secret_key=TEST_PAYSTACK_SECRET
+    )
+
+    with pytest.raises(PaymentProviderUnavailableError):
+        provider.create_customer(
+            email="johnny@example.com",
+            phone="2348012345678",
+            first_name="Johnny",
+            last_name="Successful",
+        )        
+
+
+def test_a_customer_response_without_a_code_is_invalid(
+    monkeypatch,
+):
+    requesting = RecordingRequest()
+    requesting.response = httpx.Response(
+        200,
+        json={
+            "status": True,
+            "message": "Customer created",
+            "data": {},
+        },
+    )
+    monkeypatch.setattr(
+        paystack_virtual_account_provider.httpx,
+        "request",
+        requesting,
+    )
+    provider = PaystackVirtualAccountProvider(
+        secret_key=TEST_PAYSTACK_SECRET
+    )
+
+    with pytest.raises(InvalidProviderAnswerError):
+        provider.create_customer(
+            email="johnny@example.com",
+            phone="2348012345678",
+            first_name="Johnny",
+            last_name="Successful",
+        )
+
+
+def test_a_virtual_account_response_without_bank_details_is_invalid(
+    monkeypatch,
+):
+    requesting = RecordingRequest()
+    requesting.response = httpx.Response(
+        200,
+        json={
+            "status": True,
+            "message": "NUBAN successfully created",
+            "data": {
+                "account_number": "1234567890",
+                "account_name": "BUDGET / JOHNNY SUCCESSFUL",
+                "bank": {},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        paystack_virtual_account_provider.httpx,
+        "request",
+        requesting,
+    )
+    provider = PaystackVirtualAccountProvider(
+        secret_key=TEST_PAYSTACK_SECRET
+    )
+
+    with pytest.raises(InvalidProviderAnswerError):
+        provider.create_virtual_account(
+            customer_code="CUS_123"
+        )                

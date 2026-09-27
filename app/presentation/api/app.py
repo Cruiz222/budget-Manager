@@ -55,7 +55,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from app.composition_root import google_verifier_for, provider_for
+from app.composition_root import google_verifier_for, provider_for, virtual_account_provider_for
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
@@ -154,6 +154,7 @@ def create_app(
     password_hasher=None,
     paystack_settings=None,
     payment_provider=None,
+    virtual_account_provider=None,
     termii_settings=None,
     google_settings=None,
     google_verifier=None,
@@ -399,6 +400,14 @@ def create_app(
         )
         if payment_provider is None
         else payment_provider
+    )
+
+    application.state.virtual_account_provider = (
+        virtual_account_provider_for(
+            application.state.paystack,
+        )
+        if virtual_account_provider is None
+        else virtual_account_provider
     )
     application.state.termii = (
         termii_from_environment() if termii_settings is None else termii_settings

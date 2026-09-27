@@ -1,5 +1,11 @@
 import httpx
 
+from app.domain.payments.exception import (
+    InvalidProviderAnswerError,
+    PaymentProviderError,
+    PaymentProviderUnavailableError,
+)
+
 from app.domain.payments.virtualAccountDetails import (
     VirtualAccountDetails,
 )
@@ -11,6 +17,7 @@ from app.infrastructure.payments.paystack_payment_provider import (
     DEFAULT_TIMEOUT,
 )
 from app.domain.payments.exception import (
+    PaymentProviderError,
     PaymentProviderUnavailableError,
 )
 
@@ -34,7 +41,23 @@ class PaystackVirtualAccountProvider(VirtualAccountProvider):
             "last_name": last_name,
             },
         )
-        return body["data"]["customer_code"]    
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise InvalidProviderAnswerError(
+                "the virtual account provider returned no customer"
+            )
+
+        customer_code = data.get("customer_code")
+        if (
+            not isinstance(customer_code, str)
+            or customer_code.strip() == ""
+        ):
+            raise InvalidProviderAnswerError(
+                "the virtual account provider returned a customer "
+                "without a customer code"
+            )
+
+        return customer_code    
 
     def create_virtual_account(
         self,
@@ -47,7 +70,40 @@ class PaystackVirtualAccountProvider(VirtualAccountProvider):
                 "customer": customer_code,
             },
         )
-        data = body["data"]
+        data = body.get("data")
+        if not isinstance(data, dict):
+            raise InvalidProviderAnswerError(
+                "the virtual account provider returned no bank account"
+            )
+
+        bank = data.get("bank")
+        if not isinstance(bank, dict):
+            raise InvalidProviderAnswerError(
+                "the virtual account provider returned no bank"
+            )
+
+        account_number = data.get("account_number")
+        account_name = data.get("account_name")
+        bank_name = bank.get("name")
+
+        details = {
+            "account number": account_number,
+            "account name": account_name,
+            "bank name": bank_name,
+        }
+
+        for label, value in details.items():
+            if not isinstance(value, str) or value.strip() == "":
+                raise InvalidProviderAnswerError(
+                    "the virtual account provider returned an account "
+                    f"without a valid {label}"
+                )
+
+        return VirtualAccountDetails(
+            account_number=account_number,
+            account_name=account_name,
+            bank_name=bank_name,
+        )
 
         return VirtualAccountDetails(
             account_number=data["account_number"],
@@ -79,4 +135,22 @@ class PaystackVirtualAccountProvider(VirtualAccountProvider):
                 f"{type(failure).__name__}"
             ) from failure
 
-        return response.json()
+        if response.status_code >= 500:
+            raise PaymentProviderUnavailableError(
+                "the virtual account provider failed this call with "
+                f"{response.status_code}"
+            )
+
+        if 400 <= response.status_code < 500:
+            raise PaymentProviderError(
+                "the virtual account provider refused this call with "
+                f"{response.status_code}"
+            )
+
+        try:
+            return response.json()
+        except ValueError as failure:
+            raise PaymentProviderUnavailableError(
+                "the virtual account provider returned a response "
+                "that was not JSON"
+            ) from failure
