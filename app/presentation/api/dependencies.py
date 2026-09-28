@@ -630,6 +630,35 @@ def payment_provider(request: Request) -> PaymentProvider:
     return provider
 
 
+def virtual_account_provider(
+    request: Request,
+) -> VirtualAccountProvider:
+    """Return this installation's virtual-account provider, or refuse."""
+    provider = request.app.state.virtual_account_provider
+
+    if provider is None:
+        raise PaymentsUnconfiguredError(
+            "this installation has no virtual account provider configured"
+        )
+
+    return provider
+
+
+def virtual_account_service(
+    request: Request,
+    actor: User = Depends(current_actor),
+    provider: VirtualAccountProvider = Depends(
+        virtual_account_provider
+    ),
+) -> ProvisionVirtualAccount:
+    """Build virtual-account provisioning for this request's actor."""
+    return build_provision_virtual_account(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        settings=request.app.state.paystack,
+        actor=actor.user_id,
+        provider=provider,
+    )
+
 def deposit_service(
     request: Request,
     actor: User = Depends(current_actor),

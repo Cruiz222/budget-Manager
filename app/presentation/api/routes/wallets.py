@@ -7,7 +7,10 @@ from app.application.payments.initiate_deposit import InitiateDeposit
 from app.application.wallet_service import WalletService
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.presentation.api import schemas, translate
-from app.presentation.api.dependencies import deposit_service, wallet_service
+from app.presentation.api.dependencies import deposit_service, wallet_service, virtual_account_service
+from app.application.payments.provision_virtual_account import (
+    ProvisionVirtualAccount,
+)
 
 router = APIRouter(tags=["wallets"])
 
@@ -389,3 +392,18 @@ def deposit(
         payload.ref if payload.ref is not None else str(uuid4()),
     )
     return translate.initiated_deposit_out(initiated)
+
+
+@router.post(
+    "/wallets/{wallet_id}/virtual-account",
+    response_model=schemas.VirtualAccountOut,
+)
+def provision_virtual_account(
+    wallet_id: UUID,
+    service: ProvisionVirtualAccount = Depends(
+        virtual_account_service
+    ),
+) -> schemas.VirtualAccountOut:
+    """Provision and return this wallet's virtual bank account."""
+    account = service.execute(wallet_id)
+    return translate.virtual_account_out(account)

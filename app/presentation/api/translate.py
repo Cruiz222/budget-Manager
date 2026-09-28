@@ -24,7 +24,7 @@ Money, in particular, is formatted in exactly one function - which is what keeps
 
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-
+from app.domain.payments.virtualAccount import VirtualAccount
 from app.application.identity.confirm_email_change import ConfirmedEmailChange
 from app.application.identity.confirm_password_reset import ConfirmedPasswordReset
 from app.application.identity.log_in import LoggedIn
@@ -276,6 +276,19 @@ def initiated_deposit_out(deposit: InitiatedDeposit) -> schemas.DepositIntentOut
         status=deposit.status.value,
     )
 
+
+def virtual_account_out(
+    account: VirtualAccount,
+) -> schemas.VirtualAccountOut:
+    """A virtual account as an API client sees it."""
+    return schemas.VirtualAccountOut(
+        wallet_id=account.wallet_id,
+        status=account.status.value,
+        provider=account.provider,
+        account_number=account.account_number,
+        account_name=account.account_name,
+        bank_name=account.bank_name,
+    )
 
 def schedule_out(schedule: Schedule) -> schemas.ScheduleOut:
     return schemas.ScheduleOut(

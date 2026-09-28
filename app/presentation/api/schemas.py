@@ -72,6 +72,16 @@ class InstructionOut(BaseModel):
     destination: DestinationOut | None = None
 
 
+class VirtualAccountOut(BaseModel):
+    """A wallet's provider-issued bank account."""
+
+    wallet_id: UUID
+    status: str = Field(examples=["active"])
+    provider: str
+    account_number: str | None = None
+    account_name: str | None = None
+    bank_name: str | None = None
+
 class FundOut(BaseModel):
     fund_id: UUID
     name: str

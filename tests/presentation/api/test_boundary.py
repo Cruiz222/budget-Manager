@@ -158,6 +158,8 @@ EXPECTED_OPERATIONS = {
     # for Paystack, and Paystack proves itself with a signature. See the deposit
     # route's docstring and ``/webhooks/paystack`` below.
     ("post", "/wallets/{wallet_id}/deposits"),
+    ("post", "/wallets/{wallet_id}/deposits"),
+    ("post", "/wallets/{wallet_id}/virtual-account"),
     # --- the second kind of authority, added in 3a ---------------------------
     #
     # **The one route in this API that no person calls, and the reason it needs
