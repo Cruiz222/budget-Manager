@@ -41,10 +41,10 @@ from app.domain.money.currency import Currency
 from app.domain.money.money import Money
 from app.domain.money.wallet import Wallet
 from app.domain.money.walletStatus import WalletStatus
-from app.domain.payments.virtualAccount import VirtualAccount
-from app.domain.payments.virtualAccountStatus import VirtualAccountStatus
+from app.application.payments.record_wallet import (
+    record_wallet_with_pending_virtual_account,
+)
 
-VIRTUAL_ACCOUNT_PROVIDER = "paystack"
 
 def _record_starter_wallet(uow: UnitOfWork, user: User) -> None:
     """Write the empty NGN wallet every new account starts with."""
@@ -56,14 +56,7 @@ def _record_starter_wallet(uow: UnitOfWork, user: User) -> None:
         currency=Currency.NGN,
     )
 
-    uow.wallets.save(wallet)
-    uow.virtual_accounts.save(
-        VirtualAccount(
-            wallet_id=wallet.wallet_id,
-            status=VirtualAccountStatus.PENDING,
-            provider=VIRTUAL_ACCOUNT_PROVIDER,
-        )
-    )
+    record_wallet_with_pending_virtual_account(uow, wallet)
 
 
 def record_new_account(

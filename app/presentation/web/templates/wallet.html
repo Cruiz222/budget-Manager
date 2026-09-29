@@ -32,8 +32,50 @@
             {{ virtual_account.account_name }}<br>
             {{ virtual_account.bank_name }}
           </p>
-        {% else %}
-        <p>Your bank account is being prepared.</p>
+                {% else %}
+          <p>Your bank account is being prepared.</p>
+
+          {% if not user.phone %}
+            <h3>Verify your phone</h3>
+            <p class="muted small">
+              Your verified phone number is required before your bank
+              account can be issued.
+            </p>
+
+            <form
+              method="post"
+              action="{{ urls.PREFIX }}/phone-verifications"
+              class="stack"
+            >
+              <label for="verification-phone">Phone number</label>
+              <input
+                id="verification-phone"
+                name="phone"
+                type="tel"
+                autocomplete="tel"
+                placeholder="08012345678"
+                required
+              >
+              <button type="submit">Send verification code</button>
+            </form>
+
+            <form
+              method="post"
+              action="{{ urls.PREFIX }}/phone-verifications/confirm"
+              class="stack"
+            >
+              <label for="verification-code">Verification code</label>
+              <input
+                id="verification-code"
+                name="code"
+                type="text"
+                inputmode="numeric"
+                autocomplete="one-time-code"
+                required
+              >
+              <button type="submit">Verify phone</button>
+            </form>
+          {% endif %}
         {% endif %}
         </section>
         {% endif %}

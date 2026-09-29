@@ -1,7 +1,7 @@
 from uuid import uuid4
 
 import pytest
-
+from app.domain.money.currency import Currency
 from app.application.wallet_service import WalletService
 from app.domain.money.exception import WalletNotFoundError
 from app.domain.payments.virtualAccount import VirtualAccount
@@ -23,6 +23,31 @@ def build_service(tmp_path):
         factory,
     )
 
+
+def test_opening_a_wallet_records_a_pending_virtual_account(
+    tmp_path,
+):
+    service, factory = build_service(tmp_path)
+
+    wallet = service.open_wallet(Currency.NGN)
+
+    stored = factory.start()
+    try:
+        account = stored.virtual_accounts.get_by_wallet_id(
+            wallet.wallet_id
+        )
+    finally:
+        stored.rollback()
+
+    assert account is not None
+    assert account.wallet_id == wallet.wallet_id
+    assert account.status is VirtualAccountStatus.PENDING
+    assert account.provider == "paystack"
+    assert account.provider_customer_code is None
+    assert account.account_number is None
+    assert account.account_name is None
+    assert account.bank_name is None
+    
 
 def seed(factory, wallet, account):
     uow = factory.start()

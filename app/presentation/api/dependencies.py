@@ -145,6 +145,7 @@ from app.composition_root import (
     build_sign_up,
     build_sign_up_with_google,
     build_wallet_service,
+    build_confirm_phone_change,
 )
 from app.domain.identity.phoneNumber import fold_phone
 from app.domain.identity.user import User, fold_email
@@ -161,6 +162,9 @@ from app.presentation.api import rate_limits, schemas
 from app.presentation.api.errors import (
     MissingCredentialsError,
     PaymentsUnconfiguredError,
+)
+from app.application.identity.confirm_phone_change import (
+    ConfirmPhoneChange,
 )
 
 #: The scheme a token is presented with, spelled the way the header spells it.
@@ -530,6 +534,17 @@ def confirm_phone_sign_up_service(request: Request) -> ConfirmPhoneSignUp:
         password_hasher=request.app.state.password_hasher,
     )
 
+
+def confirm_phone_change_service(
+    request: Request,
+    actor: User = Depends(current_actor),
+) -> ConfirmPhoneChange:
+    """Confirm a phone number for the authenticated account."""
+    return build_confirm_phone_change(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        actor=actor.user_id,
+    )
+    
 
 def sign_up_with_google_service(request: Request) -> SignUpWithGoogle:
     """Registering with a Google identity, for somebody who may not exist yet.

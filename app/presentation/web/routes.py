@@ -50,6 +50,8 @@ from app.presentation.api.dependencies import (
     sign_up_service,
     sign_up_with_google_service,
     wallet_service,
+    confirm_phone_change_service,
+    request_phone_verification_service,
 )
 from app.presentation.web import forms, urls
 from app.presentation.web.dependencies import (
@@ -315,6 +317,27 @@ def sign_out(request: Request):
     return response
 
 
+@router.post(
+    _path(urls.PREFIX) + "/phone-verifications/confirm"
+)
+def confirm_phone_change(
+    request: Request,
+    code: str | None = Form(default=None),
+    user: User = Depends(web_actor),
+):
+    """Attach the phone proved by the submitted code to this user."""
+    forms.reject_cross_site(request)
+
+    confirm_phone_change_service(
+        request,
+        actor=user,
+    ).execute(
+        forms.required(code, "verification code"),
+        datetime.now(),
+    )
+
+    return _redirect(urls.LANDING_PATH)
+
 # --- a person's money --------------------------------------------------------
 
 
@@ -466,7 +489,7 @@ def withdraw(
         internal_reference=forms.optional(ref),
         amount=translate.money_in(
             forms.required(amount, "amount"),
-            service.get_wallet(wallet_id).currency,
+            service.get_wallet(wallet_id).currency
         ),
     )
     return _redirect(
@@ -590,6 +613,24 @@ def confirm(
     answered = service.confirm(confirmation_id, datetime.now())
     return _redirect(f"{urls.PREFIX}/wallets/{answered.wallet.wallet_id}")
 
+
+@router.post(
+    _path(urls.PREFIX) + "/phone-verifications"
+)
+def request_phone_verification(
+    request: Request,
+    phone: str | None = Form(default=None),
+    user: User = Depends(web_actor),
+):
+    """Text a verification code to a signed-in person's phone."""
+    forms.reject_cross_site(request)
+
+    request_phone_verification_service(request).execute(
+        forms.required(phone, "phone number"),
+        datetime.now(),
+    )
+
+    return _redirect(urls.LANDING_PATH)
 
 # --- the front door ----------------------------------------------------------
 

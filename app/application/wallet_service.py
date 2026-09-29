@@ -47,7 +47,9 @@ from app.domain.payments.virtualAccount import VirtualAccount
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notificationKind import NotificationKind
 from app.domain.planning.planStatus import PlanStatus
-
+from app.application.payments.record_wallet import (
+    record_wallet_with_pending_virtual_account,
+)
 
 
 @dataclass(frozen=True)
@@ -764,7 +766,7 @@ class WalletService:
                 _available_balance=Money(Decimal("0"), currency),
                 currency=currency,
             )
-            uow.wallets.save(wallet)
+            record_wallet_with_pending_virtual_account(uow, wallet)
             uow.commit()
             return wallet
         except BaseException:
