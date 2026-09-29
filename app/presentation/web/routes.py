@@ -403,11 +403,17 @@ def wallet(
     of this layer named rather than discovered.
     """
     service = wallet_service(request, actor=user)
+    account = service.virtual_account_for_wallet(wallet_id)
     return _render(
         request,
         "wallet.html",
         user=user,
         wallet=translate.wallet_out(service.get_wallet(wallet_id)),
+        virtual_account=(
+            translate.virtual_account_out(account)
+            if account is not None
+            else None
+        ),
         transactions=[
             translate.transaction_out(one)
             for one in service.transactions_for_wallet(wallet_id)

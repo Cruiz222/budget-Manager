@@ -43,9 +43,11 @@ from app.domain.money.transaction import Transaction
 from app.domain.money.transactionStatus import TransactionStatus
 from app.domain.money.transactionType import OUTBOUND_TYPES, TransactionType
 from app.domain.money.wallet import Wallet
+from app.domain.payments.virtualAccount import VirtualAccount
 from app.domain.money.walletStatus import WalletStatus
 from app.domain.notifications.notificationKind import NotificationKind
 from app.domain.planning.planStatus import PlanStatus
+
 
 
 @dataclass(frozen=True)
@@ -654,6 +656,20 @@ class WalletService:
             return self._wallet(uow, wallet_id)
         finally:
             uow.rollback()
+
+
+    def virtual_account_for_wallet(
+        self,
+        wallet_id: UUID,
+    ) -> VirtualAccount | None:
+            """Read the virtual account attached to an owned wallet."""
+            uow = self._unit_of_work_factory.start()
+            try:
+                self._wallet(uow, wallet_id)
+                return uow.virtual_accounts.get_by_wallet_id(wallet_id)
+            finally:
+                uow.rollback()
+
 
     def wallets_for_actor(self) -> list[Wallet]:
         """Every wallet this service's actor holds, oldest first.

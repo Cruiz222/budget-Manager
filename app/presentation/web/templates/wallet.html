@@ -22,6 +22,22 @@
       Wallet <code>{{ wallet.wallet_id }}</code> · {{ wallet.status }}
     </p>
 
+    {% if virtual_account %}
+      <section class="panel">
+       <h2>Bank account</h2>
+
+        {% if virtual_account.status == "active" %}
+          <p>
+          <strong>{{ virtual_account.account_number }}</strong><br>
+            {{ virtual_account.account_name }}<br>
+            {{ virtual_account.bank_name }}
+          </p>
+        {% else %}
+        <p>Your bank account is being prepared.</p>
+        {% endif %}
+        </section>
+        {% endif %}
+
     {% if wallet.funds %}
       <section class="panel">
         <h2>Pots</h2>

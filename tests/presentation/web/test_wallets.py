@@ -57,6 +57,64 @@ def close_through_the_service(browser, wallet_id: str) -> None:
     service.confirm(request.confirmation.confirmation_id, datetime.now())
 
 
+def activate_virtual_account(browser, wallet_id: str) -> None:
+    """Make the signup-created account active as a page precondition."""
+    factory = SqliteUnitOfWorkFactory(browser.db_path)
+    uow = factory.start()
+
+    try:
+        pending = uow.virtual_accounts.get_by_wallet_id(
+            UUID(wallet_id)
+        )
+        assert pending is not None
+
+        active = pending.activate(
+            provider_customer_code="CUS_123",
+            account_number="1234567890",
+            account_name="JOHNNY SUCCESSFUL",
+            bank_name="Wema Bank",
+        )
+        uow.virtual_accounts.save(active)
+        uow.commit()
+    except BaseException:
+        uow.rollback()
+        raise
+
+
+class TestTheVirtualAccount:
+    def test_a_new_accounts_bank_account_is_pending(
+        self,
+        browser,
+    ):
+        browser.sign_up()
+        wallet_id = browser.wallet_ids()[0]
+
+        page = browser.page(
+            f"{urls.PREFIX}/wallets/{wallet_id}"
+        )
+
+        assert "Bank account" in page
+        assert "Your bank account is being prepared." in page
+
+    
+    def test_an_active_account_shows_its_bank_details(
+    self,
+    browser,
+    ):
+        browser.sign_up()
+        wallet_id = browser.wallet_ids()[0]
+        activate_virtual_account(browser, wallet_id)
+
+        page = browser.page(
+            f"{urls.PREFIX}/wallets/{wallet_id}"
+        )
+
+        assert "1234567890" in page
+        assert "JOHNNY SUCCESSFUL" in page
+        assert "Wema Bank" in page
+        assert "CUS_123" not in page
+
+
 class TestTheCurrenciesOnOffer:
     def test_a_new_account_already_holds_the_mvp_currency(
         self,
@@ -67,7 +125,6 @@ class TestTheCurrenciesOnOffer:
 
         assert offered(browser.page(urls.LANDING_PATH)) == []
         assert len(browser.wallet_ids()) == 1
-
 
     def test_a_currency_already_held_is_no_longer_offered(self, browser):
         """The rule as a person meets it: not a refusal, an absence. The wallet
