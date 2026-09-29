@@ -33,6 +33,7 @@ from app.composition_root import (
     build_wallet_service,
     provider_for,
     virtual_account_provider_for,
+    build_confirm_phone_change,
 )
 
 NGN = Currency.NGN
@@ -636,6 +637,45 @@ def test_an_injected_provider_is_handed_no_callback_url(build_payment_provider):
     assert chosen is injected
     assert not hasattr(injected, "callback_url")
 
+
+def test_build_confirm_phone_change_joins_factory_and_actor(
+    monkeypatch,
+):
+    captured = {}
+
+    class RecordingConfirmation:
+        def __init__(
+            self,
+            unit_of_work_factory,
+            *,
+            actor,
+        ):
+            captured.update(
+                {
+                    "unit_of_work_factory": unit_of_work_factory,
+                    "actor": actor,
+                }
+            )
+
+    monkeypatch.setattr(
+        composition_root,
+        "ConfirmPhoneChange",
+        RecordingConfirmation,
+        raising=False,
+    )
+
+    factory = object()
+
+    result = build_confirm_phone_change(
+        unit_of_work_factory=factory,
+        actor=ACTOR,
+    )
+
+    assert isinstance(result, RecordingConfirmation)
+    assert captured == {
+        "unit_of_work_factory": factory,
+        "actor": ACTOR,
+    }
 
 def test_an_injected_provider_beats_the_settings(monkeypatch, build_payment_provider):
     """The seam that keeps this suite off the network, stated as a precedence.

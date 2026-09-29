@@ -375,3 +375,20 @@ class TestTheTwoIdentifiers:
         """
         with pytest.raises(InvalidUserPhoneError):
             build(email=None, phone="()")
+
+
+class TestChangingThePhone:
+    def test_it_stores_the_checked_number(self):
+        user = build(phone=None)
+
+        user.change_phone("0801 234 5678")
+
+        assert user.phone == "2348012345678"
+
+    def test_a_refused_number_does_not_replace_the_existing_one(self):
+        user = build(phone="08012345678")
+
+        with pytest.raises(InvalidUserPhoneError):
+            user.change_phone("not-a-phone")
+
+        assert user.phone == "2348012345678"

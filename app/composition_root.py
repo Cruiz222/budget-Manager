@@ -21,9 +21,6 @@ from app.application.notifications.deliver_pending_messages import (
     DeliverPendingMessages,
 )
 from app.application.payments.initiate_deposit import InitiateDeposit
-from app.application.payments.provision_virtual_account import (
-    ProvisionVirtualAccount,
-)
 from app.application.payments.reconcile_payments import ReconcilePayments
 from app.application.payments.settle_payment import SettlePayment
 from app.application.plan_service import PlanService
@@ -36,6 +33,9 @@ from app.application.wallet_service import WalletService
 from app.domain.identity.googleIdentityVerifier import GoogleIdentityVerifier
 from app.domain.identity.password_hasher import PasswordHasher
 from app.infrastructure.security.argon2_password_hasher import Argon2PasswordHasher
+from app.application.identity.confirm_phone_change import (
+    ConfirmPhoneChange,
+)
 from app.infrastructure.identity.pyjwt_google_identity_verifier import (
     PyJwtGoogleIdentityVerifier,
 )
@@ -817,6 +817,19 @@ def build_confirm_email_change(
         channel=_channel_for(settings, channel),
     )
 
+
+def build_confirm_phone_change(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    *,
+    actor: UUID,
+) -> ConfirmPhoneChange:
+    """Wire phone confirmation to the authenticated actor."""
+    return ConfirmPhoneChange(
+        unit_of_work_factory=(
+            unit_of_work_factory or SqliteUnitOfWorkFactory()
+        ),
+        actor=actor,
+    )
 
 def build_request_password_reset(
     unit_of_work_factory: UnitOfWorkFactory | None = None,

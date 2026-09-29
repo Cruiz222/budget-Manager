@@ -217,3 +217,8 @@ class User:
         ``app.domain.identity.emailAddress``.
         """
         self.email = checked_email(email)
+
+
+    def change_phone(self, phone: str) -> None:
+        """Move this account to a checked, normalized phone number."""
+        self.phone = checked_phone(phone)
