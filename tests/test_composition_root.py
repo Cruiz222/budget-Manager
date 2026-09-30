@@ -998,3 +998,47 @@ def test_build_provision_virtual_account_joins_its_three_dependencies(
         "provider": provider,
         "actor": ACTOR,
     }
+
+
+def test_build_provision_ready_virtual_accounts_joins_its_dependencies(
+    monkeypatch,
+):
+    captured = {}
+
+    class RecordingProvisioner:
+        def __init__(
+            self,
+            unit_of_work_factory,
+            provider,
+            *,
+            actor,
+        ):
+            captured.update(
+                {
+                    "unit_of_work_factory": unit_of_work_factory,
+                    "provider": provider,
+                    "actor": actor,
+                }
+            )
+
+    monkeypatch.setattr(
+        composition_root,
+        "ProvisionReadyVirtualAccounts",
+        RecordingProvisioner,
+        raising=False,
+    )
+
+    factory = object()
+    provider = object()
+
+    build_provision_ready_virtual_accounts(
+        unit_of_work_factory=factory,
+        actor=ACTOR,
+        provider=provider,
+    )
+
+    assert captured == {
+        "unit_of_work_factory": factory,
+        "provider": provider,
+        "actor": ACTOR,
+    }

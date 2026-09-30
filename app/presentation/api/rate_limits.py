@@ -168,6 +168,17 @@ POLICIES: dict[str, Policy] = {
             "is the same problem as a mail that did not."
         ),
     ),
+        "confirm_phone_verification": Policy(
+        subject=Limit(calls=10, window=_QUARTER),
+        ceiling=Limit(calls=300, window=_HOUR),
+        why=(
+            "Confirmation sends no SMS, but it accepts a short-lived "
+            "credential that must not be guessable without a bound. "
+            "A signed-in browser is limited per account, while an "
+            "unauthenticated signup confirmation is still protected "
+            "by the installation ceiling."
+        ),
+    ),
 }
 
 

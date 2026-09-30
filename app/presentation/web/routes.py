@@ -29,7 +29,7 @@ on. What this layer adds is the actor: ``web_actor`` reads a cookie where
 ``current_actor`` reads a header, and everything below that line is identical.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -50,8 +50,10 @@ from app.presentation.api.dependencies import (
     sign_up_service,
     sign_up_with_google_service,
     wallet_service,
+    profile_service,
     confirm_phone_change_service,
     request_phone_verification_service,
+    
 )
 from app.presentation.web import forms, urls
 from app.presentation.web.dependencies import (
@@ -325,18 +327,60 @@ def confirm_phone_change(
     code: str | None = Form(default=None),
     user: User = Depends(web_actor),
 ):
-    """Attach the phone proved by the submitted code to this user."""
-    forms.reject_cross_site(request)
+    token = forms.required(code, "verification code")
+    rate_limits.enforce(
+        request,
+        "confirm_phone_verification",
+        str(user.user_id),
+    )
 
     confirm_phone_change_service(
         request,
         actor=user,
     ).execute(
-        forms.required(code, "verification code"),
+        token,
         datetime.now(),
     )
 
     return _redirect(urls.LANDING_PATH)
+
+
+@router.post(_path(urls.PREFIX) + "/profile")
+def save_profile(
+    request: Request,
+    display_name: str | None = Form(default=None),
+    legal_first_name: str | None = Form(default=None),
+    legal_last_name: str | None = Form(default=None),
+    date_of_birth: str | None = Form(default=None),
+    phone: str | None = Form(default=None),
+    country: str | None = Form(default=None),
+    address_line: str | None = Form(default=None),
+    user: User = Depends(web_actor),
+):
+    """Save this signed-in person's complete profile."""
+    forms.reject_cross_site(request)
+
+    birth_date = forms.optional(date_of_birth)
+
+    profile_service(request, actor=user).save(
+        display_name=forms.required(
+            display_name,
+            "display name",
+        ),
+        legal_first_name=forms.optional(legal_first_name),
+        legal_last_name=forms.optional(legal_last_name),
+        date_of_birth=(
+            date.fromisoformat(birth_date)
+            if birth_date is not None
+            else None
+        ),
+        phone=forms.optional(phone),
+        country=forms.optional(country),
+        address_line=forms.optional(address_line),
+        now=datetime.now(),
+    )
+
+    return _redirect(urls.LANDING_PATH)    
 
 # --- a person's money --------------------------------------------------------
 
@@ -427,10 +471,13 @@ def wallet(
     """
     service = wallet_service(request, actor=user)
     account = service.virtual_account_for_wallet(wallet_id)
+    standing = profile_service(request, actor=user).standing()
+    profile = translate.profile_out(standing).profile
     return _render(
         request,
         "wallet.html",
         user=user,
+        profile=profile,
         wallet=translate.wallet_out(service.get_wallet(wallet_id)),
         virtual_account=(
             translate.virtual_account_out(account)
@@ -622,11 +669,15 @@ def request_phone_verification(
     phone: str | None = Form(default=None),
     user: User = Depends(web_actor),
 ):
-    """Text a verification code to a signed-in person's phone."""
-    forms.reject_cross_site(request)
+    number = forms.required(phone, "phone number")
+    rate_limits.enforce(
+        request,
+        "request_phone_verification",
+        fold_phone(number),
+    )
 
     request_phone_verification_service(request).execute(
-        forms.required(phone, "phone number"),
+        number,
         datetime.now(),
     )
 

@@ -76,6 +76,76 @@
               <button type="submit">Verify phone</button>
             </form>
           {% endif %}
+                    <h3>Complete your profile</h3>
+          <p class="muted small">
+            Your legal name is required before your bank account can be issued.
+          </p>
+
+          <form
+            method="post"
+            action="{{ urls.PREFIX }}/profile"
+            class="stack"
+          >
+            <label for="profile-display-name">Display name</label>
+            <input
+              id="profile-display-name"
+              name="display_name"
+              type="text"
+              autocomplete="nickname"
+              value="{{ profile.display_name if profile else '' }}"
+              required
+            >
+
+            <label for="profile-first-name">Legal first name</label>
+            <input
+              id="profile-first-name"
+              name="legal_first_name"
+              type="text"
+              autocomplete="given-name"
+              value="{{ profile.legal_first_name if profile and profile.legal_first_name else '' }}"
+              required
+            >
+
+            <label for="profile-last-name">Legal last name</label>
+            <input
+              id="profile-last-name"
+              name="legal_last_name"
+              type="text"
+              autocomplete="family-name"
+              value="{{ profile.legal_last_name if profile and profile.legal_last_name else '' }}"
+              required
+            >
+
+            <label for="profile-date-of-birth">Date of birth</label>
+            <input
+              id="profile-date-of-birth"
+              name="date_of_birth"
+              type="date"
+              value="{{ profile.date_of_birth if profile and profile.date_of_birth else '' }}"
+            >
+
+            <label for="profile-country">Country code</label>
+            <input
+              id="profile-country"
+              name="country"
+              type="text"
+              maxlength="2"
+              placeholder="NG"
+              autocomplete="country"
+              value="{{ profile.country if profile and profile.country else '' }}"
+            >
+
+            <label for="profile-address">Address</label>
+            <input
+              id="profile-address"
+              name="address_line"
+              type="text"
+              autocomplete="street-address"
+              value="{{ profile.address_line if profile and profile.address_line else '' }}"
+            >
+
+            <button type="submit">Save profile</button>
+          </form>
         {% endif %}
         </section>
         {% endif %}

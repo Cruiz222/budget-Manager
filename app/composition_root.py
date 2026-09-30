@@ -2,6 +2,9 @@ from uuid import UUID
 from app.application.payments.provision_virtual_account import (
     ProvisionVirtualAccount,
 )
+from app.application.payments.provision_ready_virtual_accounts import (
+    ProvisionReadyVirtualAccounts,
+)
 from app.application.identity.confirm_email_change import ConfirmEmailChange
 from app.application.identity.confirm_password_reset import ConfirmPasswordReset
 from app.application.identity.confirm_phone_sign_up import ConfirmPhoneSignUp
@@ -277,6 +280,20 @@ def build_provision_virtual_account(
         actor=actor,
     )    
 
+
+def build_provision_ready_virtual_accounts(
+    unit_of_work_factory: UnitOfWorkFactory | None = None,
+    *,
+    actor: UUID,
+    provider,
+) -> ProvisionReadyVirtualAccounts:
+    return ProvisionReadyVirtualAccounts(
+        unit_of_work_factory=(
+            unit_of_work_factory or SqliteUnitOfWorkFactory()
+        ),
+        provider=provider,
+        actor=actor,
+    )
 
 def build_settler(
     unit_of_work_factory: UnitOfWorkFactory | None = None,
