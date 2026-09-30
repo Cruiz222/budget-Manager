@@ -53,6 +53,7 @@ from app.presentation.api.dependencies import (
     profile_service,
     confirm_phone_change_service,
     request_phone_verification_service,
+    provision_ready_virtual_accounts_service,
     
 )
 from app.presentation.web import forms, urls
@@ -379,6 +380,13 @@ def save_profile(
         address_line=forms.optional(address_line),
         now=datetime.now(),
     )
+
+    provisioner = provision_ready_virtual_accounts_service(
+        request,
+        actor=user,
+    )
+    if provisioner is not None:
+        provisioner.execute()
 
     return _redirect(urls.LANDING_PATH)    
 

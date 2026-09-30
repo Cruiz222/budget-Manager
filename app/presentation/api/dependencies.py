@@ -146,6 +146,7 @@ from app.composition_root import (
     build_sign_up_with_google,
     build_wallet_service,
     build_confirm_phone_change,
+    build_provision_ready_virtual_accounts,
 )
 from app.domain.identity.phoneNumber import fold_phone
 from app.domain.identity.user import User, fold_email
@@ -165,6 +166,9 @@ from app.presentation.api.errors import (
 )
 from app.application.identity.confirm_phone_change import (
     ConfirmPhoneChange,
+)
+from app.application.payments.provision_ready_virtual_accounts import (
+    ProvisionReadyVirtualAccounts,
 )
 
 #: The scheme a token is presented with, spelled the way the header spells it.
@@ -673,6 +677,24 @@ def virtual_account_service(
         actor=actor.user_id,
         provider=provider,
     )
+
+
+def provision_ready_virtual_accounts_service(
+    request: Request,
+    actor: User = Depends(current_actor),
+) -> ProvisionReadyVirtualAccounts | None:
+    """Build automatic provisioning, or return None when unconfigured."""
+    provider = request.app.state.virtual_account_provider
+
+    if provider is None:
+        return None
+
+    return build_provision_ready_virtual_accounts(
+        unit_of_work_factory=request.app.state.unit_of_work_factory,
+        actor=actor.user_id,
+        provider=provider,
+    )
+    
 
 def deposit_service(
     request: Request,

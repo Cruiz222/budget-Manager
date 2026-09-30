@@ -17,13 +17,20 @@ def test_a_signed_in_person_can_save_their_profile(
 ):
     browser.sign_up()
     service = RecordingProfileService()
+    provisioner = RecordingReadyAccountProvisioner()
 
     monkeypatch.setattr(
         routes,
         "profile_service",
         lambda request, actor: service,
         raising=False,
-    )
+)
+    monkeypatch.setattr(
+        routes,
+        "provision_ready_virtual_accounts_service",
+        lambda request, actor: provisioner,
+        raising=False,
+)
 
     response = browser.post(
         f"{urls.PREFIX}/profile",
@@ -45,7 +52,7 @@ def test_a_signed_in_person_can_save_their_profile(
 
     moment = saved.pop("now")
     assert isinstance(moment, datetime)
-
+    assert provisioner.calls == 1
     assert saved == {
         "display_name": "Johnny",
         "legal_first_name": "Johnny",
@@ -104,3 +111,12 @@ def test_the_profile_form_remembers_the_saved_values(
     assert 'value="1998-06-15"' in page
     assert 'value="NG"' in page
     assert 'value="12 Lagos Road"' in page
+
+
+class RecordingReadyAccountProvisioner:
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self):
+        self.calls += 1
+        return []

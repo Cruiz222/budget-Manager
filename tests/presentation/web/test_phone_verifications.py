@@ -4,7 +4,7 @@ from app.domain.identity.phoneVerification import PhoneVerification
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
-from app.presentation.web import urls
+from app.presentation.web import urls, routes
 
 
 TYPED_PHONE = "08012345678"
@@ -46,10 +46,12 @@ def test_a_signed_in_person_can_request_a_phone_code(
     assert len(requester.requests) == 1
     assert requester.requests[0]["phone"] == TYPED_PHONE
     assert isinstance(requester.requests[0]["now"], datetime)
+    assert provisioner.calls == 1
 
 
 def test_a_signed_in_person_can_confirm_their_phone(
     browser,
+    monkeypatch,
 ):
     browser.sign_up()
     user_id = browser.user_id
@@ -65,6 +67,15 @@ def test_a_signed_in_person_can_confirm_their_phone(
         seed.commit()
     finally:
         seed.rollback()
+
+    provisioner = RecordingReadyAccountProvisioner()
+
+    monkeypatch.setattr(
+        routes,
+        "provision_ready_virtual_accounts_service",
+        lambda request, actor: provisioner,
+        raising=False,
+    )
 
     response = browser.post(
         f"{urls.PREFIX}/phone-verifications/confirm",
@@ -101,3 +112,13 @@ def test_a_pending_account_asks_for_phone_verification(
         in page
     )
     assert 'name="code"' in page
+
+
+
+class RecordingReadyAccountProvisioner:
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self):
+        self.calls += 1
+        return []

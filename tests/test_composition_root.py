@@ -34,6 +34,7 @@ from app.composition_root import (
     provider_for,
     virtual_account_provider_for,
     build_confirm_phone_change,
+    build_provision_ready_virtual_accounts,
 )
 
 NGN = Currency.NGN
