@@ -343,6 +343,13 @@ def confirm_phone_change(
         datetime.now(),
     )
 
+    provisioner = provision_ready_virtual_accounts_service(
+        request,
+        actor=user,
+    )
+    if provisioner is not None:
+        provisioner.execute()
+
     return _redirect(urls.LANDING_PATH)
 
 
@@ -456,7 +463,17 @@ def open_wallet(
     """
     forms.reject_cross_site(request)
     chosen = forms.required(currency, "currency")
-    wallet_service(request, actor=user).open_wallet(translate.currency_in(chosen))
+    wallet_service(request, actor=user).open_wallet(
+        translate.currency_in(chosen)
+    )
+
+    provisioner = provision_ready_virtual_accounts_service(
+        request,
+        actor=user,
+    )
+    if provisioner is not None:
+        provisioner.execute()
+
     return _redirect(urls.LANDING_PATH)
 
 

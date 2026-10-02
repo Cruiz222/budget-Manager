@@ -46,7 +46,6 @@ def test_a_signed_in_person_can_request_a_phone_code(
     assert len(requester.requests) == 1
     assert requester.requests[0]["phone"] == TYPED_PHONE
     assert isinstance(requester.requests[0]["now"], datetime)
-    assert provisioner.calls == 1
 
 
 def test_a_signed_in_person_can_confirm_their_phone(
@@ -91,6 +90,8 @@ def test_a_signed_in_person_can_confirm_their_phone(
         assert user.phone == FOLDED_PHONE
     finally:
         stored.rollback()
+
+    assert provisioner.calls == 1
 
 
 def test_a_pending_account_asks_for_phone_verification(

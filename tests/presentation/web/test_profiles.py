@@ -1,6 +1,12 @@
 from datetime import date, datetime
 
 from app.presentation.web import routes, urls
+from app.domain.payments.virtualAccountDetails import (
+    VirtualAccountDetails,
+)
+from app.infrastructure.persistence.sqlite_unit_of_work import (
+    SqliteUnitOfWorkFactory,
+)
 
 
 class RecordingProfileService:
@@ -62,7 +68,7 @@ def test_a_signed_in_person_can_save_their_profile(
         "country": "NG",
         "address_line": "Lagos",
     }
-    
+
 
 def test_a_pending_bank_account_asks_for_the_legal_profile(
     browser,
@@ -120,3 +126,87 @@ class RecordingReadyAccountProvisioner:
     def execute(self):
         self.calls += 1
         return []
+
+
+class IssuingVirtualAccountProvider:
+    def __init__(self):
+        self.customers = []
+        self.accounts = []
+
+    def create_customer(
+        self,
+        *,
+        email,
+        phone,
+        first_name,
+        last_name,
+    ):
+        self.customers.append(
+            {
+                "email": email,
+                "phone": phone,
+                "first_name": first_name,
+                "last_name": last_name,
+            }
+        )
+        return "CUS_123"
+
+    def create_virtual_account(self, *, customer_code):
+        self.accounts.append(customer_code)
+        return VirtualAccountDetails(
+            account_number="1234567890",
+            account_name="JOHNNY SUCCESSFUL",
+            bank_name="Wema Bank",
+        )
+
+
+def test_completing_the_last_requirement_issues_the_bank_account(
+    browser,
+):
+    browser.sign_up()
+    user_id = browser.user_id
+    wallet_id = browser.wallet_ids()[0]
+
+    factory = SqliteUnitOfWorkFactory(browser.db_path)
+    uow = factory.start()
+    try:
+        user = uow.users.get_by_id(user_id)
+        user.change_phone("08012345678")
+        uow.users.save(user)
+        uow.commit()
+    except BaseException:
+        uow.rollback()
+        raise
+
+    provider = IssuingVirtualAccountProvider()
+    browser.client.app.state.virtual_account_provider = provider
+
+    response = browser.post(
+        f"{urls.PREFIX}/profile",
+        data={
+            "display_name": "Johnny",
+            "legal_first_name": "Johnny",
+            "legal_last_name": "Successful",
+            "date_of_birth": "",
+            "phone": "",
+            "country": "NG",
+            "address_line": "",
+        },
+    )
+
+    assert response.status_code == 303
+    assert provider.customers == [
+        {
+            "email": "alice@example.com",
+            "phone": "2348012345678",
+            "first_name": "Johnny",
+            "last_name": "Successful",
+        }
+    ]
+    assert provider.accounts == ["CUS_123"]
+
+    page = browser.wallet_page(wallet_id)
+
+    assert "1234567890" in page
+    assert "JOHNNY SUCCESSFUL" in page
+    assert "Wema Bank" in page

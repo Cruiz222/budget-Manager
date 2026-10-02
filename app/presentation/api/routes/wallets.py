@@ -7,9 +7,17 @@ from app.application.payments.initiate_deposit import InitiateDeposit
 from app.application.wallet_service import WalletService
 from app.domain.money.confirmationKind import ConfirmationKind
 from app.presentation.api import schemas, translate
-from app.presentation.api.dependencies import deposit_service, wallet_service, virtual_account_service
+from app.presentation.api.dependencies import (
+    deposit_service,
+    provision_ready_virtual_accounts_service,
+    virtual_account_service,
+    wallet_service,
+)
 from app.application.payments.provision_virtual_account import (
     ProvisionVirtualAccount,
+)
+from app.application.payments.provision_ready_virtual_accounts import (
+    ProvisionReadyVirtualAccounts,
 )
 
 router = APIRouter(tags=["wallets"])
@@ -19,6 +27,9 @@ router = APIRouter(tags=["wallets"])
 def open_wallet(
     payload: schemas.OpenWalletIn,
     service: WalletService = Depends(wallet_service),
+    provisioner: ProvisionReadyVirtualAccounts | None = Depends(
+        provision_ready_virtual_accounts_service
+    ),
 ) -> schemas.WalletOut:
     """Open a wallet for the caller.
 
@@ -30,7 +41,13 @@ def open_wallet(
 
     201 rather than 200, because this creates a resource and says where it is.
     """
-    wallet = service.open_wallet(translate.currency_in(payload.currency))
+    wallet = service.open_wallet(
+        translate.currency_in(payload.currency)
+    )
+
+    if provisioner is not None:
+        provisioner.execute()
+
     return translate.wallet_out(wallet)
 
 

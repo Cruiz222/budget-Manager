@@ -19,7 +19,8 @@ from app.domain.money.confirmationKind import ConfirmationKind
 from app.infrastructure.persistence.sqlite_unit_of_work import (
     SqliteUnitOfWorkFactory,
 )
-from app.presentation.web import urls
+from app.presentation.web import urls, routes
+
 
 #: The currencies the form offers, in the order it offers them.
 #:
@@ -172,6 +173,15 @@ class TestTheCurrenciesOnOffer:
         assert browser.wallet_ids() == [wallet_id]
 
 
+class RecordingReadyAccountProvisioner:
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self):
+        self.calls += 1
+        return []
+
+
 class TestOpeningASecondWallet:
     def test_a_known_currency_outside_the_mvp_offer_is_refused(
         self,
@@ -235,3 +245,29 @@ class TestOpeningASecondWallet:
         assert response.status_code == 400
         assert "UnsupportedCurrencyError" in response.text
         assert "NGN, USD" in response.text
+
+
+    def test_opening_a_wallet_attempts_automatic_account_provisioning(
+    self,
+    browser,
+    monkeypatch,
+    ):
+        browser.sign_up()
+        existing_wallet_id = browser.wallet_ids()[0]
+        close_through_the_service(browser, existing_wallet_id)
+
+        provisioner = RecordingReadyAccountProvisioner()
+        monkeypatch.setattr(
+        routes,
+        "provision_ready_virtual_accounts_service",
+        lambda request, actor: provisioner,
+        raising=False,
+    )
+
+        response = browser.post(
+        f"{urls.PREFIX}/wallets",
+        data={"currency": "NGN"},
+    )
+
+        assert response.status_code == 303
+        assert provisioner.calls == 1

@@ -11,7 +11,18 @@ balances look like before anything has happened.
 """
 
 from tests.presentation.api.conftest import ALICE, BOB
+from app.presentation.api.dependencies import (
+    provision_ready_virtual_accounts_service,
+)
 
+
+class RecordingReadyAccountProvisioner:
+    def __init__(self):
+        self.calls = 0
+
+    def execute(self):
+        self.calls += 1
+        return []
 
 class TestOpeningAWallet:
     def test_signup_provides_an_active_wallet(self, client, as_user):
@@ -175,6 +186,48 @@ class TestOneWalletPerCurrency:
 
         assert reopened.status_code == 201, reopened.text
         assert reopened.json()["wallet_id"] != wallet_id
+
+
+    def test_opening_a_wallet_attempts_automatic_account_provisioning(
+        self,
+        client,
+        as_user,
+        open_wallet,
+    ):
+        headers = as_user()
+        wallet_id = open_wallet(headers)
+
+        closing = client.post(
+            f"/wallets/{wallet_id}/close",
+            headers=headers,
+        )
+        assert closing.status_code == 201, closing.text
+
+        confirmed = client.post(
+            f"/confirmations/{closing.json()['confirmation_id']}/confirm",
+            headers=headers,
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        provisioner = RecordingReadyAccountProvisioner()
+        client.app.dependency_overrides[
+            provision_ready_virtual_accounts_service
+        ] = lambda: provisioner
+
+        try:
+            response = client.post(
+                "/wallets",
+                json={"currency": "NGN"},
+                headers=headers,
+            )
+        finally:
+            client.app.dependency_overrides.pop(
+                provision_ready_virtual_accounts_service,
+                None,
+            )
+
+        assert response.status_code == 201
+        assert provisioner.calls == 1
 
     def test_the_closed_wallet_is_still_listed_beside_the_new_one(
         self, client, as_user, open_wallet
